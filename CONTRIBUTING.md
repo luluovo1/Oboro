@@ -1,44 +1,46 @@
-# 贡献指南 (Contributing Guide)
+# Contributing Guide
 
-感谢你对本项目的关注！欢迎通过 Issue 和 Pull Request 参与贡献。
+[English](./CONTRIBUTING.md) | [简体中文](./CONTRIBUTING.zh-CN.md)
 
-## 报告问题
+Thanks for your interest in this project! Issues and pull requests are welcome.
 
-提交 Bug 前请先搜索已有 [Issues](https://github.com/luluovo1/ollvm-ndk30-based-on-llvm21/issues) 避免重复。报告中请尽量包含：
+## Reporting Issues
 
-- 使用的工具链版本（Release 版本号或对应 commit）
-- 宿主平台（Windows / Linux / macOS）与目标 ABI
-- 完整的最小复现步骤与混淆参数
-- 期望行为与实际行为
-- 相关日志、反编译截图或崩溃信息
+Search the existing [Issues](https://github.com/luluovo1/Oboro/issues) before filing a new one. Please include:
 
-## 功能建议
+- Toolchain version (Release tag or commit)
+- Host platform (Windows / Linux / macOS) and target ABI
+- Minimal reproduction steps and obfuscation flags
+- Expected vs. actual behavior
+- Relevant logs, decompilation screenshots, or crash information
 
-欢迎在 Issues 中提出新混淆选项、易用性改进等建议，并说明使用场景与预期收益。
+## Feature Requests
 
-## 提交 Pull Request
+Open an Issue describing the new obfuscation option or usability improvement, along with the use case and expected benefit.
 
-1. Fork 本仓库，并从 `main` 分支创建你的特性分支
-2. 保持改动聚焦：一个 PR 只解决一个问题
-3. 涉及混淆 Pass 的改动，请在 PR 描述中说明对以下方面的影响：
-   - 混淆强度与逆向难度
-   - 运行时性能与体积开销
-   - 与现有参数组合的兼容性
-4. 提交前自测：至少编译一个示例并确认混淆生效、产物可正常运行
-5. PR 描述中关联对应 Issue，并附上测试结果
+## Pull Requests
 
-## 开发方向
+1. Fork this repository and create a feature branch from `main`
+2. Keep the change focused: one PR solves one problem
+3. For obfuscation pass changes, describe the impact on:
+   - Obfuscation strength and reverse-engineering difficulty
+   - Runtime performance and binary size overhead
+   - Compatibility with existing flag combinations
+4. Self-test before submitting: compile at least one example and confirm the obfuscation takes effect and the output runs correctly
+5. Link the related Issue in the PR description and attach test results
 
-- 引入更多混淆选项（新 Pass / 新参数）
-- 独立混淆算法与实现逻辑的持续演进（本仓库将逐步剥离上游，详见 README 顶部重要声明）
-- 文档改进与多语言维护
+## Roadmap
 
-## 注意事项
+- More obfuscation options (new passes / new flags)
+- Ongoing evolution of the independent obfuscation algorithms and implementation (this repository is gradually detaching from upstream — see the notice at the top of the README)
+- Documentation improvements and multilingual maintenance
 
-- 请勿提交与混淆功能无关的 LLVM 上游同步改动
-- 禁止提交任何用于违法用途的代码或教程
-- 贡献即表示你同意所提交的代码以本仓库协议发布
+## Notes
 
-## 许可
+- Do not submit LLVM upstream sync changes unrelated to obfuscation
+- Do not submit code or tutorials intended for illegal purposes
+- By contributing, you agree that your code will be released under this repository's license
 
-本项目基于 LLVM Apache 2.0 协议发布，详见 [LICENSE.TXT](./LICENSE.TXT)。
+## License
+
+This project is licensed under LLVM Apache 2.0. See [LICENSE.TXT](./LICENSE.TXT).

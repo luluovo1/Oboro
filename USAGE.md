@@ -1,7 +1,9 @@
 # OLLVM-NDK 混淆使用手册
 
-> 本文档是 [README](./README.md) 的详细补充，集中收录**混淆参数速查表**与**混淆前后效果对比**（IDA 截图）。
-> 快速上手请看 [README · 快速开始](./README.md#快速开始)。
+> [English](./USAGE_en.md) | 简体中文
+
+> 本文档是 [README（中文）](./README.zh-CN.md) 的详细补充，集中收录**混淆参数速查表**与**混淆前后效果对比**（IDA 反汇编视图 / Graph View）。
+> 快速上手请看 [README（中文） · 快速开始](./README.zh-CN.md#快速开始)。
 
 ## ⚠️ 参数语法规则
 
@@ -183,7 +185,7 @@ clang -O2 -mllvm -irobf-bcf -mllvm -irobf-bcf_prob=100 test.c -o test
 
 ## 混淆前后效果对比
 
-以下截图均使用 IDA Pro 的 Hex-Rays 反编译器（F5）生成，源代码见 [`testresu/`](./testresu/)。
+以下对比图均为 IDA Pro 反汇编视图（Graph View）。
 
 ---
 
@@ -264,5 +266,5 @@ clang -O2 test.c -o test_plain.exe
 # 编译混淆版本
 clang -O2 -mllvm -irobf-bcf -mllvm -irobf-bcf_prob=100 test.c -o test_bcf.exe
 
-# 用 IDA 分别打开两个文件，对比 Hex-Rays 反编译结果
+# 用 IDA 分别载入两个文件，对比反汇编视图（Graph View）差异
 ```
