@@ -100,8 +100,8 @@ EnableBogusControlFlow("irobf-bcf", cl::init(false), cl::NotHidden,
 
 
 static cl::opt<std::string>
-SamsaraConfigPath("samsara-cfg", cl::init(std::string{}), cl::NotHidden,
-                 cl::desc("Samsara config path."),
+OboroConfigPath("oboro-cfg", cl::init(std::string{}), cl::NotHidden,
+                 cl::desc("Oboro config path."),
                  cl::ZeroOrMore);
 
 namespace llvm {
@@ -162,7 +162,7 @@ struct ObfuscationPassManager : public ModulePass {
   }
 
   static std::shared_ptr<ObfuscationOptions> getOptions() {
-    auto Opt = ObfuscationOptions::readConfigFile(SamsaraConfigPath);
+    auto Opt = ObfuscationOptions::readConfigFile(OboroConfigPath);
 
     Opt->indBrOpt()->readOpt(EnableIndirectBr, LevelIndirectBr);
     Opt->iCallOpt()->readOpt(EnableIndirectCall, LevelIndirectCall);
@@ -185,7 +185,7 @@ struct ObfuscationPassManager : public ModulePass {
         EnableIRFlattening || EnableIRStringEncryption ||
         EnableIRConstantIntEncryption || EnableIRConstantFPEncryption ||
         EnableRttiEraser ||
-        EnableBogusControlFlow || !SamsaraConfigPath.empty()) {
+        EnableBogusControlFlow || !OboroConfigPath.empty()) {
       EnableIRObfuscation = true;
     }
 
@@ -199,26 +199,32 @@ struct ObfuscationPassManager : public ModulePass {
 
     add(llvm::createConstantIntEncryptionPass(Options.get()));
 
-    add(llvm::createIndirectGlobalVariablePass(Options.get()));
-
     add(llvm::createConstantFPEncryptionPass(Options.get()));
 
+    // 字符串加密必须在间接全局变量之前：否则 INDGV 先把字符串全局的
+    // 使用点改写成页表对象，CSE 认不出这些常量串，导致 full 组合下明文泄露。
     if (EnableIRStringEncryption || Options->cseOpt()->isEnabled()) {
       add(llvm::createStringEncryptionPass(Options.get()));
     }
 
+    add(llvm::createIndirectGlobalVariablePass(Options.get()));
+
     add(llvm::createIndirectCallPass(Options.get()));
     add(llvm::createFlatteningPass(pointerSize, Options.get()));
+
+    // BCF 必须在 IndirectBranch 之前跑：BCF 在原始 CFG 上做 split+fixStack
+    // 是线性的；若 indbr 先把条件分支全部换成 indirectbr，BCF 再在其上
+    // split 会引发后端寄存器分配/EH 准备的组合爆炸（实测编译卡死）。
+    if (EnableBogusControlFlow || Options->bcfOpt()->isEnabled()) {
+      add(llvm::createBogusControlFlowPass(Options.get()));
+    }
+
     add(llvm::createIndirectBranchPass(Options.get()));
 
     if (EnableRttiEraser || Options->rttiOpt()->isEnabled()) {
       add(llvm::createMsRttiEraserPass(Options.get()));
     }
 
-
-    if (EnableBogusControlFlow || Options->bcfOpt()->isEnabled()) {
-      add(llvm::createBogusControlFlowPass(Options.get()));
-    }
 
     bool Changed = run(M);
 
@@ -233,7 +239,12 @@ ModulePass *llvm::createObfuscationPassManager() {
   return new ObfuscationPassManager();
 }
 
-INITIALIZE_PASS_BEGIN(ObfuscationPassManager, "irobf", "Enable IR Obfuscation",
+// Legacy pass registration name must NOT collide with the cl::opt "irobf"
+// above: when opt.exe registers this pass at pipeline time, its PassNameParser
+// listener turns the pass arg into a literal option and fatals on the clash
+// ("Option 'irobf' registered more than once").  The user-facing switch stays
+// -irobf; only the legacy pass name becomes "irobf-pm".
+INITIALIZE_PASS_BEGIN(ObfuscationPassManager, "irobf-pm", "Enable IR Obfuscation",
                       false, false)
-INITIALIZE_PASS_END(ObfuscationPassManager, "irobf", "Enable IR Obfuscation",
+INITIALIZE_PASS_END(ObfuscationPassManager, "irobf-pm", "Enable IR Obfuscation",
                       false, false)
