@@ -19,14 +19,15 @@ struct IndirectGlobalVariable : public FunctionPass {
   static char ID;
   ObfuscationOptions *ArgsOptions;
 
-  std::unordered_map<Function *, std::set<GlobalVariable *>> FunctionGVs;
+  std::unordered_map<Function *, std::vector<GlobalVariable *>> FunctionGVs;
+  // Dedup only; the vector keeps module order (deterministic).
+  std::unordered_map<Function *, SmallPtrSet<GlobalVariable *, 16>> GVSeen;
 
   std::vector<Constant *> GlobalVariables;
   std::unordered_map<Constant *, unsigned> GVIndex;
   std::unordered_map<Constant *, uint64_t> GVKeys;
   std::vector<GlobalVariable *> GVPageTable;
 
-  CryptoUtils RandomEngine;
   uint64_t    PtrEncKey = 0;
   bool RunOnFuncChanged = false;
 
@@ -59,10 +60,11 @@ struct IndirectGlobalVariable : public FunctionPass {
               continue;
             }
 
-            FunctionGVs[&F].emplace(GV);
+            if (GVSeen[&F].insert(GV).second)
+              FunctionGVs[&F].push_back(GV);
             if (GVKeys.count(GV) == 0) {
               GlobalVariables.push_back(GV);
-              GVKeys[GV] = RandomEngine.get_uint64_t();
+              GVKeys[GV] = cryptoutils->get_uint64_t();
             }
           }
         }
@@ -88,12 +90,12 @@ struct IndirectGlobalVariable : public FunctionPass {
       return false;
     }
 
-    PtrEncKey = RandomEngine.get_uint64_t();
+    PtrEncKey = cryptoutils->get_uint64_t();
 
     CreatePageTableArgs createPageTableArgs;
     createPageTableArgs.CountLoop = 1;
     createPageTableArgs.GVNamePrefix = M.getName().str() + "_IndirectGVs" ;
-    createPageTableArgs.RandomEngine = &RandomEngine;
+    createPageTableArgs.RandomEngine = &*cryptoutils;
     createPageTableArgs.M = &M;
     createPageTableArgs.Objects = &GlobalVariables;
     createPageTableArgs.IndexMap = &GVIndex;
@@ -127,7 +129,7 @@ struct IndirectGlobalVariable : public FunctionPass {
     std::unordered_map<Constant *, uint64_t> FuncKeys;
     for (auto GV : FuncGVSet) {
       FuncGVs.push_back(GV);
-      FuncKeys[GV] = RandomEngine.get_uint64_t();
+      FuncKeys[GV] = cryptoutils->get_uint64_t();
     }
 
     std::vector<GlobalVariable *> FuncGVPageTable;
@@ -137,7 +139,7 @@ struct IndirectGlobalVariable : public FunctionPass {
       CreatePageTableArgs createPageTableArgs;
       createPageTableArgs.CountLoop = opt.level();
       createPageTableArgs.GVNamePrefix = M.getName().str() + Fn.getName().str() + "_IndirectGVs" ;
-      createPageTableArgs.RandomEngine = &RandomEngine;
+      createPageTableArgs.RandomEngine = &*cryptoutils;
       createPageTableArgs.M = &M;
       createPageTableArgs.Objects = &FuncGVs;
       createPageTableArgs.IndexMap = &GVIndex;

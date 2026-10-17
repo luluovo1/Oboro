@@ -23,7 +23,6 @@ namespace {
 class MsRttiEraser : public ModulePass {
 protected:
   ObfuscationOptions *ArgsOptions;
-  CryptoUtils         RandomEngine;
 
 public:
   static char ID;
@@ -89,7 +88,7 @@ public:
     passwd.append(ArgsOptions->randomSeed());
     passwd.append(rtti);
     uint8_t hash[32];
-    RandomEngine.sha256(passwd.c_str(), hash);
+    cryptoutils->sha256(passwd.c_str(), hash);
 
     SmallString<256> result = rtti;
 

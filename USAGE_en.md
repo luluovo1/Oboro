@@ -269,6 +269,8 @@ script, never the source**:
   "fla":  { "enable": true },
   "cse":  { "enable": true },
 
+  "seed": "0123456789abcdef0123456789abcdef",
+
   "deny": ["MyCodec::*", "vendor::**"],
 
   "patterns": [
@@ -285,6 +287,7 @@ script, never the source**:
 |---|---|
 | `<pass>.enable` | On/off switch (`true`/`false`) |
 | `<pass>.level` | Encryption strength 0~3 (CIE/CFE/INDBR/ICALL/INDGV) |
+| `seed` / `randomSeed` | Fixed 32-hex (16-byte) PRNG seed for **tests / audits / bug reproducers only**; empty means a random seed per build (production default). Never reuse one seed across releases |
 | `deny` | **Red-zone list**: matched functions are never obfuscated, even by annotation |
 | `patterns[].match` | Match demangled function names (class/namespace) |
 | `patterns[].file` | Match the source file name (no path) |

@@ -27,9 +27,12 @@ struct ConstantIntEncryption : public FunctionPass {
   static char         ID;
   ObfuscationOptions *ArgsOptions;
 
-  std::unordered_map<Function *, std::set<Instruction *>> FunctionModifyIRs;
+  std::unordered_map<Function *, std::vector<Instruction *>> FunctionModifyIRs;
+  // Dedup only; iteration always uses the insertion-ordered vector above so
+  // output does not depend on pointer addresses (ASLR).
+  std::unordered_map<Function *, SmallPtrSet<Instruction *, 16>>
+      FunctionModifySeen;
 
-  CryptoUtils         RandomEngine;
 
   ConstantIntEncryption(ObfuscationOptions *argsOptions) : FunctionPass(ID) {
     this->ArgsOptions = argsOptions;
@@ -71,7 +74,8 @@ struct ConstantIntEncryption : public FunctionPass {
             Value* Opr = PHI ? PHI->getIncomingValue(i) : I.getOperand(i);
             auto CTI = dyn_cast<ConstantInt>(Opr);
             if (CTI && CTI->getBitWidth() > 7) {
-              FunctionModifyIRs[&F].emplace(&I);
+              if (FunctionModifySeen[&F].insert(&I).second)
+                FunctionModifyIRs[&F].push_back(&I);
               break;
             }
           }
@@ -94,6 +98,9 @@ struct ConstantIntEncryption : public FunctionPass {
     // 统计常量出现次数：重复使用的常量在函数入口统一解密一次，
     // 避免每个使用点生成重复的加密全局与解密序列（体积/性能优化）
     std::unordered_map<ConstantInt *, unsigned> ConstUseCount;
+    // Deterministic first-use order (module/instruction order), so alloca
+    // numbering and PRNG consumption do not depend on hash iteration.
+    SmallVector<ConstantInt *, 16> ConstOrder;
     for (auto I : FuncModifyIRs) {
       auto CI = dyn_cast<CallInst>(I);
       auto GEP = dyn_cast<GetElementPtrInst>(I);
@@ -109,7 +116,9 @@ struct ConstantIntEncryption : public FunctionPass {
           if (PHI &&
               isa<SwitchInst>(PHI->getIncomingBlock(i)->getTerminator()))
             continue;
-          ConstUseCount[CTI]++;
+          unsigned &Cnt = ConstUseCount[CTI];
+          if (Cnt++ == 0)
+            ConstOrder.push_back(CTI);
         }
       }
     }
@@ -118,10 +127,9 @@ struct ConstantIntEncryption : public FunctionPass {
     std::unordered_map<ConstantInt *, AllocaInst *> DedupCache;
     auto &EntryBB = F.getEntryBlock();
     Instruction *AllocaInsertPt = &*EntryBB.begin();
-    for (auto &KV : ConstUseCount) {
-      if (KV.second <= 1)
+    for (auto *CTI : ConstOrder) {
+      if (ConstUseCount[CTI] <= 1)
         continue;
-      auto *CTI = KV.first;
       auto *Ty = CTI->getType();
       auto BitWidth = Ty->getPrimitiveSizeInBits().getFixedValue();
       if (BitWidth < 8)
@@ -140,10 +148,13 @@ struct ConstantIntEncryption : public FunctionPass {
       }
       if (!DecryptPt)
         DecryptPt = EntryBB.getTerminator();
-      for (auto &KV : DedupCache) {
-        Value *Dec = encryptConstant(KV.first, DecryptPt, &RandomEngine, opt.level());
+      for (auto *CTI : ConstOrder) {
+        auto CacheIt = DedupCache.find(CTI);
+        if (CacheIt == DedupCache.end())
+          continue;
+        Value *Dec = encryptConstant(CTI, DecryptPt, &*cryptoutils, opt.level());
         IRBuilder<NoFolder> SIB(DecryptPt);
-        SIB.CreateAlignedStore(Dec, KV.second, Align{1}, true);
+        SIB.CreateAlignedStore(Dec, CacheIt->second, Align{1}, true);
       }
     }
 
@@ -178,7 +189,7 @@ struct ConstantIntEncryption : public FunctionPass {
             CipherConstant = IRB.CreateAlignedLoad(
                 CTI->getType(), CacheIt->second, Align{1}, true);
           } else {
-            CipherConstant = encryptConstant(CTI, InsertPoint, &RandomEngine, opt.level());
+            CipherConstant = encryptConstant(CTI, InsertPoint, &*cryptoutils, opt.level());
           }
           if (PHI)
             PHI->setIncomingValue(i, CipherConstant);

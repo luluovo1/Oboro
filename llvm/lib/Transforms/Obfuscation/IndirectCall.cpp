@@ -19,8 +19,11 @@ struct IndirectCall : public FunctionPass {
   static char ID;
   ObfuscationOptions *ArgsOptions;
 
-  std::unordered_map<Function *, std::set<CallInst *>> FunctionCallSites;
-  std::unordered_map<Function *, std::set<Function *>> FunctionCallees;
+  std::unordered_map<Function *, std::vector<CallInst *>> FunctionCallSites;
+  std::unordered_map<Function *, std::vector<Function *>> FunctionCallees;
+  // Dedup only; vectors keep module order (deterministic).
+  std::unordered_map<Function *, SmallPtrSet<CallInst *, 16>> CallSiteSeen;
+  std::unordered_map<Function *, SmallPtrSet<Function *, 16>> CalleeSeen;
 
   std::vector<Constant *> Callees;
   std::unordered_map<Constant *, unsigned> CalleeIndex;
@@ -29,7 +32,6 @@ struct IndirectCall : public FunctionPass {
   std::unordered_map<Constant *, uint64_t> CalleeKeys;
   std::vector<GlobalVariable *> CalleePageTable;
 
-  CryptoUtils RandomEngine;
   uint64_t    PtrEncKey = 0;
   bool RunOnFuncChanged = false;
 
@@ -60,12 +62,14 @@ struct IndirectCall : public FunctionPass {
               continue;
             }
 
-            FunctionCallSites[&F].emplace(CI);
-            FunctionCallees[&F].emplace(Callee);
+            if (CallSiteSeen[&F].insert(CI).second)
+              FunctionCallSites[&F].push_back(CI);
+            if (CalleeSeen[&F].insert(Callee).second)
+              FunctionCallees[&F].push_back(Callee);
 
             if (CalleeKeys.count(Callee) == 0) {
               Callees.push_back(Callee);
-              CalleeKeys[Callee] = RandomEngine.get_uint64_t();
+              CalleeKeys[Callee] = cryptoutils->get_uint64_t();
             }
           }
         }
@@ -83,6 +87,8 @@ struct IndirectCall : public FunctionPass {
     CalleeIndex.clear();
     FunctionCallSites.clear();
     FunctionCallees.clear();
+    CallSiteSeen.clear();
+    CalleeSeen.clear();
     Callees.clear();
     CalleePageTable.clear();
     CalleeKeys.clear();
@@ -92,12 +98,12 @@ struct IndirectCall : public FunctionPass {
       return false;
     }
 
-    PtrEncKey = RandomEngine.get_uint64_t();
+    PtrEncKey = cryptoutils->get_uint64_t();
 
     CreatePageTableArgs createPageTableArgs;
     createPageTableArgs.CountLoop = 1;
     createPageTableArgs.GVNamePrefix = M.getName().str() + "_IndirectCallee" ;
-    createPageTableArgs.RandomEngine = &RandomEngine;
+    createPageTableArgs.RandomEngine = &*cryptoutils;
     createPageTableArgs.M = &M;
     createPageTableArgs.Objects = &Callees;
     createPageTableArgs.IndexMap = &CalleeIndex;
@@ -131,7 +137,7 @@ struct IndirectCall : public FunctionPass {
     std::unordered_map<Constant *, uint64_t> FuncKeys;
     for (auto callee : FuncCalleesSet) {
       FuncCallees.push_back(callee);
-      FuncKeys[callee] = RandomEngine.get_uint64_t();
+      FuncKeys[callee] = cryptoutils->get_uint64_t();
     }
 
     std::vector<GlobalVariable *> FuncCalleePageTable;
@@ -141,7 +147,7 @@ struct IndirectCall : public FunctionPass {
       CreatePageTableArgs createPageTableArgs;
       createPageTableArgs.CountLoop = opt.level();
       createPageTableArgs.GVNamePrefix = M.getName().str() + Fn.getName().str() + "_IndirectCallee" ;
-      createPageTableArgs.RandomEngine = &RandomEngine;
+      createPageTableArgs.RandomEngine = &*cryptoutils;
       createPageTableArgs.M = &M;
       createPageTableArgs.Objects = &FuncCallees;
       createPageTableArgs.IndexMap = &CalleeIndex;
@@ -154,13 +160,17 @@ struct IndirectCall : public FunctionPass {
 
     // 统计被调函数出现次数：重复调用的函数在入口统一解密一次
     std::unordered_map<Function *, unsigned> CalleeUseCount;
+    SmallVector<Function *, 16> CalleeOrder;
     for (auto CI : CallSites) {
       CallBase *CB = CI;
       Function *Callee = CB->getCalledFunction();
       if (!Callee)
         Callee = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
-      if (Callee)
-        CalleeUseCount[Callee]++;
+      if (Callee) {
+        unsigned &Cnt = CalleeUseCount[Callee];
+        if (Cnt++ == 0)
+          CalleeOrder.push_back(Callee);
+      }
     }
 
     // 重复被调函数在函数入口解密一次并缓存
@@ -168,11 +178,11 @@ struct IndirectCall : public FunctionPass {
     auto &EntryBB = Fn.getEntryBlock();
     Instruction *AllocaInsertPt = &*EntryBB.begin();
     auto *PtrTy = PointerType::getUnqual(Fn.getContext());
-    for (auto &KV : CalleeUseCount) {
-      if (KV.second <= 1)
+    for (auto *Callee : CalleeOrder) {
+      if (CalleeUseCount[Callee] <= 1)
         continue;
       IRBuilder<> AIB(AllocaInsertPt);
-      CalleeDedupCache[KV.first] = AIB.CreateAlloca(PtrTy, nullptr);
+      CalleeDedupCache[Callee] = AIB.CreateAlloca(PtrTy, nullptr);
     }
 
     if (!CalleeDedupCache.empty()) {
@@ -185,8 +195,10 @@ struct IndirectCall : public FunctionPass {
       }
       if (!DecryptPt)
         DecryptPt = EntryBB.getTerminator();
-      for (auto &KV : CalleeDedupCache) {
-        Function *Callee = KV.first;
+      for (auto *Callee : CalleeOrder) {
+        auto DedupIt = CalleeDedupCache.find(Callee);
+        if (DedupIt == CalleeDedupCache.end())
+          continue;
         BuildDecryptArgs buildDecrypt;
         buildDecrypt.FuncLoopCount = opt.level();
         buildDecrypt.NextIndex = opt.level() ?
@@ -204,7 +216,7 @@ struct IndirectCall : public FunctionPass {
 
         auto DecPtr = buildPageTableDecryptIR(buildDecrypt);
         IRBuilder<> SIB(DecryptPt);
-        SIB.CreateAlignedStore(DecPtr, KV.second, Align{1}, true);
+        SIB.CreateAlignedStore(DecPtr, DedupIt->second, Align{1}, true);
       }
     }
 

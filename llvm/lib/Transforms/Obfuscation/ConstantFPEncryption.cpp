@@ -27,9 +27,11 @@ struct ConstantFPEncryption : public FunctionPass {
   static char         ID;
   ObfuscationOptions *ArgsOptions;
 
-  std::unordered_map<Function *, std::set<Instruction *>> FunctionModifyIRs;
+  std::unordered_map<Function *, std::vector<Instruction *>> FunctionModifyIRs;
+  // Dedup only; the vector keeps module order (deterministic).
+  std::unordered_map<Function *, SmallPtrSet<Instruction *, 16>>
+      FunctionModifySeen;
 
-  CryptoUtils         RandomEngine;
 
   ConstantFPEncryption(ObfuscationOptions *argsOptions) : FunctionPass(ID) {
     this->ArgsOptions = argsOptions;
@@ -70,7 +72,8 @@ struct ConstantFPEncryption : public FunctionPass {
             }
             Value* Opr = PHI ? PHI->getIncomingValue(i) : I.getOperand(i);
             if (isa<ConstantFP>(Opr)) {
-              FunctionModifyIRs[&F].emplace(&I);
+              if (FunctionModifySeen[&F].insert(&I).second)
+                FunctionModifyIRs[&F].push_back(&I);
               break;
             }
           }
@@ -138,7 +141,7 @@ struct ConstantFPEncryption : public FunctionPass {
       if (!DecryptPt)
         DecryptPt = EntryBB.getTerminator();
       for (auto &KV : DedupCache) {
-        Value *Dec = encryptConstant(KV.first, DecryptPt, &RandomEngine, opt.level());
+        Value *Dec = encryptConstant(KV.first, DecryptPt, &*cryptoutils, opt.level());
         IRBuilder<NoFolder> SIB(DecryptPt);
         SIB.CreateAlignedStore(Dec, KV.second, Align{1}, true);
       }
@@ -172,7 +175,7 @@ struct ConstantFPEncryption : public FunctionPass {
             CipherConstant = IRB.CreateAlignedLoad(
                 CFP->getType(), CacheIt->second, Align{1}, true);
           } else {
-            CipherConstant = encryptConstant(CFP, InsertPoint, &RandomEngine, opt.level());
+            CipherConstant = encryptConstant(CFP, InsertPoint, &*cryptoutils, opt.level());
           }
           if (PHI)
             PHI->setIncomingValue(i, CipherConstant);

@@ -19,15 +19,17 @@ struct IndirectBranch : public FunctionPass {
   static char ID;
   ObfuscationOptions *ArgsOptions;
 
-  std::unordered_map<Function *, std::set<Constant *>> FunctionBBs;
-  std::unordered_map<Function *, std::set<BranchInst *>> FunctionBrs;
+  std::unordered_map<Function *, std::vector<Constant *>> FunctionBBs;
+  std::unordered_map<Function *, std::vector<BranchInst *>> FunctionBrs;
+  // Dedup only; vectors keep module order (deterministic).
+  std::unordered_map<Function *, SmallPtrSet<Constant *, 16>> BBSeen;
+  std::unordered_map<Function *, SmallPtrSet<BranchInst *, 16>> BrSeen;
 
   std::vector<Constant *> BBAddrTargets;
   std::unordered_map<Constant *, unsigned> BBIndex;
   std::unordered_map<Constant *, uint64_t> BBKeys;
   std::vector<GlobalVariable *> BBPageTable;
 
-  CryptoUtils RandomEngine;
   uint64_t    PtrEncKey = 0;
   bool RunOnFuncChanged = false;
 
@@ -45,16 +47,18 @@ struct IndirectBranch : public FunctionPass {
         continue;
       }
       SplitAllCriticalEdges(F, CriticalEdgeSplittingOptions(nullptr, nullptr));
-      uint64_t BBKey = RandomEngine.get_uint64_t();
+      uint64_t BBKey = cryptoutils->get_uint64_t();
       for (auto &BB : F) {
         if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator())) {
           if (BI->isConditional()) {
-            FunctionBrs[&F].emplace(BI);
+            if (BrSeen[&F].insert(BI).second)
+              FunctionBrs[&F].push_back(BI);
             unsigned N = BI->getNumSuccessors();
             for (unsigned I = 0; I < N; I++) {
               BasicBlock *Successor = BI->getSuccessor(I);
               auto BBAddr = BlockAddress::get(Successor);
-              FunctionBBs[&F].emplace(BBAddr);
+              if (BBSeen[&F].insert(BBAddr).second)
+                FunctionBBs[&F].push_back(BBAddr);
               if (BBKeys.count(BBAddr) == 0) {
                 BBAddrTargets.push_back(BBAddr);
                 BBKeys[BBAddr] = BBKey;
@@ -78,6 +82,8 @@ struct IndirectBranch : public FunctionPass {
     BBPageTable.clear();
     FunctionBBs.clear();
     FunctionBrs.clear();
+    BBSeen.clear();
+    BrSeen.clear();
     BBAddrTargets.clear();
     BBKeys.clear();
 
@@ -86,12 +92,12 @@ struct IndirectBranch : public FunctionPass {
       return false;
     }
 
-    PtrEncKey = RandomEngine.get_uint64_t();
+    PtrEncKey = cryptoutils->get_uint64_t();
 
     CreatePageTableArgs createPageTableArgs;
     createPageTableArgs.CountLoop = 1;
     createPageTableArgs.GVNamePrefix = M.getName().str() + "_IndirectBr" ;
-    createPageTableArgs.RandomEngine = &RandomEngine;
+    createPageTableArgs.RandomEngine = &*cryptoutils;
     createPageTableArgs.M = &M;
     createPageTableArgs.Objects = &BBAddrTargets;
     createPageTableArgs.IndexMap = &BBIndex;
@@ -128,7 +134,7 @@ struct IndirectBranch : public FunctionPass {
 
     std::vector<Constant *> FuncBBs;
     std::unordered_map<Constant *, uint64_t> FuncKeys;
-    auto FuncKey = RandomEngine.get_uint64_t();
+    auto FuncKey = cryptoutils->get_uint64_t();
 
     for (auto bb : FuncBBsSet) {
       FuncBBs.push_back(bb);
@@ -142,7 +148,7 @@ struct IndirectBranch : public FunctionPass {
       CreatePageTableArgs createPageTableArgs;
       createPageTableArgs.CountLoop = opt.level();
       createPageTableArgs.GVNamePrefix = M.getName().str() + Fn.getName().str() + "_IndirectBr" ;
-      createPageTableArgs.RandomEngine = &RandomEngine;
+      createPageTableArgs.RandomEngine = &*cryptoutils;
       createPageTableArgs.M = &M;
       createPageTableArgs.Objects = &FuncBBs;
       createPageTableArgs.IndexMap = &BBIndex;

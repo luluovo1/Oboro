@@ -259,6 +259,8 @@ L3 站点。
   "fla":  { "enable": true },
   "cse":  { "enable": true },
 
+  "seed": "0123456789abcdef0123456789abcdef",
+
   "deny": ["MyCodec::*", "vendor::**"],
 
   "patterns": [
@@ -275,6 +277,7 @@ L3 站点。
 |---|---|
 | `<pass>.enable` | 开关（`true`/`false`） |
 | `<pass>.level` | 加密强度 0~3（CIE/CFE/INDBR/ICALL/INDGV 有效） |
+| `seed` / `randomSeed` | 32 位十六进制（16 字节）固定随机种子，**仅用于测试/审计/问题复现**；不填则每次构建随机（生产默认）。不要跨版本复用同一个 seed |
 | `deny` | **红区名单**：命中的函数永不混淆，注解也无法解锁 |
 | `patterns[].match` | 按 demangled 函数名匹配（类/命名空间） |
 | `patterns[].file` | 按源文件名匹配（不含路径） |

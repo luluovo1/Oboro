@@ -6,6 +6,10 @@
 #include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationPassManager.h"
+// CryptoUtils.h defines a function-like macro `R`, which collides with
+// std::function template parameters in CommandLine.h if included earlier.
+#include "llvm/CryptoUtils.h"
+#undef R
 
 
 #define DEBUG_TYPE "ir-obfuscation"
@@ -194,6 +198,16 @@ struct ObfuscationPassManager : public ModulePass {
     }
 
     const auto Options(getOptions());
+
+    // Reproducible mode (tests / audits / bug reproducers): a config-provided
+    // seed fixes the shared AES-CTR stream for every pass in this module.
+    // Without it the PRNG seeds itself from time/urandom, so two builds of the
+    // same source differ -- which is the intended production behaviour.
+    if (!Options->randomSeed().empty()) {
+      std::string Seed(Options->randomSeed());
+      cryptoutils->prng_seed(Seed);
+    }
+
     unsigned   pointerSize = M.getDataLayout().getTypeAllocSize(
         PointerType::getUnqual(M.getContext()));
 

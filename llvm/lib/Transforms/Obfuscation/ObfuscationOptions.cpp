@@ -395,12 +395,36 @@ std::shared_ptr<ObfuscationOptions> ObfuscationOptions::readConfigFile(
 
   SmallVector<std::shared_ptr<ObfOpt>> allOpt = result->getAllOpt();
   for (auto &obj : *rootObj) {
-    if (obj.getFirst().str() == "randomSeed") {
+    std::string Key = obj.getFirst().str();
+    if (Key == "randomSeed" || Key == "seed") {
+      // Optional deterministic seed.  Empty (default) keeps the time/urandom
+      // seed, so every build differs; a valid 16-byte hex seed makes the
+      // obfuscation reproducible for tests, audits and bug reproducers.
       if (auto objStr = obj.getSecond().getAsString()) {
-        const auto &seedStr = objStr.value();
-        auto &seed = result->randomSeed();
-        seed = seedStr;
-        seed.resize(32, 0);
+        StringRef SeedStr = objStr.value();
+        StringRef Hex = SeedStr;
+        bool Valid = SeedStr.size() == 32;
+        if (SeedStr.size() == 34 && SeedStr.starts_with_insensitive("0x")) {
+          Valid = true;
+          Hex = SeedStr.drop_front(2);
+        }
+        if (Valid) {
+          for (char C : Hex) {
+            if (!((C >= '0' && C <= '9') || (C >= 'a' && C <= 'f') ||
+                  (C >= 'A' && C <= 'F'))) {
+              Valid = false;
+              break;
+            }
+          }
+        }
+        if (Valid)
+          result->randomSeed() = SeedStr;
+        else
+          llvm::errs() << "warning: \"" << Key
+                       << "\" must be 32 hex chars (16 bytes, optional 0x "
+                          "prefix); ignoring, using a random seed\n";
+      } else {
+        llvm::errs() << "warning: \"" << Key << "\" must be a string\n";
       }
       continue;
     }

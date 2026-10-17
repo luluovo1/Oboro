@@ -39,7 +39,6 @@ struct Flattening : public FunctionPass {
   static char ID; // Pass identification, replacement for typeid
 
   ObfuscationOptions *ArgsOptions;
-  CryptoUtils         RandomEngine;
 
   Flattening(unsigned            pointerSize,
              ObfuscationOptions *argsOptions) : FunctionPass(ID) {
@@ -92,7 +91,7 @@ bool Flattening::flatten(Function *f, const ObfOpt &opt) {
 
   // 随机数源（保留 CryptoUtils 架构）
   auto randWord = [&]() -> uint64_t {
-    uint64_t v = RandomEngine.get_uint64_t();
+    uint64_t v = cryptoutils->get_uint64_t();
     if (pointerSize != 8)
       v &= 0xffffffffull;
     return v;
@@ -124,7 +123,7 @@ bool Flattening::flatten(Function *f, const ObfOpt &opt) {
   auto insertBlock = &*(f->begin());
   auto splitPos = insertBlock->getFirstNonPHIOrDbgOrAlloca();
 
-  std::mt19937_64 re(RandomEngine.get_uint64_t());
+  std::mt19937_64 re(cryptoutils->get_uint64_t());
   std::shuffle(origBB.begin(), origBB.end(), re);
 
   auto bbEndOfEntry = insertBlock->splitBasicBlock(splitPos, "first");
