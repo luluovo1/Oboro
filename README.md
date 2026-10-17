@@ -35,7 +35,7 @@ Obfuscation capabilities at a glance:
 - **Indirection obfuscation**: INDBR (indirect branches), ICALL (indirect calls), INDGV (indirect global variable access) — encryption loop levels 0–3
 - **Data obfuscation**: CSE (string encryption), CIE (integer constant encryption), CFE (floating-point constant encryption)
 - **Extra protection**: RTTI name erasure (experimental)
-- **Three control interfaces**: command-line flags, per-function `annotate` attributes, JSON config file (`-samsara-cfg`)
+- **Three control interfaces**: command-line flags, per-function `annotate` attributes, JSON config file (`-oboro-cfg`)
 
 > 📖 The full **flag reference** and **before/after obfuscation comparisons** (IDA disassembly views / Graph View) are detailed usage documentation, kept in → [**Usage Manual (USAGE_en.md)**](./USAGE_en.md)
 
@@ -83,13 +83,18 @@ This project builds on [Arkari](https://github.com/KomiMoe/Arkari) as its core o
 | Control-flow flattening (FLA) | Standard implementation | Ported and adapted from Arkari |
 | Indirect branches (INDBR) | Standard encrypted page table | Ported and adapted from Arkari |
 | Indirect calls (ICALL) | Standard encrypted page table | Ported and adapted from Arkari |
-| Bogus control flow (BCF) | Not included | Included |
-| Active stack corruption | Not included | Deprecated |
+| Bogus control flow (BCF) | Not included | **BCF v2**: 11 randomized opaque-predicate families, randomized poison payloads (AArch64 SP-convergence / x86_64 JUMPOUT) |
+| Anti-emulation decoy | Not included | **Opt-in**: probe-driven L1 reconverge / L3 value pollution |
+| Safety floor | Not included | **Red/yellow zones**: weak symbols, C++ runtime glue, ctors/dtors/operators are never obfuscated |
+| Policy system | CLI flags only | **Config-first**: JSON `deny` + class/file `patterns` with field-level cascade |
 | Compatibility | Generic | Generic |
 
 Key differences in detail:
 
-- Added the **BCF (Bogus Control Flow)** pass using opaque predicates `(x*(x+1))%2==0` to inject unreachable diamond-shaped branches, degrading IDA Hex-Rays decompilation quality
+- Added the **BCF (Bogus Control Flow)** pass. v2 picks one of 11 mathematically proven opaque predicates at random per compilation (wraparound-safe, pre-filtered against InstSimplify), randomizes the input transform / polarity / payload constants, and injects either a poison dead block or an opt-in decoy block
+- **Safety floor** enforced inside `toObfuscate()`: red zone (weak symbols incl. all STL template instances, `__cxa_`/`__gxx_` glue, static ctor/dtor list, `operator new/delete`) is never obfuscated even by annotation; yellow zone (ctors/dtors/other operators) needs an explicit per-function annotation or an exact-name config pattern
+- **Config-first policy**: `-oboro-cfg=policy.json` supports a `deny` list and class/namespace/file `patterns`, with a field-level cascade (`annotation > class pattern > file pattern > CLI > config > built-in`)
+- **decoy (opt-in)**: the toolchain never detects environments itself. Your app provides `__oboro_probe()`; when it returns 0 the obfuscated code silently follows decoy paths — L1 stays semantically correct (trace noise), L3 pollutes values (wrong but executable results) behind a hard def-use safety filter
 - Removed the ineffective PseudoStackOffset pass
 - Fixed the `CryptoUtils.h` macro pollution issue affecting MSVC compilation
 

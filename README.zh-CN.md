@@ -35,7 +35,7 @@
 - **间接化混淆**：INDBR 间接分支、ICALL 间接调用、INDGV 间接全局变量（支持加密循环层数 0–3）
 - **数据混淆**：CSE 字符串加密、CIE 整数常量加密、CFE 浮点常量加密
 - **辅助保护**：RTTI 类型信息擦除（实验性）
-- **三种控制方式**：命令行参数、函数级 `annotate` 注解、JSON 配置文件（`-samsara-cfg`）
+- **三种控制方式**：命令行参数、函数级 `annotate` 注解、JSON 配置文件（`-oboro-cfg`）
 
 > 📖 完整的**参数速查表**与**混淆前后效果对比**（IDA 反汇编视图 / Graph View）属于详细使用说明，已迁移至 → [**混淆使用手册（USAGE.md）**](./USAGE.md)
 
@@ -83,13 +83,18 @@ clang -O2 -mllvm -irobf-cse -mllvm -irobf-icall foo.c -o foo
 | 控制流平坦化 (FLA) | 标准实现 | 基于 Arkari 适配迁移 |
 | 间接分支 (INDBR) | 标准加密页表 | 基于 Arkari 适配迁移 |
 | 间接调用 (ICALL) | 标准加密页表 | 基于 Arkari 适配迁移 |
-| 虚假控制流 (BCF) | 不含 | 包含 |
-| 主动栈破坏 | 不含 | 弃用 |
+| 虚假控制流 (BCF) | 不含 | **BCF v2**：11 族随机不透明谓词 + 随机毒载荷（AArch64 SP 收敛 / x86_64 JUMPOUT） |
+| 反模拟诱饵 | 不含 | **可选**：probe 驱动 L1 重汇聚 / L3 值污染 |
+| 安全底线 | 不含 | **红/黄区**：weak 符号、C++ 运行时胶水、构造/析构/运算符永不混淆 |
+| 策略系统 | 仅命令行 | **config 优先**：JSON `deny` + 类/文件 `patterns`，字段级级联 |
 | 兼容性 | 通用 | 通用 |
 
 细节差异：
 
-- 新增 **BCF（虚假控制流）** Pass：使用不透明谓词 `(x*(x+1))%2==0` 注入不可达的菱形分支，显著降低 IDA Hex-Rays 反编译质量
+- 新增 **BCF（虚假控制流）** Pass。v2 每次编译从 11 个数学上严格恒真的谓词族中随机选择（回绕安全、经 InstSimplify 折叠筛选），并随机化输入变换 / 极性 / 载荷常量；注入毒块或可选的诱饵块
+- **安全底线**统一实现在 `toObfuscate()`：红区（weak 符号含全部 STL 模板实例、`__cxa_`/`__gxx_` 胶水、静态构造/析构列表、`operator new/delete`）永不混淆，注解也无法解锁；黄区（构造/析构/其他运算符）需逐函数注解或精确函数名 config pattern 才能解锁
+- **config 优先策略**：`-oboro-cfg=policy.json` 支持 `deny` 名单与类/命名空间/文件 `patterns`，字段级级联（`注解 > 类 pattern > 文件 pattern > CLI > config > 内置`）
+- **decoy（可选）**：工具链不做任何环境检测。由 App 提供 `__oboro_probe()`；返回 0 时代码静默走诱饵路径——L1 语义完全正确（trace 噪声），L3 污染数值（错误但可执行），并受硬性危险链过滤保护
 - 移除无效的 PseudoStackOffset Pass
 - 修复 `CryptoUtils.h` 宏污染导致的 MSVC 编译问题
 

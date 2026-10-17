@@ -41,7 +41,7 @@ All obfuscation flags are passed to the compiler via `-mllvm -<flag>`.
 | `-irobf-cfe` | bool | false | Floating-point constant encryption (double/float literals) · [before/after](#cfe-floating-point-constant-encryption) |
 | `-level-cfe` | int | 0 | Floating-point constant encryption strength |
 | `-irobf-rtti` | bool | false | Erase C++ RTTI type information (experimental) |
-| `-samsara-cfg` | string | "" | Path to a JSON obfuscation config file |
+| `-oboro-cfg` | string | "" | Path to a JSON obfuscation config file |
 
 ---
 
@@ -63,20 +63,100 @@ All obfuscation flags are passed to the compiler via `-mllvm -<flag>`.
 ```
 Puts all basic blocks of a function into a switch-loop dispatcher, hiding the original control-flow structure. The switch values are XOR-encrypted to defeat IDA value tracking.
 
-#### Bogus Control Flow (BCF) ⭐ New
+#### Bogus Control Flow (BCF) v2
 ```bash
 -mllvm -irobf-bcf
--mllvm -irobf-bcf_prob=70   # optional, injection probability 0~100, default 70
+-mllvm -irobf-bcf_prob=70      # optional, per-block injection probability 0~100, default 70
+-mllvm -irobf-bcf_pred=3       # optional, force predicate family 1~11 (0=random, testing)
 ```
-Injects a bogus branch guarded by an **opaque predicate** (`(x*(x+1))%2==0`, always true) into every basic block, building an **irreducible CFG**.
 
-**Effect**: makes IDA Hex-Rays decompilation fail with `optimizations loop too much`.
+Injects an **opaque-predicate diamond** into every basic block: the true edge runs the
+original code, the false edge is a never-executed dead block carrying an
+anti-decompiler payload. The predicate is chosen **at random per compilation** from
+11 mathematical families (all wraparound-safe on 2^64 and pre-filtered against
+InstSimplify folding), combined with randomized input transforms, randomized
+polarity flips, and a 1-in-5 chance of a two-family composition.
 
-Example:
+The payload is randomized as well: AArch64 uses SP-convergence poisoning
+(`add sp, sp, #random`, producing Hex-Rays `sp-analysis failed`); x86_64 uses random
+byte sequences that create JUMPOUTs (jumping into the middle of an instruction).
+The old fixed fingerprints (`#0x100` / `B8 11 11 11 11`) are gone.
+
+**Effect**: IDA's graph view fills with diamonds, decompilation quality collapses or
+fails outright; this is the strongest lever against automated pipelines and LLM-based
+reverse-engineering agents.
+
 ```bash
 # Force 100% injection on all blocks
 clang -O2 -mllvm -irobf-bcf -mllvm -irobf-bcf_prob=100 test.c -o test
 ```
+
+> Runtime safety: the predicate is mathematically always true, so the dead block is
+> never executed. Safety comes from unreachability, not from "an unbalanced stack
+> that happens to work".
+
+#### decoy Anti-Emulation (BCF extension, off by default)
+
+The toolchain performs **no environment detection of any kind**. Detection lives in
+your app and is exposed through a weak symbol `__oboro_probe` (non-zero = real path,
+zero = decoy path):
+
+```c
+// Your app source (not part of the toolchain repo)
+extern "C" int __oboro_probe(void);
+extern "C" int __oboro_probe(void) {
+    // Your detection: emulator / cloud phone / debugger / tampering ... up to you
+    return suspicious ? 0 : 1;
+}
+```
+
+**Eligibility gate**: decoy can only be enabled by a **function annotation** or a
+**config pattern**. Command-line flags (.mk / CMake) can never open it — this prevents
+one global flag from spreading decoy over every function.
+
+```c
+__attribute__((annotate("+bcf_decoy")))          // enable decoy for this function (L1)
+__attribute__((annotate("^bcf_decoy=50")))       // 50% of BCF sites become decoys
+__attribute__((annotate("+bcf_decoy_pollute")))  // upgrade to L3 value pollution
+```
+
+```json
+{ "patterns": [
+  { "match": "Crypto::**", "bcf": { "enable": true, "decoy": 80, "decoy_pollute": true } }
+] }
+```
+
+| Level | Behavior | Runtime result |
+|---|---|---|
+| **L1 reconverge** | Decoy block runs pure register noise, then falls into the real block which recomputes everything | **Fully correct** (trace/CFG noise only) |
+| **L3 pollution** | Decoy block is a clone of the original with a safe constant mutation, jumping straight to the successor | **Wrong but executable** (the analyst gets untrustworthy results) |
+
+L3 has hard def-use filters: if the mutated value can reach a division/remainder,
+memory address, array index, call argument, branch condition, indirect jump,
+FP→int conversion, or atomic operation, the site automatically falls back to L1.
+At most 4 L3 sites per function by default.
+
+**Transport**: two shares (`env ^ K1`, `env ^ K2`) whose keys are derived from
+function addresses (ASLR-randomized) and never stored; both shares are verified on
+every call, and a mismatch sets a sticky `tampered` flag that routes the rest of the
+process through decoys. No runtime sampling.
+
+Testing knobs (hidden): `-mllvm -irobf-force-decoy`, `-mllvm -irobf-force-real`,
+`-mllvm -irobf-probe-symbol=xxx`.
+
+> No probe, not initialized, or a probe with a wrong signature → the real path is
+> used (fail-open), so artifacts stay stable on real devices, emulators, cloud
+> phones, and any architecture.
+
+**Deployment constraints (measured)**:
+
+| Scenario | Result |
+|---|---|
+| probe and obfuscated code in the same TU / same .so | ✅ works (recommended; `hidden` visibility is enough) |
+| multiple obfuscated .so files, each with its own probe | ✅ each binds its own probe (independent under RTLD_LOCAL, measured) |
+| probe in a static `libprobe.a`, plain link | ❌ **not extracted** (the toolchain's weak definition already satisfies the reference) → decoy silently disabled |
+| probe in a static lib + `-Wl,--whole-archive` | ✅ works (measured) |
+| cross-.so dependency (A.so's probe used by B.so) | ❌ unsupported; the probe must be in the same link unit as each obfuscated .so |
 
 ---
 
@@ -172,14 +252,83 @@ Erases C++ RTTI information, preventing reverse-engineering tools from recoverin
 
 ---
 
-## Using a Config File (samsara)
+## Using a Config File (oboro) ⭐ Recommended
 
-A JSON config file can be used instead of command-line flags:
+Managing policy through a JSON config file is recommended — **you only touch the build
+script, never the source**:
+
 ```bash
--mllvm -samsara-cfg=obf_config.json
+-mllvm -oboro-cfg=obf_config.json
 ```
 
-The config file allows per-function obfuscation levels; see the attribute annotation mechanism in `Flattening.cpp` / `ObfuscationOptions.cpp`.
+### Full example
+
+```json
+{
+  "bcf":  { "enable": true, "level": 1 },
+  "fla":  { "enable": true },
+  "cse":  { "enable": true },
+
+  "deny": ["MyCodec::*", "vendor::**"],
+
+  "patterns": [
+    { "match": "crypto::aes::**", "bcf": { "decoy": 80, "decoy_pollute": true } },
+    { "match": "License::verify", "bcf": { "decoy": 50 } },
+    { "file": "*generated_*.cpp", "bcf": { "enable": false } }
+  ]
+}
+```
+
+### Fields
+
+| Field | Meaning |
+|---|---|
+| `<pass>.enable` | On/off switch (`true`/`false`) |
+| `<pass>.level` | Encryption strength 0~3 (CIE/CFE/INDBR/ICALL/INDGV) |
+| `deny` | **Red-zone list**: matched functions are never obfuscated, even by annotation |
+| `patterns[].match` | Match demangled function names (class/namespace) |
+| `patterns[].file` | Match the source file name (no path) |
+| `patterns[].bcf.decoy` | decoy eligibility + ratio (0~100) |
+| `patterns[].bcf.decoy_pollute` | L3 value-pollution switch |
+
+### Matching rules
+
+| Pattern | Matches | Does not match |
+|---|---|---|
+| `test` | global `test` only | `Class::test`, `ns::test` |
+| `Class::*` | one level of members under `Class` | globals, deeper nesting |
+| `Class::**` | any depth under `Class` | globals |
+| `**::test` | `test` at any scope (including global) | — |
+| `**` | every function | — |
+
+`*` never crosses `::`; `**` does (same model as ProGuard). Overloads are matched by
+name without parameters (all overloads of the same name match); `operator*` contains
+a literal `*` and cannot be matched exactly by a pattern — use a function annotation.
+
+### Priority chain (more specific wins)
+
+```
+1. Red zone (built-in hard floor)   never obfuscated, annotations cannot override
+2. deny list (config)               never obfuscated
+3. Yellow zone (built-in default)   skipped unless unlocked by a per-function
+                                    annotation or an exact-name pattern
+4. Function annotation
+5. Class/namespace pattern
+6. File pattern
+7. CLI flags (assembled by .mk / CMake)
+8. Config global
+9. Built-in default
+```
+
+### Built-in safety floor
+
+| Level | Covered | Notes |
+|---|---|---|
+| 🔴 Red | weak functions (all STL template instances), C++ runtime glue (`__cxa_`/`__gxx_`/`_GLOBAL__`), static ctor/dtor list functions, `operator new/delete` | Never obfuscated; **annotations cannot override** (a compile-time warning is emitted) |
+| 🟡 Yellow | constructors, destructors, other `operator`s | Skipped by default; only a per-function `+bcf` annotation or an **exact function name** pattern (no `*` at all) + `enable:true` unlocks them |
+
+The safety floor applies uniformly to **all 8 obfuscation/encryption passes**
+(BCF/FLA/INDBR/ICALL/INDGV/CSE/CIE/CFE) and cannot be bypassed from the command line.
 
 ---
 
