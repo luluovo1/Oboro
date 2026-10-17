@@ -5,28 +5,72 @@
 #include "llvm/IR/Function.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringMap.h"
+#include <optional>
+#include <vector>
 
 
 namespace llvm {
 
 SmallVector<std::string> readAnnotate(Function *f);
 
+// 读取函数上的 decoy 注解（+bcf_decoy / -bcf_decoy / ^bcf_decoy=N）。
+// 返回 std::nullopt 表示没有 decoy 注解（该函数不进入 decoy 资格门）。
+// 多条 decoy 注解时后写覆盖先写。
+std::optional<uint32_t> readDecoyAnnotation(Function *f);
+// 读取 L3 值污染注解（+bcf_decoy_pollute / -bcf_decoy_pollute）。
+// 只有 decoy>0 的函数才可能真正生效；pollute 本身不构成 decoy 资格。
+std::optional<bool> readDecoyPolluteAnnotation(Function *f);
+
+// config "patterns" 段的单条规则（分级策略的中间层）：
+//   "match"  —— demangled 函数名 pattern（'*' 不跨 "::"，'**' 跨 "::"；
+//                空 = 不做函数名约束）
+//   "file"   —— 源文件 basename pattern（空 = 不做文件约束）
+//   两个字段可同时出现（AND 语义：都匹配才生效）。
+//   其余 key 为 pass 名（bcf/fla/...），值是 {"enable": bool, "level": int}
+//   的字段级覆盖——规则只覆盖它显式设置的字段，其余向上层继承。
+// 优先级：函数注解 > 含 match 的规则（类/命名空间层）> 纯 file 规则（文件层）
+//         > CLI > config 全局 > 内置默认；同层按声明顺序，后写覆盖先写。
+struct ConfigPatternRule {
+  std::string NamePattern;
+  std::string FilePattern;
+  struct OptOverride {
+    std::optional<bool>     Enable;
+    std::optional<uint32_t> Level;
+    // decoy 比例（0-100）。只有显式写 "decoy" 的函数才进入 decoy 资格门；
+    // 该字段与 Level 一样按字段级级联（未写的层不覆盖上层）。
+    std::optional<uint32_t> Decoy;
+    // L3 值污染开关（仅对 decoy>0 的函数有效）。缺省 false = 只做 L1。
+    std::optional<bool>     DecoyPollute;
+  };
+  llvm::StringMap<OptOverride> Overrides;
+};
+
 class ObfOpt {
 protected:
   uint32_t    Enabled : 1;
   uint32_t    Level   : 2;
+  // decoy 比例（0-100）：仅 BCF 使用；0 表示该函数不进入 decoy 资格门。
+  // 资格只能由函数注解或 config pattern 显式设置，CLI 不能全局打开。
+  uint32_t    Decoy   : 7;
+  // L3 值污染：仅 decoy>0 时生效；默认关（只做 L1 重汇聚）。
+  uint32_t    DecoyPollute : 1;
   std::string AttributeName;
 
 public:
   ObfOpt(bool enable, uint32_t level, const std::string &attributeName) {
     this->Enabled = enable;
     this->Level = std::min<uint32_t>(level, 3);
+    this->Decoy = 0;
+    this->DecoyPollute = 0;
     this->AttributeName = attributeName;
   }
 
   ObfOpt(const std::string &attributeName) {
     this->Enabled = false;
     this->Level = 0;
+    this->Decoy = 0;
+    this->DecoyPollute = 0;
     this->AttributeName = attributeName;
   }
 
@@ -52,12 +96,28 @@ public:
     this->Level = std::min<uint32_t>(level, 3);
   }
 
+  void setDecoy(uint32_t decoy) {
+    this->Decoy = std::min<uint32_t>(decoy, 100);
+  }
+
+  void setDecoyPollute(bool pollute) {
+    this->DecoyPollute = pollute ? 1 : 0;
+  }
+
   bool isEnabled() const {
     return this->Enabled;
   }
 
   uint32_t level() const {
     return this->Level;
+  }
+
+  uint32_t decoy() const {
+    return this->Decoy;
+  }
+
+  bool decoyPollute() const {
+    return this->DecoyPollute != 0;
   }
 
   const std::string &attributeName() const {
@@ -84,6 +144,13 @@ protected:
   std::shared_ptr<ObfOpt> BcfOpt  = nullptr;
 
   SmallString<32> RandomSeed;
+  // config "deny" 段：用户自定义红区名单（红区语义，注解也无法解锁），
+  // 匹配 demangled 函数名（'*' 不跨 "::"，'**' 跨 "::"）。
+  std::vector<std::string> DenyList;
+
+  // config "patterns" 段：分级策略中间层（文件 / 类 / 命名空间级覆盖），
+  // 按声明顺序保存；同层后写覆盖先写（字段级）。
+  std::vector<ConfigPatternRule> PatternRules;
 
 public:
   SmallVector<std::shared_ptr<ObfOpt>> getAllOpt() const {
@@ -176,10 +243,24 @@ public:
     return RandomSeed;
   }
 
+  auto &denyList() {
+    return DenyList;
+  }
+
+  auto &patternRules() {
+    return PatternRules;
+  }
+
   static std::shared_ptr<ObfuscationOptions> readConfigFile(
       const Twine &FileName);
 
-  static ObfOpt toObfuscate(const std::shared_ptr<ObfOpt> &option, Function *f);
+  ObfOpt toObfuscate(const std::shared_ptr<ObfOpt> &option, Function *f);
+
+  // doInitialization 阶段（无 Function 上下文）的"宽判断"：该 pass 是否
+  // 可能被任何层面启用——全局开关 / 任一 pattern 规则显式 enable=true /
+  // 任一函数的 "+<name>" 注解。Module 级收集与页表构建前用它短路，
+  // 避免未启用本 pass 的构建也被塞入页表全局（并避免无谓修改 CFG）。
+  bool mayBeEnabled(const std::shared_ptr<ObfOpt> &option, Module &M);
 
 };
 
