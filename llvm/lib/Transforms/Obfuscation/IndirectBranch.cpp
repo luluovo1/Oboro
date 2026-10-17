@@ -28,6 +28,7 @@ struct IndirectBranch : public FunctionPass {
   std::vector<GlobalVariable *> BBPageTable;
 
   CryptoUtils RandomEngine;
+  uint64_t    PtrEncKey = 0;
   bool RunOnFuncChanged = false;
 
   IndirectBranch(ObfuscationOptions *argsOptions) : FunctionPass(ID) {
@@ -66,6 +67,13 @@ struct IndirectBranch : public FunctionPass {
   }
 
   bool doInitialization(Module &M) override {
+    // 未启用则跳过整个模块级收集与页表构建：否则即使没开 INDBR，
+    // NumberBasicBlock 的 SplitAllCriticalEdges 也会无谓修改 CFG，
+    // 且页表全局会被无条件塞进产物。
+    if (!ArgsOptions->mayBeEnabled(ArgsOptions->indBrOpt(), M)) {
+      return false;
+    }
+
     BBIndex.clear();
     BBPageTable.clear();
     FunctionBBs.clear();
@@ -78,6 +86,8 @@ struct IndirectBranch : public FunctionPass {
       return false;
     }
 
+    PtrEncKey = RandomEngine.get_uint64_t();
+
     CreatePageTableArgs createPageTableArgs;
     createPageTableArgs.CountLoop = 1;
     createPageTableArgs.GVNamePrefix = M.getName().str() + "_IndirectBr" ;
@@ -87,6 +97,7 @@ struct IndirectBranch : public FunctionPass {
     createPageTableArgs.IndexMap = &BBIndex;
     createPageTableArgs.ObjectKeys = &BBKeys;
     createPageTableArgs.OutPageTable = &BBPageTable;
+    createPageTableArgs.PtrEncKey = PtrEncKey;
 
     createPageTable(createPageTableArgs);
     return false;
@@ -94,6 +105,9 @@ struct IndirectBranch : public FunctionPass {
 
 
   bool runOnFunction(Function &Fn) override {
+    // 弱符号等红黄区函数的跳过已统一收敛到
+    // ObfuscationOptions::toObfuscate()（安全底线），此处不再单独判断。
+
     const auto opt = ArgsOptions->toObfuscate(ArgsOptions->indBrOpt(), &Fn);
     if (!opt.isEnabled()) {
       return false;
@@ -134,11 +148,17 @@ struct IndirectBranch : public FunctionPass {
       createPageTableArgs.IndexMap = &BBIndex;
       createPageTableArgs.ObjectKeys = &FuncKeys;
       createPageTableArgs.OutPageTable = &FuncBBPageTable;
+      createPageTableArgs.PtrEncKey = PtrEncKey;
 
       enhancedPageTable(createPageTableArgs, &FuncBBIndex);
     }
 
-    auto Int32Ty = IntegerType::getInt32Ty(Ctx);
+    // 页表索引必须与页表整数宽度一致（getPageTableIntTy = 指针宽度）：
+    // 这里曾固定 i32，而页表已改为 i64（x86_64/AArch64），
+    // 产生 `add i64 %x, i32 %y` 的非法 IR，导致后端 Post-RA 崩溃
+    // （Cannot emit physreg copy instruction；clang 默认
+    // -disable-llvm-verifier 放过了非法 IR）。
+    auto *IntTy = getPageTableIntTy(M);
     for (auto &BI : FuncBrs) {
       if (BI && BI->isConditional()) {
         IRBuilder<> IRB(BI);
@@ -151,12 +171,12 @@ struct IndirectBranch : public FunctionPass {
         auto AddrFBB = BlockAddress::get(FBB);
 
         auto TIndex = opt.level() ?
-                        ConstantInt::get(Int32Ty, FuncBBIndex[AddrTBB]) :
-                        ConstantInt::get(Int32Ty, BBIndex[AddrTBB]);
+                        ConstantInt::get(IntTy, FuncBBIndex[AddrTBB]) :
+                        ConstantInt::get(IntTy, BBIndex[AddrTBB]);
 
         auto FIndex = opt.level() ?
-                        ConstantInt::get(Int32Ty, FuncBBIndex[AddrFBB]) :
-                        ConstantInt::get(Int32Ty, BBIndex[AddrFBB]);
+                        ConstantInt::get(IntTy, FuncBBIndex[AddrFBB]) :
+                        ConstantInt::get(IntTy, BBIndex[AddrFBB]);
 
         auto NextIndex = IRB.CreateSelect(Cond, TIndex, FIndex);
 
@@ -171,6 +191,7 @@ struct IndirectBranch : public FunctionPass {
         buildDecrypt.FuncPageTable = &FuncBBPageTable;
         buildDecrypt.ModuleKey = BBKeys[AddrTBB];
         buildDecrypt.FuncKey = FuncKeys[AddrTBB];
+        buildDecrypt.PtrEncKey = PtrEncKey;
 
         auto TargetPtr = buildPageTableDecryptIR(buildDecrypt);
         IndirectBrInst *IBI = IndirectBrInst::Create(TargetPtr, 2);

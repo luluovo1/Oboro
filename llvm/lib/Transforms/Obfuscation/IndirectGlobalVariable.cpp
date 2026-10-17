@@ -27,6 +27,7 @@ struct IndirectGlobalVariable : public FunctionPass {
   std::vector<GlobalVariable *> GVPageTable;
 
   CryptoUtils RandomEngine;
+  uint64_t    PtrEncKey = 0;
   bool RunOnFuncChanged = false;
 
   IndirectGlobalVariable(ObfuscationOptions *argsOptions) : FunctionPass(ID) {
@@ -70,6 +71,12 @@ struct IndirectGlobalVariable : public FunctionPass {
   }
 
   bool doInitialization(Module &M) override {
+    // 未启用则跳过收集与页表构建（同 IndirectBranch，防止未开混淆的
+    // 构建被塞入死页表全局）。
+    if (!ArgsOptions->mayBeEnabled(ArgsOptions->indGvOpt(), M)) {
+      return false;
+    }
+
     GVIndex.clear();
     GVPageTable.clear();
     FunctionGVs.clear();
@@ -81,6 +88,8 @@ struct IndirectGlobalVariable : public FunctionPass {
       return false;
     }
 
+    PtrEncKey = RandomEngine.get_uint64_t();
+
     CreatePageTableArgs createPageTableArgs;
     createPageTableArgs.CountLoop = 1;
     createPageTableArgs.GVNamePrefix = M.getName().str() + "_IndirectGVs" ;
@@ -90,6 +99,7 @@ struct IndirectGlobalVariable : public FunctionPass {
     createPageTableArgs.IndexMap = &GVIndex;
     createPageTableArgs.ObjectKeys = &GVKeys;
     createPageTableArgs.OutPageTable = &GVPageTable;
+    createPageTableArgs.PtrEncKey = PtrEncKey;
 
     createPageTable(createPageTableArgs);
     return false;
@@ -133,6 +143,7 @@ struct IndirectGlobalVariable : public FunctionPass {
       createPageTableArgs.IndexMap = &GVIndex;
       createPageTableArgs.ObjectKeys = &FuncKeys;
       createPageTableArgs.OutPageTable = &FuncGVPageTable;
+      createPageTableArgs.PtrEncKey = PtrEncKey;
 
       enhancedPageTable(createPageTableArgs, &FuncGVIndex);
     }
@@ -166,6 +177,7 @@ struct IndirectGlobalVariable : public FunctionPass {
           buildDecrypt.FuncPageTable = &FuncGVPageTable;
           buildDecrypt.ModuleKey = GVKeys[GV];
           buildDecrypt.FuncKey = FuncKeys[GV];
+          buildDecrypt.PtrEncKey = PtrEncKey;
 
           auto GVPtr = buildPageTableDecryptIR(buildDecrypt);
           if (PHI)

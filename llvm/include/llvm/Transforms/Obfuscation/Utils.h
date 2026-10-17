@@ -23,6 +23,7 @@ struct CreatePageTableArgs {
   std::unordered_map<Constant *, unsigned> *IndexMap;
   std::unordered_map<Constant *, uint64_t> *ObjectKeys;
   std::vector<GlobalVariable *> *OutPageTable;
+  uint64_t PtrEncKey = 0;
 };
 
 
@@ -37,8 +38,10 @@ struct BuildDecryptArgs {
   std::vector<GlobalVariable *> *FuncPageTable;
   uint64_t ModuleKey;
   uint64_t FuncKey;
+  uint64_t PtrEncKey = 0;
 };
 
+IntegerType *getPageTableIntTy(Module &M);
 bool valueEscapes(Instruction *Inst);
 void fixStack(Function *f);
 CallBase* fixEH(CallBase* CB);
