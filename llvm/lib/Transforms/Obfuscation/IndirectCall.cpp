@@ -24,6 +24,11 @@ struct IndirectCall : public FunctionPass {
   // Dedup only; vectors keep module order (deterministic).
   std::unordered_map<Function *, SmallPtrSet<CallInst *, 16>> CallSiteSeen;
   std::unordered_map<Function *, SmallPtrSet<Function *, 16>> CalleeSeen;
+  // Eligibility is decided once per function (same query the per-function pass
+  // uses).  Caching keeps NumberCallees from re-running the config/annotation
+  // resolution, which may diagnose, and keeps collection consistent with what
+  // runOnFunction will actually rewrite.
+  std::unordered_map<const Function *, ObfOpt> FuncOpts;
 
   std::vector<Constant *> Callees;
   std::unordered_map<Constant *, unsigned> CalleeIndex;
@@ -46,6 +51,15 @@ struct IndirectCall : public FunctionPass {
       if (F.isIntrinsic()) {
         continue;
       }
+      // Only collect from functions this pass will actually rewrite.  A
+      // skipped function keeps its direct calls, so putting its callees in
+      // the page table would merely take their address: internal callees
+      // then stay alive and cannot be inlined, which can drag special ABI
+      // call forms (preallocated/inalloca) into CodeGen that the base build
+      // eliminates.  Only the calls we turn indirect need an entry.
+      auto OptIt = FuncOpts.find(&F);
+      if (OptIt == FuncOpts.end() || !OptIt->second.isEnabled())
+        continue;
 
       for (auto &BB : F) {
         for (auto &I : BB) {
@@ -59,6 +73,14 @@ struct IndirectCall : public FunctionPass {
               }
             }
             if (Callee->isIntrinsic()) {
+              continue;
+            }
+
+            // COMDAT key functions must keep their direct reference: taking an
+            // indirect reference to a comdat member drops the association and
+            // the backend then reports "Associative COMDAT symbol ... does not
+            // exist".  Keep such calls direct.
+            if (Callee->hasComdat()) {
               continue;
             }
 
@@ -81,6 +103,7 @@ struct IndirectCall : public FunctionPass {
     // 未启用则跳过收集与页表构建（同 IndirectBranch，防止未开混淆的
     // 构建被塞入死页表全局）。
     if (!ArgsOptions->mayBeEnabled(ArgsOptions->iCallOpt(), M)) {
+      FuncOpts.clear();
       return false;
     }
 
@@ -92,6 +115,12 @@ struct IndirectCall : public FunctionPass {
     Callees.clear();
     CalleePageTable.clear();
     CalleeKeys.clear();
+
+    FuncOpts.clear();
+    for (Function &F : M)
+      if (!F.isIntrinsic())
+        FuncOpts.emplace(
+            &F, ArgsOptions->toObfuscate(ArgsOptions->iCallOpt(), &F));
 
     NumberCallees(M);
     if (!Callees.size()) {
@@ -116,7 +145,11 @@ struct IndirectCall : public FunctionPass {
   }
 
   bool runOnFunction(Function &Fn) override {
-    const auto opt = ArgsOptions->toObfuscate(ArgsOptions->iCallOpt(), &Fn);
+    auto OptIt = FuncOpts.find(&Fn);
+    const auto opt =
+        OptIt != FuncOpts.end()
+            ? OptIt->second
+            : ArgsOptions->toObfuscate(ArgsOptions->iCallOpt(), &Fn);
     if (!opt.isEnabled()) {
       return false;
     }

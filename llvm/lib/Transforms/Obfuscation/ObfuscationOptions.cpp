@@ -7,6 +7,8 @@
 #include "llvm/Support/Path.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Demangle/Demangle.h"
@@ -15,6 +17,42 @@
 using namespace llvm;
 
 namespace llvm {
+
+// IR features whose semantics cannot survive CFG rewriting or call-site
+// rewriting.  These are not "hardening" choices but correctness gates:
+//   - convergence tokens: control flow must stay inside the convergence region
+//   - gc.statepoint/result/relocate: stack maps encode exact call sites
+//   - coro.*: state machine protos and suspend points
+//   - preallocated/inalloca: caller-owned argument storage and ABI
+static bool hasObfuscationUnsafeIR(Function *F) {
+  for (unsigned i = 0; i < F->arg_size(); ++i)
+    if (F->hasParamAttribute(i, Attribute::InAlloca) ||
+        F->hasParamAttribute(i, Attribute::Preallocated))
+      return true;
+  for (Instruction &I : instructions(*F)) {
+    auto *CB = dyn_cast<CallBase>(&I);
+    if (!CB)
+      continue;
+    // inalloca is a call-site ABI contract: the caller passes a pointer to
+    // caller-owned argument storage.  Rewriting the call (e.g. indirect call
+    // promotion) would materialise those arguments in registers.
+    for (unsigned i = 0; i < CB->arg_size(); ++i)
+      if (CB->paramHasAttr(i, Attribute::InAlloca) ||
+          CB->paramHasAttr(i, Attribute::Preallocated))
+        return true;
+    Function *Callee = CB->getCalledFunction();
+    if (!Callee)
+      continue;
+    StringRef N = Callee->getName();
+    if (N.starts_with("llvm.experimental.") ||
+        N.starts_with("llvm.coro.") ||
+        N.starts_with("llvm.call.preallocated.") ||
+        N.starts_with("llvm.type."))
+      return true;
+  }
+  return false;
+}
+
 
 SmallVector<std::string> readAnnotate(Function *f) {
   SmallVector<std::string> annotations;
@@ -523,6 +561,19 @@ ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
   const auto attrLevel = "^" + option->attributeName();
   ObfOpt     result = option->none();
   if (f->isDeclaration()) {
+    return result;
+  }
+
+  // Coroutines are not ordinary control flow: the split-coroutine CFG carries
+  // coro.suspend/coro.end semantics that flattening and block-splitting do not
+  // model.  Every pass goes through this gate, so they all stay off coroutine
+  // bodies (the frontend lowers them before our pipeline would see a normal
+  // function).  Naked/returns_twice functions get the same treatment: their
+  // prologue/return contract cannot survive inserted blocks.
+  if (f->isPresplitCoroutine() ||
+      f->hasFnAttribute(Attribute::Naked) ||
+      f->hasFnAttribute(Attribute::ReturnsTwice) ||
+      hasObfuscationUnsafeIR(f)) {
     return result;
   }
 
