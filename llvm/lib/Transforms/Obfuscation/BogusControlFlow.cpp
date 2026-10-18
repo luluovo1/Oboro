@@ -23,6 +23,7 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/EHPersonalities.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/InstIterator.h"
@@ -1144,11 +1145,12 @@ struct BogusControlFlow : public FunctionPass {
     // 运算符等红黄区函数的跳过已统一收敛到
     // ObfuscationOptions::toObfuscate()（安全底线），此处不再单独判断。
 
-    // 含异常处理（personality / invoke / landingpad）的函数无条件跳过：
-    // BCF 菱形 + SP 扰动汇合边与 EH 展开边组合会引发编译时间爆炸
-    // （实测 try/catch 函数卡死 >5min），且落地 pad 边界风险高。
-    // runtime 安全优先 —— 注解也无法强制参与。
-    if (F.hasPersonalityFn())
+    // scoped EH（WinEH / Wasm funclets）仍然整体跳过：funclet 内的调用必须
+    // 携带 funclet operand bundle，菱形跨越 funclet 边界的成本与风险不可控。
+    // Itanium EH（Android/Linux）只跳过 landingpad/EH pad 块本身，普通块尾部
+    // 插入菱形不会修改 unwind 边，也不会改变 LSDA 的 call-site 范围。
+    if (F.hasPersonalityFn() &&
+        isScopedEHPersonality(classifyEHPersonality(F.getPersonalityFn())))
       return false;
 
     // 检查是否对此函数应用 BCF

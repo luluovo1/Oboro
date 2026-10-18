@@ -95,6 +95,13 @@ clang -O2 -mllvm -irobf-bcf -mllvm -irobf-bcf_prob=100 test.c -o test
 > never executed. Safety comes from unreachability, not from "an unbalanced stack
 > that happens to work".
 
+**Exception handling**: functions using Itanium EH (Android/Linux,
+`__gxx_personality_v0`) are instrumented normally, but `landingpad`/EH-pad blocks
+and `invoke` terminators are never rewritten, so unwind edges and LSDA call-site
+ranges stay intact. Scoped EH (Windows MSVC funclets / Wasm) is still skipped
+entirely: calls inside a funclet require an operand bundle, and crossing funclet
+boundaries with a diamond is not worth the risk.
+
 #### decoy Anti-Emulation (BCF extension, off by default)
 
 The toolchain performs **no environment detection of any kind**. Detection lives in

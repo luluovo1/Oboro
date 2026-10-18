@@ -90,6 +90,11 @@ clang -O2 -mllvm -irobf-bcf -mllvm -irobf-bcf_prob=100 test.c -o test
 > 运行安全：谓词在数学上恒真，死块永不执行；安全性来自「不可达」，不是
 > 「栈不平衡也能跑」。
 
+**异常处理**：Itanium EH（Android/Linux，`__gxx_personality_v0`）函数正常参与
+混淆，但 `landingpad`/EH pad 块与 `invoke` 终止符永不改写，unwind 边和 LSDA
+call-site 范围保持不变；scoped EH（Windows MSVC funclets / Wasm）仍整体跳过
+（funclet 内调用必须携带 operand bundle，菱形跨 funclet 边界风险不可控）。
+
 #### decoy 反模拟执行（BCF 扩展，默认关闭）
 
 工具链**不做任何环境检测**——检测由你的 App 实现，通过弱符号 `__oboro_probe`

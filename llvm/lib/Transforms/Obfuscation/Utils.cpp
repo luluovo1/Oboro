@@ -26,10 +26,24 @@ bool valueEscapes(Instruction *Inst) {
 }
 
 void fixStack(Function *f) {
+  // Demotion inserts a store on the incoming edge of a PHI.  For an invoke,
+  // that edge has no insertion point after the definition (the invoke is the
+  // terminator), so DemotePHIToStack would place a use of the invoke result
+  // before/beside its definition -> "Instruction does not dominate all uses".
+  // BCF only inserts diamonds and keeps existing PHIs in place, so the
+  // demotion is not required for EH functions.
+  for (BasicBlock &BB : *f)
+    if (isa<InvokeInst>(BB.getTerminator()))
+      return;
+
+  // Anchor every demoted alloca at the first insertion point of the entry
+  // block instead of the PHI's own block, so the alloca always dominates the
+  // load even when the entry block has non-alloca instructions first.
+  auto AllocaInsertPt = f->getEntryBlock().getFirstInsertionPt();
+
   // Try to remove phi node and demote reg to stack
   std::vector<PHINode *>     tmpPhi;
   std::vector<Instruction *> tmpReg;
-  BasicBlock *               bbEntry = &*f->begin();
 
   do {
     tmpPhi.clear();
@@ -44,8 +58,22 @@ void fixStack(Function *f) {
           tmpPhi.push_back(phi);
           continue;
         }
-        if (!(isa<AllocaInst>(j) && j->getParent() == bbEntry) &&
-            (valueEscapes(&*j) || j->isUsedOutsideOfBlock(&*i))) {
+        // An alloca is already a stack slot; demoting it only adds an
+        // alloca-of-pointer indirection.  BCF splits the entry block, which
+        // moves the original entry allocas into a successor block, so the
+        // old "alloca in entry" exemption no longer covers them.
+        if (isa<AllocaInst>(j))
+          continue;
+        // Terminators (notably invoke/callbr) define their result on the
+        // normal edge.  DemoteRegToStack clones an invoke per call, whose
+        // clone again "escapes" its block -> infinite demotion loop.
+        if (j->isTerminator())
+          continue;
+        // Never rewrite instructions that live in an EH pad block: the pad
+        // instruction must stay the first non-PHI instruction.
+        if (i->isEHPad())
+          continue;
+        if (valueEscapes(&*j) || j->isUsedOutsideOfBlock(&*i)) {
           tmpReg.push_back(&*j);
           continue;
         }
@@ -56,7 +84,7 @@ void fixStack(Function *f) {
     }
 
     for (unsigned int i = 0; i != tmpPhi.size(); ++i) {
-      DemotePHIToStack(tmpPhi.at(i));
+      DemotePHIToStack(tmpPhi.at(i), AllocaInsertPt);
     }
 
   } while (tmpReg.size() != 0 || tmpPhi.size() != 0);
