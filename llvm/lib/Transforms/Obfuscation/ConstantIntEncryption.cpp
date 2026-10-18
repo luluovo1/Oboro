@@ -7,6 +7,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/CryptoUtils.h"
@@ -22,6 +23,35 @@
 using namespace llvm;
 
 namespace {
+
+// GEP indices into a struct must stay constant: LLVM's verifier rejects a
+// variable index there ("invalid getelementptr indices").  The original
+// filter only skipped the pointer operand and the first index, so any
+// `p->field` style access (index 2..n into a struct) produced invalid IR that
+// crashed later passes.  Walk the indexed type to tell struct indices apart
+// from array/vector indices, which may be variable.
+static bool isStructGEPIndex(GetElementPtrInst *GEP, unsigned OpIdx) {
+  if (OpIdx == 0)
+    return false;
+  // Operand 1 indexes the pointer itself; the result type is still the source
+  // element type.  Operands 2..n walk into that type.
+  Type *Ty = GEP->getSourceElementType();
+  for (unsigned i = 2; i < OpIdx; ++i) {
+    if (auto *ST = dyn_cast<StructType>(Ty)) {
+      auto *CI = dyn_cast<ConstantInt>(GEP->getOperand(i));
+      if (!CI)
+        return true; // Unknown: be conservative and keep the index constant.
+      Ty = ST->getElementType(CI->getZExtValue());
+    } else if (auto *AT = dyn_cast<ArrayType>(Ty)) {
+      Ty = AT->getElementType();
+    } else if (auto *VT = dyn_cast<VectorType>(Ty)) {
+      Ty = VT->getElementType();
+    } else {
+      return true;
+    }
+  }
+  return isa<StructType>(Ty);
+}
 
 struct ConstantIntEncryption : public FunctionPass {
   static char         ID;
@@ -57,6 +87,12 @@ struct ConstantIntEncryption : public FunctionPass {
               I.isAtomic()) {
             continue;
           }
+          // Inline asm operands such as "n" require integer constant
+          // expressions; replacing them with a decrypted value is rejected by
+          // the frontend/verifier.
+          if (auto *CB = dyn_cast<CallBase>(&I))
+            if (isa<InlineAsm>(CB->getCalledOperand()))
+              continue;
           auto CI = dyn_cast<CallInst>(&I);
           auto GEP = dyn_cast<GetElementPtrInst>(&I);
           auto PHI = dyn_cast<PHINode>(&I);
@@ -108,7 +144,7 @@ struct ConstantIntEncryption : public FunctionPass {
       for (unsigned i = 0; i < I->getNumOperands(); ++i) {
         if (CI && CI->isBundleOperand(i))
           continue;
-        if (GEP && i < 2)
+        if (GEP && (i < 2 || isStructGEPIndex(GEP, i)))
           continue;
         if (auto CTI = dyn_cast<ConstantInt>(I->getOperand(i))) {
           if (CTI->getBitWidth() < 4)
@@ -167,7 +203,7 @@ struct ConstantIntEncryption : public FunctionPass {
         if (CI && CI->isBundleOperand(i)) {
           continue;
         }
-        if (GEP && i < 2) {
+        if (GEP && (i < 2 || isStructGEPIndex(GEP, i))) {
           continue;
         }
         Value* Opr = I->getOperand(i);
