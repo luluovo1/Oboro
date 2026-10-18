@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/Obfuscation/Flattening.h"
 #include "llvm/Transforms/Obfuscation/LegacyLowerSwitch.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
@@ -79,6 +80,37 @@ bool Flattening::flatten(Function *f, const ObfOpt &opt) {
     Instruction *Term = BB.getTerminator();
     if (BB.isEHPad() || isa<InvokeInst, CallBrInst, IndirectBrInst>(Term))
       return false;
+  }
+
+  // LowerSwitch and the flattening walk assume a reachable CFG.  A function
+  // containing an unreachable cycle makes the rewrite non-terminating, so
+  // refuse it instead of burning compile time (or hanging the build).
+  {
+    DominatorTree DT(*f);
+    for (BasicBlock &BB : *f)
+      if (!DT.isReachableFromEntry(&BB))
+        return false;
+  }
+
+  // Flattening moves every block into a dispatch loop.  Allocas that are not
+  // at the top of the entry block (or that live in other blocks) can end up in
+  // a different case than their uses, breaking dominance.  Only flatten when
+  // all allocas are the leading instructions of the entry block.
+  bool SeenNonAlloca = false;
+  for (Instruction &I : f->getEntryBlock()) {
+    if (isa<AllocaInst>(I)) {
+      if (SeenNonAlloca)
+        return false;
+    } else {
+      SeenNonAlloca = true;
+    }
+  }
+  for (BasicBlock &BB : *f) {
+    if (&BB == &f->getEntryBlock())
+      continue;
+    for (Instruction &I : BB)
+      if (isa<AllocaInst>(I))
+        return false;
   }
 
   auto &Ctx = f->getContext();
