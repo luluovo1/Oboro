@@ -56,6 +56,13 @@ struct IndirectGlobalVariable : public FunctionPass {
             if (GV->isThreadLocal() || GV->isDLLImportDependent()) {
               continue;
             }
+            // COMDAT members must keep a direct reference: routing them
+            // through a page table drops the comdat association and the
+            // backend fails with "Associative COMDAT symbol ... does not
+            // exist".
+            if (GV->hasComdat()) {
+              continue;
+            }
             if (GV->getMetadata("noobf")) {
               continue;
             }
