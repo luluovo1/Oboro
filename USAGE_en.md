@@ -67,15 +67,22 @@ Puts all basic blocks of a function into a switch-loop dispatcher, hiding the or
 ```bash
 -mllvm -irobf-bcf
 -mllvm -irobf-bcf_prob=70      # optional, per-block injection probability 0~100, default 70
--mllvm -irobf-bcf_pred=3       # optional, force predicate family 1~11 (0=random, testing)
+-mllvm -irobf-bcf_pred=3       # optional, force predicate family 1~12 (0=random, testing)
 ```
 
 Injects an **opaque-predicate diamond** into every basic block: the true edge runs the
 original code, the false edge is a never-executed dead block carrying an
 anti-decompiler payload. The predicate is chosen **at random per compilation** from
-11 mathematical families (all wraparound-safe on 2^64 and pre-filtered against
+12 mathematical families (all wraparound-safe on 2^64 and pre-filtered against
 InstSimplify folding), combined with randomized input transforms, randomized
 polarity flips, and a 1-in-5 chance of a two-family composition.
+
+Production weights only use the rule-engine-proof families (5/8 consecutive
+products, 9/11 popcount, 12 eight-term product): measured with the d810 proxy
+(`obftest/d810_proxy.py`), their rule-fold rate is **0%**. Families 1/2/3/4/7
+(bit0 identities) and 6/10 (MBA identities) are foldable by a rule engine, so
+their weights are zero and they remain reachable only via `-irobf-bcf_pred` for
+regression tests.
 
 The payload is randomized as well: AArch64 uses SP-convergence poisoning
 (`add sp, sp, #random`, producing Hex-Rays `sp-analysis failed`); x86_64 uses random
@@ -102,7 +109,14 @@ ranges stay intact. Scoped EH (Windows MSVC funclets / Wasm) is still skipped
 entirely: calls inside a funclet require an operand bundle, and crossing funclet
 boundaries with a diamond is not worth the risk.
 
-#### decoy Anti-Emulation (BCF extension, off by default)
+#### decoy Anti-Emulation (independent mechanism, orthogonal to BCF, off by default)
+
+decoy is a **runtime misleading mechanism independent of BCF**, not a BCF variant:
+BCF's decision is a statically-true opaque predicate (against static analysis),
+while decoy's decision is a **runtime probe result** (against emulators/debuggers)
+and the decoy path genuinely executes when the environment is suspicious.  They
+share the site/branch generation code but have completely different mathematical
+foundations and purposes.
 
 The toolchain performs **no environment detection of any kind**. Detection lives in
 your app and is exposed through a weak symbol `__oboro_probe` (non-zero = real path,

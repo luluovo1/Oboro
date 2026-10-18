@@ -67,13 +67,18 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 ```bash
 -mllvm -irobf-bcf
 -mllvm -irobf-bcf_prob=70      # 可选，块注入概率 0~100，默认 70
--mllvm -irobf-bcf_pred=3       # 可选，强制谓词族 1~11（0=随机，测试用）
+-mllvm -irobf-bcf_pred=3       # 可选，强制谓词族 1~12（0=随机，测试用）
 ```
 
 为每个基本块注入**不透明谓词菱形**：真路走原代码，假路是永不执行的死块（内含
-反编译器毒载荷）。谓词**每次编译随机**从 11 个数学族中选择（全部对 2^64 回绕
+反编译器毒载荷）。谓词**每次编译随机**从 12 个数学族中选择（全部对 2^64 回绕
 安全、经 InstSimplify 折叠筛选存活），并叠加随机输入变换、随机极性翻转、1/5
 概率双族组合。
+
+生产权重只使用规则引擎不可折叠的族（5/8 连续积链、9/11 popcount、12 八连积），
+按 d810 代理（`obftest/d810_proxy.py`）实测：这 5 族的规则可折叠率为 **0%**；
+族 1/2/3/4/7（bit0 低位恒等式）与 6/10（MBA 恒等式）可被规则引擎折叠，权重置 0，
+仅保留 `-irobf-bcf_pred` 强制供回归测试。
 
 毒载荷同样全随机化：AArch64 用 SP 收敛投毒（`add sp, sp, #随机值`，制造
 Hex-Rays `sp-analysis failed`）；x86_64 用随机字节序列制造 JUMPOUT（跳入指令
@@ -95,7 +100,12 @@ clang -O2 -mllvm -irobf-bcf -mllvm -irobf-bcf_prob=100 test.c -o test
 call-site 范围保持不变；scoped EH（Windows MSVC funclets / Wasm）仍整体跳过
 （funclet 内调用必须携带 operand bundle，菱形跨 funclet 边界风险不可控）。
 
-#### decoy 反模拟执行（BCF 扩展，默认关闭）
+#### decoy 反模拟执行（独立机制，与 BCF 正交，默认关闭）
+
+decoy 是**独立于 BCF 的运行时误导机制**，不是 BCF 的变体：BCF 的判据是静态
+恒真谓词（骗静态分析），decoy 的判据是**运行时 probe 结果**（骗模拟器/调试器），
+环境可疑时诱饵路径会真实执行。二者共享站点/分支生成代码，但数学基础与用途
+完全不同。
 
 工具链**不做任何环境检测**——检测由你的 App 实现，通过弱符号 `__oboro_probe`
 提供判定结果（非 0 = 真实路径，0 = 诱饵路径）：

@@ -83,7 +83,7 @@ This project builds on [Arkari](https://github.com/KomiMoe/Arkari) as its core o
 | Control-flow flattening (FLA) | Standard implementation | Ported and adapted from Arkari |
 | Indirect branches (INDBR) | Standard encrypted page table | Ported and adapted from Arkari |
 | Indirect calls (ICALL) | Standard encrypted page table | Ported and adapted from Arkari |
-| Bogus control flow (BCF) | Not included | **BCF v2**: 11 randomized opaque-predicate families, randomized poison payloads (AArch64 SP-convergence / x86_64 JUMPOUT) |
+| Bogus control flow (BCF) | Not included | **BCF v2**: 12 randomized opaque-predicate families (production: 5 rule-engine-proof families), randomized poison payloads (AArch64 SP-convergence / x86_64 JUMPOUT) |
 | Anti-emulation decoy | Not included | **Opt-in**: probe-driven L1 reconverge / L3 value pollution |
 | Safety floor | Not included | **Red/yellow zones**: weak symbols, C++ runtime glue, ctors/dtors/operators are never obfuscated |
 | Policy system | CLI flags only | **Config-first**: JSON `deny` + class/file `patterns` with field-level cascade |
@@ -91,7 +91,7 @@ This project builds on [Arkari](https://github.com/KomiMoe/Arkari) as its core o
 
 Key differences in detail:
 
-- Added the **BCF (Bogus Control Flow)** pass. v2 picks one of 11 mathematically proven opaque predicates at random per compilation (wraparound-safe, pre-filtered against InstSimplify), randomizes the input transform / polarity / payload constants, and injects either a poison dead block or an opt-in decoy block
+- Added the **BCF (Bogus Control Flow)** pass. v2 picks one of 12 mathematically proven opaque predicates at random per compilation (wraparound-safe, pre-filtered against InstSimplify), randomizes the input transform / polarity / payload constants, and injects either a poison dead block or an opt-in decoy block. Production weights only use the five families with 0% rule-engine fold rate (consecutive products / popcount); MBA and bit0 families stay test-only.
 - **Safety floor** enforced inside `toObfuscate()`: red zone (weak symbols incl. all STL template instances, `__cxa_`/`__gxx_` glue, static ctor/dtor list, `operator new/delete`) is never obfuscated even by annotation; yellow zone (ctors/dtors/other operators) needs an explicit per-function annotation or an exact-name config pattern
 - **Config-first policy**: `-oboro-cfg=policy.json` supports a `deny` list and class/namespace/file `patterns`, with a field-level cascade (`annotation > class pattern > file pattern > CLI > config > built-in`)
 - **decoy (opt-in)**: the toolchain never detects environments itself. Your app provides `__oboro_probe()`; when it returns 0 the obfuscated code silently follows decoy paths — L1 stays semantically correct (trace noise), L3 pollutes values (wrong but executable results) behind a hard def-use safety filter
