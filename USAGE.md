@@ -321,6 +321,21 @@ L3 站点。
 红黄区对**全部 8 个混淆/加密 pass** 统一生效（BCF/FLA/INDBR/ICALL/INDGV/CSE/
 CIE/CFE），命令行参数无法绕过。
 
+### 结构性安全跳过
+
+以下函数/调用形态在语义上无法与 CFG 重写共存，所有 pass 自动跳过（同样不受
+注解或配置影响）：
+
+| 形态 | 原因 |
+|---|---|
+| coroutine（`llvm.coro.*` / presplit） | 状态机 proto 与 suspend 点依赖原始 CFG |
+| convergence（`llvm.experimental.convergence.*`） | token 必须留在 convergence region 内 |
+| GC statepoint（`gc.statepoint/result/relocate`） | stack map 记录精确调用点，改写调用即失配 |
+| `inalloca` / `preallocated` | 调用方持有参数存储，间接化会改变 ABI |
+| `naked` / `returns_twice` | prologue / 返回契约不允许插入基本块 |
+| FLA：含不可达块的函数 | LowerSwitch 在不可达循环上不终止 |
+| FLA：alloca 不在 entry 开头或位于其他块 | 平坦化后 alloca 与使用可能落入不同 case，破坏支配关系 |
+
 ---
 
 ## 混淆前后效果对比

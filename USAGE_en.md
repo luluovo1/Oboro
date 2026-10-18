@@ -333,6 +333,21 @@ a literal `*` and cannot be matched exactly by a pattern — use a function anno
 The safety floor applies uniformly to **all 8 obfuscation/encryption passes**
 (BCF/FLA/INDBR/ICALL/INDGV/CSE/CIE/CFE) and cannot be bypassed from the command line.
 
+### Structural safety skips
+
+The following function/call shapes cannot coexist with CFG rewriting; every pass
+skips them automatically (also not overridable by annotations or config):
+
+| Shape | Reason |
+|---|---|
+| coroutine (`llvm.coro.*` / presplit) | state-machine protos and suspend points depend on the original CFG |
+| convergence (`llvm.experimental.convergence.*`) | tokens must stay inside the convergence region |
+| GC statepoint (`gc.statepoint/result/relocate`) | stack maps encode exact call sites |
+| `inalloca` / `preallocated` | caller-owned argument storage; indirect calls change the ABI |
+| `naked` / `returns_twice` | prologue / return contract forbids inserted blocks |
+| FLA: functions with unreachable blocks | LowerSwitch does not terminate on unreachable cycles |
+| FLA: allocas not at the entry top or outside the entry block | flattening can put an alloca and its use in different cases, breaking dominance |
+
 ---
 
 ## Before / After Obfuscation Comparisons
