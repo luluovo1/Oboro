@@ -11,7 +11,7 @@ wrapper；wrapper 把参数打包后调用该函数专属的解释器。解释�
 clang++ -O2 -mllvm -irobf-vmp -mllvm -level-vmp=2 ...
 
 # 只保护指定函数（源码注解）
-__attribute__((annotate("vmp"))) void check_license(...);
+__attribute__((annotate("+vmp"))) void check_license(...);
 ```
 
 config（`-mllvm -oboro-cfg=oboro.json`）：

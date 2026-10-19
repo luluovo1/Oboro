@@ -202,8 +202,6 @@ struct ObfuscationPassManager : public ModulePass {
       // The late manager only runs passes that must see final, optimized IR.
       // VMP is the first such pass: at PipelineStart the optimizer would
       // constant-fold the bytecode back into the original code.
-      if (!EnableVmp && OboroConfigPath.empty())
-        return false;
       const auto Options(getOptions());
       if (!EnableVmp && !Options->mayBeEnabled(Options->vmpOpt(), M))
         return false;
