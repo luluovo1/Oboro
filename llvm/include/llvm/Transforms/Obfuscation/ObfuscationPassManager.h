@@ -16,14 +16,18 @@ namespace llvm {
 class ModulePass;
 class PassRegistry;
 
-ModulePass *createObfuscationPassManager();
+ModulePass *createObfuscationPassManager(bool Late = false);
 void initializeObfuscationPassManagerPass(PassRegistry &Registry);
 
 class ObfuscationPassManagerPass
     : public PassInfoMixin<ObfuscationPassManagerPass> {
+  bool Late = false;
+
 public:
+  explicit ObfuscationPassManagerPass(bool Late = false) : Late(Late) {}
+
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
-    ModulePass *OPM = createObfuscationPassManager();
+    ModulePass *OPM = createObfuscationPassManager(Late);
     bool Changed = OPM->runOnModule(M);
     OPM->doFinalization(M);
     delete OPM;

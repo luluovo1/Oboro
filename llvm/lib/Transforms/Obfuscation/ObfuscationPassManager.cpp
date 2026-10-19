@@ -7,6 +7,7 @@
 #include "llvm/Transforms/Obfuscation/DecoyPass.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationPassManager.h"
+#include "llvm/Transforms/Obfuscation/Virtualize.h"
 // CryptoUtils.h defines a function-like macro `R`, which collides with
 // std::function template parameters in CommandLine.h if included earlier.
 #include "llvm/CryptoUtils.h"
@@ -91,6 +92,15 @@ EnableRttiEraser("irobf-rtti", cl::init(false), cl::NotHidden,
   cl::desc("Enable RTTI Eraser."),
   cl::ZeroOrMore);
 
+// VMP runs in the late (OptimizerLast) manager, after all optimization.
+static cl::opt<bool>
+EnableVmp("irobf-vmp", cl::init(false), cl::NotHidden,
+          cl::desc("Enable IR Virtualization (VMP)."),
+          cl::ZeroOrMore);
+static cl::opt<uint32_t>
+LevelVmp("level-vmp", cl::init(0), cl::NotHidden,
+         cl::desc("Set VMP level (1..3)."), cl::ZeroOrMore);
+
 // BCF 开关（概率参数 irobf-bcf_prob 定义在 BogusControlFlow.cpp，不在此重复）
 static cl::opt<bool>
 EnableBogusControlFlow("irobf-bcf", cl::init(false), cl::NotHidden,
@@ -114,8 +124,10 @@ namespace llvm {
 struct ObfuscationPassManager : public ModulePass {
   static char            ID; // Pass identification
   SmallVector<Pass *, 8> Passes;
+  bool                   Late;
 
-  ObfuscationPassManager() : ModulePass(ID) {
+  explicit ObfuscationPassManager(bool Late = false)
+      : ModulePass(ID), Late(Late) {
     initializeObfuscationPassManagerPass(*PassRegistry::getPassRegistry());
   };
 
@@ -181,10 +193,26 @@ struct ObfuscationPassManager : public ModulePass {
     Opt->rttiOpt()->readOpt(EnableRttiEraser);
 
     Opt->bcfOpt()->readOpt(EnableBogusControlFlow);
+    Opt->vmpOpt()->readOpt(EnableVmp, LevelVmp);
     return Opt;
   }
 
   bool runOnModule(Module &M) override {
+    if (Late) {
+      // The late manager only runs passes that must see final, optimized IR.
+      // VMP is the first such pass: at PipelineStart the optimizer would
+      // constant-fold the bytecode back into the original code.
+      if (!EnableVmp && OboroConfigPath.empty())
+        return false;
+      const auto Options(getOptions());
+      if (!EnableVmp && !Options->mayBeEnabled(Options->vmpOpt(), M))
+        return false;
+      if (!Options->randomSeed().empty())
+        cryptoutils->prng_seed(std::string(Options->randomSeed()));
+      add(llvm::createVirtualizePass(Options.get()));
+      return run(M);
+    }
+
 
     if (EnableIndirectBr || EnableIndirectCall || EnableIndirectGV ||
         EnableIRFlattening || EnableIRStringEncryption ||
@@ -255,8 +283,8 @@ struct ObfuscationPassManager : public ModulePass {
 
 char ObfuscationPassManager::ID = 0;
 
-ModulePass *llvm::createObfuscationPassManager() {
-  return new ObfuscationPassManager();
+ModulePass *llvm::createObfuscationPassManager(bool Late) {
+  return new ObfuscationPassManager(Late);
 }
 
 // Legacy pass registration name must NOT collide with the cl::opt "irobf"

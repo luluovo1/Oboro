@@ -142,6 +142,7 @@ protected:
   std::shared_ptr<ObfOpt> RttiOpt = nullptr;
   std::shared_ptr<ObfOpt> PsoOpt  = nullptr;
   std::shared_ptr<ObfOpt> BcfOpt  = nullptr;
+  std::shared_ptr<ObfOpt> VmpOpt  = nullptr;
 
   SmallString<32> RandomSeed;
   // config "deny" 段：用户自定义红区名单（红区语义，注解也无法解锁），
@@ -165,6 +166,7 @@ public:
     allOpt.push_back(RttiOpt);
     allOpt.push_back(PsoOpt);
     allOpt.push_back(BcfOpt);
+    allOpt.push_back(VmpOpt);
     return allOpt;
   }
 
@@ -177,7 +179,8 @@ public:
                      const std::shared_ptr<ObfOpt> &cfeOpt,
                      const std::shared_ptr<ObfOpt> &rttiOpt,
                      const std::shared_ptr<ObfOpt> &psoOpt,
-                     const std::shared_ptr<ObfOpt> &bcfOpt) {
+                     const std::shared_ptr<ObfOpt> &bcfOpt,
+                     const std::shared_ptr<ObfOpt> &vmpOpt) {
     this->IndBrOpt = indBrOpt;
     this->ICallOpt = iCallOpt;
     this->IndGvOpt = indGvOpt;
@@ -188,6 +191,7 @@ public:
     this->RttiOpt = rttiOpt;
     this->PsoOpt  = psoOpt;
     this->BcfOpt  = bcfOpt;
+    this->VmpOpt  = vmpOpt;
   }
 
   ObfuscationOptions() : ObfuscationOptions{
@@ -200,7 +204,8 @@ public:
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "cfe")),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "rtti")),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "pso")),
-                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "bcf"))
+                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "bcf")),
+                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "vmp"))
                        } {}
 
   auto indBrOpt() const {
@@ -238,6 +243,8 @@ public:
   auto psoOpt() const { return PsoOpt; }
 
   auto bcfOpt() const { return BcfOpt; }
+
+  auto vmpOpt() const { return VmpOpt; }
 
   auto &randomSeed() {
     return RandomSeed;

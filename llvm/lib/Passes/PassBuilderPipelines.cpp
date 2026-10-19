@@ -372,6 +372,12 @@ void PassBuilder::invokeOptimizerEarlyEPCallbacks(ModulePassManager &MPM,
 void PassBuilder::invokeOptimizerLastEPCallbacks(ModulePassManager &MPM,
                                                  OptimizationLevel Level,
                                                  ThinOrFullLTOPhase Phase) {
+  // Oboro late obfuscation (VMP).  Prelink LTO phases are deliberately
+  // excluded: the postlink pipeline optimizes the module again and would
+  // destroy a VM emitted before the link.
+  if (Phase != ThinOrFullLTOPhase::ThinLTOPreLink &&
+      Phase != ThinOrFullLTOPhase::FullLTOPreLink)
+    MPM.addPass(ObfuscationPassManagerPass(/*Late=*/true));
   for (auto &C : OptimizerLastEPCallbacks)
     C(MPM, Level, Phase);
 }
