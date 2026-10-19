@@ -1,6 +1,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Transforms/Obfuscation/IndirectCall.h"
+#include "llvm/Transforms/Obfuscation/ObfNaming.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/CryptoUtils.h"
@@ -131,7 +132,8 @@ struct IndirectCall : public FunctionPass {
 
     CreatePageTableArgs createPageTableArgs;
     createPageTableArgs.CountLoop = 1;
-    createPageTableArgs.GVNamePrefix = M.getName().str() + "_IndirectCallee" ;
+    createPageTableArgs.GVNamePrefix =
+        obf::freshName(M, M.getName().str() + "_IndirectCallee");
     createPageTableArgs.RandomEngine = &*cryptoutils;
     createPageTableArgs.M = &M;
     createPageTableArgs.Objects = &Callees;
@@ -179,7 +181,8 @@ struct IndirectCall : public FunctionPass {
     if (opt.level()) {
       CreatePageTableArgs createPageTableArgs;
       createPageTableArgs.CountLoop = opt.level();
-      createPageTableArgs.GVNamePrefix = M.getName().str() + Fn.getName().str() + "_IndirectCallee" ;
+      createPageTableArgs.GVNamePrefix = obf::freshName(
+          M, M.getName().str() + Fn.getName().str() + "_IndirectCallee");
       createPageTableArgs.RandomEngine = &*cryptoutils;
       createPageTableArgs.M = &M;
       createPageTableArgs.Objects = &FuncCallees;

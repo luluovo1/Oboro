@@ -17,7 +17,8 @@ namespace llvm {
 // 保留语义名，生产模式返回空串（LLVM 自动编号）。
 StringRef bcfName(StringRef Tag);
 
-// 模块级共享全局的名字：生产模式随机标识符 + !oboro.aux 元数据映射。
+// 模块级共享全局的名字：由 ObfNaming 的模块盐派生（生产模式随机，
+// 跨 pass 稳定；调试模式保留 llvm.bcf.* 可读名）。
 std::string bcfAuxGlobalName(Module &M, StringRef Tag);
 
 // "编译期未知"的 64 位运行时值来源（volatile load 的私有全局）。

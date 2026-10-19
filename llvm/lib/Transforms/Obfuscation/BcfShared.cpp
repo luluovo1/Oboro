@@ -5,6 +5,7 @@
 // CFG 形态，否则分析者能靠"数学式/拓扑差异"区分两类站点。
 
 #include "llvm/Transforms/Obfuscation/BcfShared.h"
+#include "llvm/Transforms/Obfuscation/ObfNaming.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/InlineAsm.h"
@@ -64,15 +65,7 @@ static cl::opt<unsigned>
                      "Testing knob."),
             cl::ZeroOrMore);
 
-static cl::opt<bool>
-    BCFDebugNames("irobf-debug-names", cl::init(false), cl::Hidden,
-                  cl::desc("Keep descriptive bcf.* names in IR. Testing only."),
-                  cl::ZeroOrMore);
-
-static bool useDebugNames() {
-  static const bool Env = ::getenv("OBORO_BCF_DEBUG_NAMES") != nullptr;
-  return Env || BCFDebugNames;
-}
+static bool useDebugNames() { return obf::debugNames(); }
 
 static cl::opt<unsigned>
     BCFTopo("irobf-bcf_topo", cl::init(0), cl::Hidden,
@@ -97,25 +90,9 @@ StringRef bcfName(StringRef Tag) {
 std::string bcfAuxGlobalName(Module &M, StringRef Tag) {
   if (useDebugNames())
     return ("llvm.bcf." + Tag).str();
-
-  LLVMContext &Ctx = M.getContext();
-  if (NamedMDNode *NMD = M.getNamedMetadata("oboro.aux")) {
-    for (MDNode *Op : NMD->operands()) {
-      if (Op->getNumOperands() != 2)
-        continue;
-      auto *K = dyn_cast<MDString>(Op->getOperand(0));
-      auto *V = dyn_cast<MDString>(Op->getOperand(1));
-      if (K && V && K->getString() == Tag)
-        return V->getString().str();
-    }
-  }
-
-  std::string Name =
-      "g" + utohexstr(cryptoutils->get_uint64_t(), /*LowerCase=*/true);
-  MDNode *Pair = MDNode::get(
-      Ctx, {MDString::get(Ctx, Tag), MDString::get(Ctx, Name)});
-  M.getOrInsertNamedMetadata("oboro.aux")->addOperand(Pair);
-  return Name;
+  // 稳定名由命名层维护（进程内 tag→name 映射），不写 IR 元数据：
+  // 产物里没有 "tag → 实体名" 的对照表可供反查。
+  return obf::stableName(M, Tag);
 }
 
 static Value *bcfRotl(IRBuilder<> &B, Module &M, Value *V, unsigned R) {
@@ -319,7 +296,7 @@ static GlobalVariable *bcfGetOrCreateBogusBlob(Module &M) {
   Blob->setAlignment(MaybeAlign(4));
   // 独立 section，链接时会被 lld 合并进最终的 .text 输出段（可执行），
   // 但其内容并非合法函数序言 —— 反汇编器强行解码会产生垃圾指令流。
-  Blob->setSection(".text.aux");
+  Blob->setSection(obf::sectionName(M));
   return Blob;
 }
 

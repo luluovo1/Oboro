@@ -23,6 +23,7 @@
 #include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
 #include "llvm/Transforms/Obfuscation/BcfShared.h"
 #include "llvm/Transforms/Obfuscation/DecoyPass.h"
+#include "llvm/Transforms/Obfuscation/ObfNaming.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/IR/BasicBlock.h"
@@ -106,7 +107,9 @@ struct BogusControlFlow : public FunctionPass {
       return false;
 
     // 工具链自己的运行时函数绝不参与混淆（防递归/自污染）。
-    if (F.getMetadata("noobf") || F.getName().starts_with("oboro."))
+    Module *M = F.getParent();
+    if (F.getMetadata(obf::metaName(*M, "noobf")) ||
+        obf::isRuntimeFunction(*M, F))
       return false;
     // 项目提供的 probe 是 DecoyPass 的策略入口，绝不能反过来被插桩
     // （否则 probe -> getenv -> 混淆函数 -> probe 递归）。
@@ -166,6 +169,13 @@ struct BogusControlFlow : public FunctionPass {
       if (isa<ReturnInst>(Term) || isa<BranchInst>(Term) ||
           isa<SwitchInst>(Term))
         Targets.push_back(&BB);
+    }
+
+    // 随机采样：顺序取前 N 会让大函数只有前部受保护，且"哪些块被选中"
+    // 本身是稳定指纹。先洗牌再按概率过滤，站点分布不再与块顺序相关。
+    for (unsigned I = Targets.size(); I > 1; --I) {
+      unsigned J = cryptoutils->get_uint32_t() % I;
+      std::swap(Targets[I - 1], Targets[J]);
     }
 
     unsigned Prob = BCFProb.getValue();

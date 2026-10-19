@@ -2,6 +2,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Transforms/Obfuscation/IndirectGlobalVariable.h"
+#include "llvm/Transforms/Obfuscation/ObfNaming.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/CryptoUtils.h"
@@ -63,7 +64,7 @@ struct IndirectGlobalVariable : public FunctionPass {
             if (GV->hasComdat()) {
               continue;
             }
-            if (GV->getMetadata("noobf")) {
+            if (GV->getMetadata(obf::metaName(*GV->getParent(), "noobf"))) {
               continue;
             }
 
@@ -101,7 +102,8 @@ struct IndirectGlobalVariable : public FunctionPass {
 
     CreatePageTableArgs createPageTableArgs;
     createPageTableArgs.CountLoop = 1;
-    createPageTableArgs.GVNamePrefix = M.getName().str() + "_IndirectGVs" ;
+    createPageTableArgs.GVNamePrefix =
+        obf::freshName(M, M.getName().str() + "_IndirectGVs");
     createPageTableArgs.RandomEngine = &*cryptoutils;
     createPageTableArgs.M = &M;
     createPageTableArgs.Objects = &GlobalVariables;
@@ -145,7 +147,8 @@ struct IndirectGlobalVariable : public FunctionPass {
     if (opt.level()) {
       CreatePageTableArgs createPageTableArgs;
       createPageTableArgs.CountLoop = opt.level();
-      createPageTableArgs.GVNamePrefix = M.getName().str() + Fn.getName().str() + "_IndirectGVs" ;
+      createPageTableArgs.GVNamePrefix = obf::freshName(
+          M, M.getName().str() + Fn.getName().str() + "_IndirectGVs");
       createPageTableArgs.RandomEngine = &*cryptoutils;
       createPageTableArgs.M = &M;
       createPageTableArgs.Objects = &FuncGVs;

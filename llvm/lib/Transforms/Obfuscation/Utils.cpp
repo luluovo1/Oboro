@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/Transforms/Obfuscation/ObfNaming.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IRBuilder.h"
@@ -296,13 +297,15 @@ void createPageTable(const CreatePageTableArgs &args) {
   }
 
   {
-    auto GVNameObjects(args.GVNamePrefix + "_objects");
+    auto GVNameObjects(args.GVNamePrefix + "_" +
+                        obf::freshName(*args.M, "objects"));
     auto ATy = ArrayType::get(IntTy, GVObjects.size());
     auto CA = ConstantArray::get(ATy, ArrayRef(GVObjects));
     auto GV = new GlobalVariable(*args.M, ATy, false, 
                                  GlobalValue::LinkageTypes::InternalLinkage,
                                  CA, GVNameObjects);
-    GV->addMetadata("noobf", *MDNode::get(args.M->getContext(), {}));
+    GV->addMetadata(obf::metaName(*args.M, "noobf"),
+                    *MDNode::get(args.M->getContext(), {}));
     args.OutPageTable->push_back(GV);
   }
 
@@ -327,13 +330,16 @@ void createPageTable(const CreatePageTableArgs &args) {
 
     {
 
-      auto GVNameObjPageTable(args.GVNamePrefix + "_page_table_" + std::to_string(i));
+      auto GVNameObjPageTable(
+          args.GVNamePrefix + "_" +
+          obf::freshName(*args.M, "page_table_" + std::to_string(i)));
       auto IATy = ArrayType::get(IntTy, ConstantObjectIndex.size());
       auto IA = ConstantArray::get(IATy, ArrayRef(ConstantObjectIndex));
       auto GV = new GlobalVariable(*args.M, IATy, false,
                                    GlobalValue::LinkageTypes::InternalLinkage,
                                    IA, GVNameObjPageTable);
-      GV->addMetadata("noobf", *MDNode::get(args.M->getContext(), {}));
+      GV->addMetadata(obf::metaName(*args.M, "noobf"),
+                      *MDNode::get(args.M->getContext(), {}));
       args.OutPageTable->push_back(GV);
     }
   }
@@ -367,12 +373,15 @@ void enhancedPageTable(const CreatePageTableArgs &args, std::unordered_map<Const
     }
 
     {
-      auto GVNameObjPage(args.GVNamePrefix + "_enhanced_page_table_" + std::to_string(i));
+      auto GVNameObjPage(
+          args.GVNamePrefix + "_" +
+          obf::freshName(*args.M, "enhanced_page_table_" + std::to_string(i)));
       auto IATy = ArrayType::get(IntTy, ConstantObjectIndex.size());
       auto IA = ConstantArray::get(IATy, ArrayRef(ConstantObjectIndex));
       auto GV = new GlobalVariable(*args.M, IATy, false, GlobalValue::LinkageTypes::PrivateLinkage,
         IA, GVNameObjPage);
-      GV->addMetadata("noobf", *MDNode::get(args.M->getContext(), {}));
+      GV->addMetadata(obf::metaName(*args.M, "noobf"),
+                      *MDNode::get(args.M->getContext(), {}));
       args.OutPageTable->push_back(GV);
     }
   }
@@ -393,9 +402,10 @@ Value * buildPageTableDecryptIR(const BuildDecryptArgs &args) {
   if (!NextIndex) {
     auto GVInitIndex = new GlobalVariable(*M, IntTy, true, GlobalValue::PrivateLinkage,
       ConstantInt::get(IntTy, args.NextIndex), 
-      M->getName() + args.Fn->getName() + "_InitIndex" +
-      std::to_string(args.NextIndex));
-    GVInitIndex->addMetadata("noobf", *MDNode::get(Ctx, {}));
+      obf::freshName(*M, (M->getName() + args.Fn->getName() + "_InitIndex" +
+                          std::to_string(args.NextIndex)).str()));
+    GVInitIndex->addMetadata(obf::metaName(*M, "noobf"),
+                             *MDNode::get(Ctx, {}));
     NextIndex = IRB.CreateAlignedLoad(IntTy, GVInitIndex, Align{1}, true);
   } else if (NextIndex->getType() != IntTy) {
     // 防御：调用方可能传入更窄的整数索引（如 i32），统一到页表整数
@@ -634,7 +644,8 @@ Value * encryptConstant(Constant *plainConstant, Instruction *insertBefore, Cryp
   }
   auto EncGV = new GlobalVariable(*insertBefore->getModule(), Enc->getType(), false,
                                   GlobalValue::InternalLinkage, Enc);
-  EncGV->addMetadata("noobf", *MDNode::get(Ctx, {}));
+  EncGV->addMetadata(obf::metaName(*insertBefore->getModule(), "noobf"),
+                     *MDNode::get(Ctx, {}));
   IRBuilder<NoFolder> IRB(insertBefore);
   Value *Load = IRB.CreateAlignedLoad(Enc->getType(), EncGV, Align{1}, true);
   

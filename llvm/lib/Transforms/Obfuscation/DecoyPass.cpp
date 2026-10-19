@@ -7,6 +7,7 @@
 
 #include "llvm/Transforms/Obfuscation/DecoyPass.h"
 #include "llvm/Transforms/Obfuscation/BcfShared.h"
+#include "llvm/Transforms/Obfuscation/ObfNaming.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/IR/BasicBlock.h"
@@ -89,33 +90,14 @@ static cl::opt<bool>
     BCFForceReal("irobf-force-real", cl::init(false), cl::Hidden,
                  cl::desc("Force decoy env=1 for testing/CI."), cl::ZeroOrMore);
 
-static std::string getOboroRuntimeSuffix(Module &M) {
-  if (NamedMDNode *NMD = M.getNamedMetadata("oboro.runtime")) {
-    if (NMD->getNumOperands() > 0) {
-      if (auto *MD = dyn_cast<MDNode>(NMD->getOperand(0))) {
-        if (MD->getNumOperands() > 0) {
-          if (auto *S = dyn_cast<MDString>(MD->getOperand(0)))
-            return S->getString().str();
-        }
-      }
-    }
-  }
-  std::string Suffix = utohexstr(cryptoutils->get_uint32_t(), true);
-  NamedMDNode *NMD = M.getOrInsertNamedMetadata("oboro.runtime");
-  NMD->addOperand(
-      MDNode::get(M.getContext(), {MDString::get(M.getContext(), Suffix)}));
-  return Suffix;
-}
-
 static Function *getOrCreateDecoyRuntime(Module &M) {
   LLVMContext &Ctx = M.getContext();
   // 类型不匹配的 probe 声明会让 CreateCall 生成非法 IR（verifier abort）。
   // 一旦发现，禁用本模块的 decoy 并留下标记，避免每个函数重复告警。
-  if (M.getNamedMetadata("oboro.disabled"))
+  const std::string DisabledTag = obf::metaName(M, "disabled");
+  if (M.getNamedMetadata(DisabledTag))
     return nullptr;
-  const std::string Suffix = getOboroRuntimeSuffix(M);
-  const std::string Prefix = "oboro.";
-  const std::string GetEnvName = Prefix + "getenv." + Suffix;
+  const std::string GetEnvName = obf::stableName(M, "oboro.getenv");
   if (Function *Existing = M.getFunction(GetEnvName))
     return Existing;
 
@@ -131,7 +113,7 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
     llvm::errs() << "oboro: probe symbol '" << ProbeName
                  << "' has incompatible type (expected i32(void)); "
                     "decoy disabled for this module\n";
-    M.getOrInsertNamedMetadata("oboro.disabled");
+    M.getOrInsertNamedMetadata(DisabledTag);
     return nullptr;
   }
   auto EmitDefaultProbeBody = [&](Function *F) {
@@ -139,13 +121,15 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
     F->setVisibility(GlobalValue::HiddenVisibility);
     F->addFnAttr(Attribute::NoInline);
     F->addFnAttr(Attribute::OptimizeNone);
+    obf::markRuntimeFunction(M, *F);
     BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
     IRBuilder<> B(BB);
-    GlobalVariable *DefaultEnv = M.getNamedGlobal("oboro.default_env");
+    const std::string DefaultEnvName = obf::stableName(M, "oboro.default_env");
+    GlobalVariable *DefaultEnv = M.getNamedGlobal(DefaultEnvName);
     if (!DefaultEnv) {
       DefaultEnv = new GlobalVariable(
           M, I32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
-          ConstantInt::get(I32, 1), "oboro.default_env");
+          ConstantInt::get(I32, 1), DefaultEnvName);
       DefaultEnv->setAlignment(Align(4));
     }
     B.CreateRet(B.CreateLoad(I32, DefaultEnv, /*isVolatile=*/true));
@@ -166,14 +150,15 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
     Function *F = Function::Create(FunctionType::get(I32, false),
                                    GlobalValue::InternalLinkage, Name, M);
     F->addFnAttr(Attribute::NoInline);
+    obf::markRuntimeFunction(M, *F);
     BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
     IRBuilder<> B(BB);
     B.CreateRet(B.getInt32(Value));
     return F;
   };
-  Function *A0 = GetOrCreateAnchor(Prefix + "anchor0." + Suffix,
+  Function *A0 = GetOrCreateAnchor(obf::freshName(M, "oboro.anchor0"),
                                    cryptoutils->get_uint32_t() & ~1u);
-  Function *A1 = GetOrCreateAnchor(Prefix + "anchor1." + Suffix,
+  Function *A1 = GetOrCreateAnchor(obf::freshName(M, "oboro.anchor1"),
                                    cryptoutils->get_uint32_t() | 1u);
 
   // ---- 编译期常量 ----
@@ -192,12 +177,14 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
     G->setAlignment(Align(4));
     return G;
   };
-  GlobalVariable *S1 = GetOrCreateI32Global(Prefix + "s1." + Suffix, 0);
-  GlobalVariable *S2 = GetOrCreateI32Global(Prefix + "s2." + Suffix, 0);
+  GlobalVariable *S1 =
+      GetOrCreateI32Global(obf::freshName(M, "oboro.s1"), 0);
+  GlobalVariable *S2 =
+      GetOrCreateI32Global(obf::freshName(M, "oboro.s2"), 0);
   GlobalVariable *Inited =
-      GetOrCreateI32Global(Prefix + "inited." + Suffix, 0);
+      GetOrCreateI32Global(obf::freshName(M, "oboro.inited"), 0);
   GlobalVariable *Tampered =
-      GetOrCreateI32Global(Prefix + "tampered." + Suffix, TamperKey);
+      GetOrCreateI32Global(obf::freshName(M, "oboro.tampered"), TamperKey);
 
   auto BuildKey = [&](IRBuilder<> &B, Function *Anchor,
                       uint32_t KeyConst) -> Value * {
@@ -222,10 +209,11 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
   // ---- init：原子状态机 0->1->2；防递归 ----
   Function *Init = Function::Create(FunctionType::get(Void, false),
                                     GlobalValue::InternalLinkage,
-                                    Prefix + "init." + Suffix, M);
+                                    obf::freshName(M, "oboro.init"), M);
   Init->addFnAttr(Attribute::NoInline);
   Init->addFnAttr(Attribute::OptimizeNone);
-  Init->addMetadata("noobf", *MDNode::get(Ctx, {}));
+  Init->addMetadata(obf::metaName(M, "noobf"), *MDNode::get(Ctx, {}));
+  obf::markRuntimeFunction(M, *Init);
   BasicBlock *InitEntry = BasicBlock::Create(Ctx, "entry", Init);
   BasicBlock *InitDo = BasicBlock::Create(Ctx, "doinit", Init);
   BasicBlock *InitDone = BasicBlock::Create(Ctx, "done", Init);
@@ -259,7 +247,8 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
                                       GetEnvName, M);
   GetEnv->addFnAttr(Attribute::NoInline);
   GetEnv->addFnAttr(Attribute::OptimizeNone);
-  GetEnv->addMetadata("noobf", *MDNode::get(Ctx, {}));
+  GetEnv->addMetadata(obf::metaName(M, "noobf"), *MDNode::get(Ctx, {}));
+  obf::markRuntimeFunction(M, *GetEnv);
   BasicBlock *GE = BasicBlock::Create(Ctx, "entry", GetEnv);
   BasicBlock *GFast = BasicBlock::Create(Ctx, "fast", GetEnv);
   BasicBlock *GSlow = BasicBlock::Create(Ctx, "slow", GetEnv);
@@ -294,18 +283,20 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
       GB.CreateNot(GB.CreateICmpNE(T, GB.getInt32(0))));
   GB.CreateRet(GB.CreateZExt(Good, I32));
 
-  // ---- constructor：优先 101，尽早初始化 ----
+  // ---- constructor：低优先级区间内随机，尽早初始化 ----
   Function *Ctor = Function::Create(FunctionType::get(Void, false),
                                     GlobalValue::InternalLinkage,
-                                    Prefix + "ctor." + Suffix, M);
+                                    obf::freshName(M, "oboro.ctor"), M);
   Ctor->addFnAttr(Attribute::NoInline);
   Ctor->addFnAttr(Attribute::OptimizeNone);
-  Ctor->addMetadata("noobf", *MDNode::get(Ctx, {}));
+  Ctor->addMetadata(obf::metaName(M, "noobf"), *MDNode::get(Ctx, {}));
+  obf::markRuntimeFunction(M, *Ctor);
   BasicBlock *CB = BasicBlock::Create(Ctx, "entry", Ctor);
   IRBuilder<> CIB(CB);
   CIB.CreateCall(Init, {});
   CIB.CreateRetVoid();
-  appendToGlobalCtors(M, Ctor, 101);
+  // 优先级随机化：固定的 .init_array.101 本身就是可扫描特征。
+  appendToGlobalCtors(M, Ctor, 101 + cryptoutils->get_uint32_t() % 800);
 
   return GetEnv;
 }
@@ -672,7 +663,9 @@ struct DecoyPass : public FunctionPass {
       return false;
 
     // 工具链自己的运行时函数绝不参与混淆（防递归/自污染）。
-    if (F.getMetadata("noobf") || F.getName().starts_with("oboro."))
+    Module *M = F.getParent();
+    if (F.getMetadata(obf::metaName(*M, "noobf")) ||
+        obf::isRuntimeFunction(*M, F))
       return false;
     // 项目提供的 probe 是策略入口，绝不能反过来被插桩
     // （否则 probe -> getenv -> probe 递归）。
@@ -737,6 +730,13 @@ struct DecoyPass : public FunctionPass {
       if (isa<ReturnInst>(Term) || isa<BranchInst>(Term) ||
           isa<SwitchInst>(Term))
         Targets.push_back(&BB);
+    }
+
+    // 随机采样：与 BCF 一致，先洗牌再按概率过滤，避免"前 16 块"
+    // 的固定空间分布成为指纹。
+    for (unsigned I = Targets.size(); I > 1; --I) {
+      unsigned J = cryptoutils->get_uint32_t() % I;
+      std::swap(Targets[I - 1], Targets[J]);
     }
 
     // 每函数 16 个站点（与 BCF 相同的体积控制）。
