@@ -64,6 +64,16 @@ VMP 不在 `PipelineStart` 运行，而是挂在 `OptimizerLast`（`FullLtoLast`
 翻译阶段只读，失败直接返回；成功后才替换函数体，并在替换后 `verifyFunction`，
 失败会恢复原函数。
 
+### Level 语义
+
+| level | 行为 |
+| --- | --- |
+| 1 | 基线：opcode 随机置换、每函数密钥、PC 派生流加密 |
+| 2 | 在 1 的基础上加：虚拟寄存器物理槽位随机置换、整数常量池加密（volatile 读取，防折叠） |
+| 3 | 预留给后续的 superinstruction / 分块密钥；当前等同 2 |
+
+建议生产使用 `-level-vmp=2`。
+
 ## 3. 实现要点
 
 - **寄存器 VM**：每个 SSA 值一个 64 位虚拟寄存器，寄存器保存零扩展位模式；有符号

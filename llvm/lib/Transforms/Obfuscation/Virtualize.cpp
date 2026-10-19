@@ -119,6 +119,10 @@ static bool widthCodeForBits(unsigned Bits, uint8_t &Out) {
   }
 }
 
+static uint64_t constMask(uint64_t Key, unsigned Index) {
+  return Key + (uint64_t)Index * 0x9E3779B97F4A7C15ULL;
+}
+
 static uint64_t splitmix64(uint64_t &State) {
   uint64_t Z = (State += 0x9E3779B97F4A7C15ULL);
   Z = (Z ^ (Z >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -144,6 +148,7 @@ struct VMProgram {
   uint32_t EntryPC = 0;
   uint8_t OpMap[OP_COUNT] = {};
   uint64_t Key = 0;
+  unsigned Level = 1;
   unsigned ArgCount = 0;
   uint64_t FrameSize = 0;
   uint64_t BodyHash = 0;
@@ -1225,7 +1230,32 @@ bool VMTranslator::run() {
   }
 
   Program.Key = nextRand() | 1;
+  Program.Level = Level;
   Program.BodyHash = nextRand();
+
+  // Level 2+: permute all non-argument registers.  Arguments stay at
+  // 0..ArgCount-1 because the interpreter prologue writes them there.
+  if (Level >= 2) {
+    uint8_t Perm[236];
+    for (unsigned I = 0; I < 236; ++I)
+      Perm[I] = (uint8_t)I;
+    for (unsigned I = 236; I > std::max(Program.ArgCount, 1u); --I) {
+      unsigned J = Program.ArgCount +
+                   (unsigned)(nextRand() % (I - Program.ArgCount));
+      std::swap(Perm[I - 1], Perm[J]);
+    }
+    auto Map = [&](uint8_t &R) {
+      if (R <= 235)
+        R = Perm[R];
+    };
+    for (VInst &I : Program.Code) {
+      Map(I.A);
+      Map(I.B);
+      Map(I.C);
+      if (I.Op == OP_SELECT && I.Imm <= 235)
+        I.Imm = Perm[I.Imm];
+    }
+  }
   return true;
 }
 
@@ -1382,8 +1412,12 @@ bool VMRuntimeBuilder::createGlobals() {
     size_t N = std::max<size_t>(P.Ints.size(), 1);
     ArrayType *Ty = ArrayType::get(I64, N);
     std::vector<Constant *> Cs;
-    for (uint64_t V : P.Ints)
+    for (unsigned I = 0; I < P.Ints.size(); ++I) {
+      uint64_t V = P.Ints[I];
+      if (P.Level >= 2)
+        V ^= constMask(P.Key, I);
       Cs.push_back(ConstantInt::get(I64, V));
+    }
     while (Cs.size() < N)
       Cs.push_back(ConstantInt::get(I64, 0));
     IntGV = new GlobalVariable(M, Ty, true, GlobalValue::InternalLinkage,
@@ -1597,7 +1631,14 @@ Function *VMRuntimeBuilder::createInterpreter() {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     Value *Cp = B.CreateGEP(I64, IntGV, D.Imm);
-    Value *V = B.CreateAlignedLoad(I64, Cp, Align(8), false);
+    Value *V = B.CreateAlignedLoad(I64, Cp, Align(8), P.Level >= 2);
+    if (P.Level >= 2) {
+      Value *Mask = B.CreateAdd(
+          B.getInt64(P.Key),
+          B.CreateMul(B.CreateZExt(D.Imm, I64),
+                      B.getInt64(0x9E3779B97F4A7C15ULL)));
+      V = B.CreateXor(V, Mask);
+    }
     storeReg(D.A, zextTo(V, D.W));
     B.CreateAlignedStore(B.CreateAdd(Pc, B.getInt32(1)), PcSlot, Align(4));
     B.CreateBr(Loop);
