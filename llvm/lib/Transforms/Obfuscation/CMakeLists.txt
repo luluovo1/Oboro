@@ -1,5 +1,7 @@
 add_llvm_library(LLVMObfuscation
   BogusControlFlow.cpp
+  BcfShared.cpp
+  DecoyPass.cpp
   CryptoUtils.cpp
   Utils.cpp
   ObfuscationPassManager.cpp

@@ -4,6 +4,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
+#include "llvm/Transforms/Obfuscation/DecoyPass.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationPassManager.h"
 // CryptoUtils.h defines a function-like macro `R`, which collides with
@@ -231,6 +232,11 @@ struct ObfuscationPassManager : public ModulePass {
     // split 会引发后端寄存器分配/EH 准备的组合爆炸（实测编译卡死）。
     if (EnableBogusControlFlow || Options->bcfOpt()->isEnabled()) {
       add(llvm::createBogusControlFlowPass(Options.get()));
+      // DecoyPass 绑定 BCF 开关（用户侧零变化：-irobf-bcf + config decoy
+      // 声明即生效）。资格门在 pass 内：无注解/config 声明时空转。
+      // 顺序：BCF 先（纯 poison）、Decoy 后（env 菱形 + poison 混合），
+      // 两者都在 INDBR 之前 —— 菱形必须在间接跳转改写前建好。
+      add(llvm::createDecoyPass(Options.get()));
     }
 
     add(llvm::createIndirectBranchPass(Options.get()));
