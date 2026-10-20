@@ -94,6 +94,22 @@ enum VMOp : uint8_t {
   OP_CTTZ,
   OP_BSWAP,
   OP_BITREVERSE,
+  OP_FADD,
+  OP_FSUB,
+  OP_FMUL,
+  OP_FDIV,
+  OP_FREM,
+  OP_FNEG,
+  OP_FABS,
+  OP_FSQRT,
+  OP_FMA,
+  OP_FCMP,
+  OP_FPEXT,
+  OP_FPTRUNC,
+  OP_FPTOSI,
+  OP_FPTOUI,
+  OP_SITOFP,
+  OP_UITOFP,
   OP_BR,
   OP_CBR,
   OP_RET,
@@ -144,11 +160,21 @@ struct VInst {
   uint32_t Imm = 0;
 };
 
+// One entry per call-site shape.  A thunk receives the argument block and an
+// optional dynamic callee: direct calls pass null, indirect calls pass the
+// function pointer loaded from a virtual register.
+struct VMThunk {
+  Function *Direct = nullptr;
+  FunctionType *SiteFT = nullptr;
+  SmallVector<Type *, 8> ArgTys;
+  Type *RetTy = nullptr;
+};
+
 struct VMProgram {
   std::vector<VInst> Code;
   std::vector<uint64_t> Ints;
   std::vector<Constant *> Ptrs;
-  std::vector<Function *> Thunks;
+  std::vector<VMThunk> Thunks;
   uint32_t EntryPC = 0;
   uint8_t OpMap[OP_COUNT] = {};
   uint64_t Key = 0;
@@ -171,6 +197,9 @@ static bool isSupportedScalar(Type *T, const DataLayout &DL) {
     return T->getPointerAddressSpace() == 0 &&
            (DL.getPointerSizeInBits(0) == 32 ||
             DL.getPointerSizeInBits(0) == 64);
+  // Scalar floating point is carried as its 32/64-bit pattern.
+  if (T->isFloatTy() || T->isDoubleTy())
+    return true;
   return false;
 }
 
@@ -179,7 +208,17 @@ static unsigned bitWidthOf(Type *T, const DataLayout &DL) {
     return T->getIntegerBitWidth();
   if (T->isPointerTy())
     return DL.getPointerSizeInBits(T->getPointerAddressSpace());
+  if (T->isFloatTy())
+    return 32;
+  if (T->isDoubleTy())
+    return 64;
   return 0;
+}
+
+// Storage width of a value: floats use the integer code of the same size,
+// because a register holds the bit pattern.
+static bool storageWidthCode(Type *T, const DataLayout &DL, uint8_t &Out) {
+  return widthCodeForBits(bitWidthOf(T, DL), Out);
 }
 
 static bool functionShapeOK(Function &F, const DataLayout &DL,
@@ -210,7 +249,8 @@ static bool functionShapeOK(Function &F, const DataLayout &DL,
     Reason = "naked/coro/returns_twice";
     return false;
   }
-  if (!isSupportedScalar(F.getReturnType(), DL)) {
+  if (!F.getReturnType()->isVoidTy() &&
+      !isSupportedScalar(F.getReturnType(), DL)) {
     Reason = "unsupported return type";
     return false;
   }
@@ -272,7 +312,6 @@ private:
   DenseMap<AllocaInst *, uint64_t> AllocaOff;
   std::vector<AllocaInst *> Allocas;
   uint64_t FrameSize = 0;
-  DenseMap<Function *, unsigned> ThunkIds;
   std::vector<std::pair<uint32_t, BasicBlock *>> Fixups;
   uint8_t NextReg = 0;
   uint64_t RngState = 0;
@@ -340,14 +379,63 @@ private:
     return (uint32_t)Program.Ptrs.size() - 1;
   }
 
-  unsigned thunkFor(Function *Callee) {
-    auto It = ThunkIds.find(Callee);
-    if (It != ThunkIds.end())
-      return It->second;
-    unsigned Id = (unsigned)Program.Thunks.size();
-    Program.Thunks.push_back(Callee);
-    ThunkIds[Callee] = Id;
-    return Id;
+  unsigned thunkForCall(CallInst &CI) {
+    Function *Direct = CI.getCalledFunction();
+    FunctionType *SiteFT = CI.getFunctionType();
+    Type *RetTy = CI.getType();
+    SmallVector<Type *, 8> ArgTys;
+    for (Value *A : CI.args())
+      ArgTys.push_back(A->getType());
+
+    for (unsigned I = 0; I < Program.Thunks.size(); ++I) {
+      const VMThunk &T = Program.Thunks[I];
+      if (T.Direct != Direct || T.RetTy != RetTy ||
+          T.ArgTys.size() != ArgTys.size())
+        continue;
+      if (!Direct && T.SiteFT != SiteFT)
+        continue;
+      bool Same = true;
+      for (unsigned J = 0; J < ArgTys.size(); ++J)
+        if (T.ArgTys[J] != ArgTys[J]) {
+          Same = false;
+          break;
+        }
+      if (Same)
+        return I;
+    }
+
+    VMThunk T;
+    T.Direct = Direct;
+    T.SiteFT = SiteFT;
+    T.RetTy = RetTy;
+    T.ArgTys.assign(ArgTys.begin(), ArgTys.end());
+    Program.Thunks.push_back(T);
+    return (unsigned)Program.Thunks.size() - 1;
+  }
+
+  unsigned thunkForFunction(Function *Callee,
+                            ArrayRef<Type *> ArgTys) {
+    FunctionType *FT = Callee->getFunctionType();
+    for (unsigned I = 0; I < Program.Thunks.size(); ++I) {
+      const VMThunk &T = Program.Thunks[I];
+      if (T.Direct != Callee || T.ArgTys.size() != ArgTys.size())
+        continue;
+      bool Same = true;
+      for (unsigned J = 0; J < ArgTys.size(); ++J)
+        if (T.ArgTys[J] != ArgTys[J]) {
+          Same = false;
+          break;
+        }
+      if (Same)
+        return I;
+    }
+    VMThunk T;
+    T.Direct = Callee;
+    T.SiteFT = FT;
+    T.RetTy = FT->getReturnType();
+    T.ArgTys.assign(ArgTys.begin(), ArgTys.end());
+    Program.Thunks.push_back(T);
+    return (unsigned)Program.Thunks.size() - 1;
   }
 };
 
@@ -391,6 +479,14 @@ bool VMTranslator::materialize(Value *V, uint8_t Dst, Type *Ty) {
     if (CI->getBitWidth() > 64)
       return fail("integer constant wider than 64 bits");
     emit(OP_IMM, W, Dst, 0, 0, 0, addIntConst(CI->getZExtValue()));
+    return true;
+  }
+
+  if (auto *CF = dyn_cast<ConstantFP>(C)) {
+    APInt Bits = CF->getValueAPF().bitcastToAPInt();
+    if (Bits.getBitWidth() > 64)
+      return fail("fp constant wider than 64 bits");
+    emit(OP_IMM, W, Dst, 0, 0, 0, addIntConst(Bits.getZExtValue()));
     return true;
   }
 
@@ -477,19 +573,15 @@ bool VMTranslator::callSignatureOK(CallInst &CI, std::string &Why) {
     return false;
   }
   Function *Callee = CI.getCalledFunction();
-  if (!Callee) {
-    Why = "indirect call";
-    return false;
-  }
-  if (Callee->isIntrinsic()) {
+  if (Callee && Callee->isIntrinsic()) {
     Why = "intrinsic call";
     return false;
   }
-  if (Callee->isVarArg()) {
-    Why = "varargs call";
-    return false;
+  if (!Callee && CI.getFunctionType()->isVarArg()) {
+    // The site keeps its concrete argument types, so a thunk can still be
+    // generated; nothing to reject here.
   }
-  if (!isSupportedScalar(CI.getType(), DL)) {
+  if (!CI.getType()->isVoidTy() && !isSupportedScalar(CI.getType(), DL)) {
     Why = "unsupported call return type";
     return false;
   }
@@ -521,8 +613,15 @@ bool VMTranslator::translateCall(CallInst &CI) {
   if (!callSignatureOK(CI, Why))
     return fail("call: " + Why);
 
-  Function *Callee = CI.getCalledFunction();
-  unsigned Id = thunkFor(Callee);
+  bool Indirect = (CI.getCalledFunction() == nullptr);
+  unsigned Id = thunkForCall(CI);
+
+  uint8_t FnReg = 0;
+  if (Indirect) {
+    FnReg = regOf(CI.getCalledOperand());
+    if (Failed)
+      return false;
+  }
 
   for (unsigned I = 0; I < CI.arg_size(); ++I) {
     Value *Arg = CI.getArgOperand(I);
@@ -536,7 +635,8 @@ bool VMTranslator::translateCall(CallInst &CI) {
     emit(OP_MOV, W, Dst, Src);
   }
 
-  emit(OP_CALL, 0, 0, 0, 0, (uint8_t)CI.arg_size(), Id);
+  uint8_t CFlags = (uint8_t)CI.arg_size() | (Indirect ? 0x80 : 0);
+  emit(OP_CALL, 0, 0, FnReg, 0, CFlags, Id);
 
   if (CI.getType()->isVoidTy()) {
     if (CI.doesNotReturn())
@@ -800,7 +900,9 @@ bool VMTranslator::translateInst(Instruction &I) {
               MI->getLength()->getType()},
         false);
     Function *Fn = cast<Function>(M.getOrInsertFunction(Name, FT).getCallee());
-    unsigned Id = thunkFor(Fn);
+    SmallVector<Type *, 4> MTys = {Ptr, IsSet ? Type::getInt32Ty(C) : Ptr,
+                                   MI->getLength()->getType()};
+    unsigned Id = thunkForFunction(Fn, MTys);
     uint8_t Dst0 = kArgBase;
     uint8_t Src0 = kArgBase + 1;
     uint8_t Len0 = kArgBase + 2;
@@ -833,6 +935,22 @@ bool VMTranslator::translateInst(Instruction &I) {
     return true;
   }
 
+  if (auto *UO = dyn_cast<UnaryOperator>(&I)) {
+    if (UO->getOpcode() == Instruction::FNeg) {
+      uint8_t W;
+      if (!storageWidthCode(UO->getType(), DL, W))
+        return fail("fneg width");
+      uint8_t A = allocReg();
+      uint8_t B = regOf(UO->getOperand(0));
+      if (Failed)
+        return false;
+      emit(OP_FNEG, W, A, B);
+      Regs[&I] = A;
+      return true;
+    }
+    return fail("unsupported unary operator");
+  }
+
   if (auto *CI = dyn_cast<CallInst>(&I)) {
     Function *Callee = CI->getCalledFunction();
     if (Callee && Callee->isIntrinsic()) {
@@ -847,6 +965,72 @@ bool VMTranslator::translateInst(Instruction &I) {
       case Intrinsic::experimental_noalias_scope_decl:
       case Intrinsic::prefetch:
         return true;
+      case Intrinsic::trap:
+        emit(OP_TRAP, 0);
+        return true;
+      case Intrinsic::expect:
+      case Intrinsic::expect_with_probability: {
+        uint8_t W;
+        if (!storageWidthCode(CI->getType(), DL, W))
+          return fail("expect width");
+        uint8_t R = regOf(CI->getArgOperand(0));
+        if (Failed)
+          return false;
+        Regs[&I] = R;
+        return true;
+      }
+      case Intrinsic::smax:
+      case Intrinsic::smin:
+      case Intrinsic::umax:
+      case Intrinsic::umin: {
+        Value *X = CI->getArgOperand(0);
+        Value *Y = CI->getArgOperand(1);
+        uint8_t W;
+        if (!storageWidthCode(X->getType(), DL, W))
+          return fail("min/max width");
+        uint8_t Bv = regOf(X);
+        uint8_t Cv = regOf(Y);
+        uint8_t Cmp = allocReg();
+        uint8_t A = allocReg();
+        if (Failed)
+          return false;
+        uint8_t CmpOp;
+        switch (Callee->getIntrinsicID()) {
+        case Intrinsic::smax: CmpOp = OP_ICMP_SGT; break;
+        case Intrinsic::smin: CmpOp = OP_ICMP_SLT; break;
+        case Intrinsic::umax: CmpOp = OP_ICMP_UGT; break;
+        default:              CmpOp = OP_ICMP_ULT; break;
+        }
+        emit(CmpOp, W, Cmp, Bv, Cv);
+        emit(OP_SELECT, W, A, Cmp, Bv, 0, Cv);
+        Regs[&I] = A;
+        return true;
+      }
+      case Intrinsic::fabs:
+      case Intrinsic::sqrt:
+      case Intrinsic::fmuladd: {
+        Type *T = CI->getArgOperand(0)->getType();
+        uint8_t W;
+        if (!storageWidthCode(T, DL, W))
+          return fail("fp intrinsic width");
+        uint8_t A = allocReg();
+        uint8_t Bv = regOf(CI->getArgOperand(0));
+        if (Failed)
+          return false;
+        if (Callee->getIntrinsicID() == Intrinsic::fmuladd) {
+          uint8_t Cv = regOf(CI->getArgOperand(1));
+          uint8_t Dv = regOf(CI->getArgOperand(2));
+          if (Failed)
+            return false;
+          emit(OP_FMA, W, A, Bv, Cv, 0, Dv);
+        } else {
+          emit(Callee->getIntrinsicID() == Intrinsic::fabs ? OP_FABS
+                                                           : OP_FSQRT,
+               W, A, Bv);
+        }
+        Regs[&I] = A;
+        return true;
+      }
       case Intrinsic::ctpop:
       case Intrinsic::ctlz:
       case Intrinsic::cttz:
@@ -902,11 +1086,30 @@ bool VMTranslator::translateInst(Instruction &I) {
     return fail("unsupported value type");
 
   if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-    if (!BO->getType()->isIntegerTy())
-      return fail("non-integer binary op");
     uint8_t W;
-    if (!widthCodeForBits(bitWidthOf(BO->getType(), DL), W))
+    if (!storageWidthCode(BO->getType(), DL, W))
       return fail("binary op width");
+    if (!BO->getType()->isIntegerTy()) {
+      if (!BO->getType()->isFloatTy() && !BO->getType()->isDoubleTy())
+        return fail("unsupported binary operand type");
+      uint8_t A = allocReg();
+      uint8_t B = regOf(BO->getOperand(0));
+      uint8_t C = regOf(BO->getOperand(1));
+      if (Failed)
+        return false;
+      uint8_t Op;
+      switch (BO->getOpcode()) {
+      case Instruction::FAdd: Op = OP_FADD; break;
+      case Instruction::FSub: Op = OP_FSUB; break;
+      case Instruction::FMul: Op = OP_FMUL; break;
+      case Instruction::FDiv: Op = OP_FDIV; break;
+      case Instruction::FRem: Op = OP_FREM; break;
+      default: return fail("unsupported fp binary operator");
+      }
+      emit(Op, W, A, B, C);
+      Regs[&I] = A;
+      return true;
+    }
     uint8_t A = allocReg();
     uint8_t B = regOf(BO->getOperand(0));
     uint8_t C = regOf(BO->getOperand(1));
@@ -930,6 +1133,20 @@ bool VMTranslator::translateInst(Instruction &I) {
     default: return fail("unsupported binary operator");
     }
     emit(Op, W, A, B, C);
+    Regs[&I] = A;
+    return true;
+  }
+
+  if (auto *FC = dyn_cast<FCmpInst>(&I)) {
+    uint8_t W;
+    if (!storageWidthCode(FC->getOperand(0)->getType(), DL, W))
+      return fail("fcmp width");
+    uint8_t A = allocReg();
+    uint8_t B = regOf(FC->getOperand(0));
+    uint8_t C = regOf(FC->getOperand(1));
+    if (Failed)
+      return false;
+    emit(OP_FCMP, W, A, B, C, 0, (uint32_t)FC->getPredicate());
     Regs[&I] = A;
     return true;
   }
@@ -997,6 +1214,31 @@ bool VMTranslator::translateInst(Instruction &I) {
     if (Failed)
       return false;
     switch (CI->getOpcode()) {
+    case Instruction::FPExt:
+      emit(OP_FPEXT, DW, A, B, 0, SW);
+      break;
+    case Instruction::FPTrunc:
+      emit(OP_FPTRUNC, DW, A, B, 0, SW);
+      break;
+    case Instruction::FPToSI:
+      emit(OP_FPTOSI, DW, A, B, 0, SW);
+      break;
+    case Instruction::FPToUI:
+      emit(OP_FPTOUI, DW, A, B, 0, SW);
+      break;
+    case Instruction::SIToFP:
+    case Instruction::UIToFP: {
+      // Normalise the integer source to 64 bits so the handler only needs to
+      // deal with the two floating-point widths.
+      uint8_t X = allocReg();
+      if (Failed)
+        return false;
+      emit(CI->getOpcode() == Instruction::SIToFP ? OP_SEXT : OP_ZEXT, W_I64,
+           X, B, 0, SW);
+      emit(CI->getOpcode() == Instruction::SIToFP ? OP_SITOFP : OP_UITOFP, DW,
+           A, X, 0, W_I64);
+      break;
+    }
     case Instruction::Trunc:
       emit(OP_TRUNC, DW, A, B, 0, SW);
       break;
@@ -1266,7 +1508,7 @@ bool VMTranslator::run() {
       Map(I.A);
       Map(I.B);
       Map(I.C);
-      if (I.Op == OP_SELECT && I.Imm <= 235)
+      if ((I.Op == OP_SELECT || I.Op == OP_FMA) && I.Imm <= 235)
         I.Imm = Perm[I.Imm];
     }
   }
@@ -1346,10 +1588,21 @@ bool VMRuntimeBuilder::createThunks() {
   IRBuilder<> B(Ctx);
   Type *I64 = B.getInt64Ty();
   Type *Ptr = B.getPtrTy();
+  auto unmarshal = [&](Value *V, Type *T) -> Value * {
+    if (T->isPointerTy())
+      return B.CreateIntToPtr(V, T);
+    if (T->isFloatTy())
+      return B.CreateBitCast(B.CreateTrunc(V, B.getInt32Ty()), T);
+    if (T->isDoubleTy())
+      return B.CreateBitCast(V, T);
+    if (T->isIntegerTy() && T->getIntegerBitWidth() < 64)
+      return B.CreateTrunc(V, T);
+    return V;
+  };
+
   for (unsigned Id = 0; Id < P.Thunks.size(); ++Id) {
-    Function *Callee = P.Thunks[Id];
-    FunctionType *CalleeFT = Callee->getFunctionType();
-    FunctionType *ThunkFT = FunctionType::get(I64, {Ptr}, false);
+    const VMThunk &D = P.Thunks[Id];
+    FunctionType *ThunkFT = FunctionType::get(I64, {Ptr, Ptr}, false);
     Function *T = Function::Create(ThunkFT, GlobalValue::InternalLinkage,
                                    randomName(RngState, "__o"), &M);
     T->addFnAttr(kGeneratedAttr);
@@ -1359,27 +1612,32 @@ bool VMRuntimeBuilder::createThunks() {
 
     Value *Args = T->getArg(0);
     SmallVector<Value *, 8> CallArgs;
-    for (unsigned I = 0; I < CalleeFT->getNumParams(); ++I) {
+    for (unsigned I = 0; I < D.ArgTys.size(); ++I) {
       Value *Pp = gepI8(B, Args, I * 8);
       Value *V = B.CreateAlignedLoad(I64, Pp, Align(8), false);
-      Type *PT = CalleeFT->getParamType(I);
-      if (PT->isPointerTy())
-        CallArgs.push_back(B.CreateIntToPtr(V, PT));
-      else if (PT->getIntegerBitWidth() < 64)
-        CallArgs.push_back(B.CreateTrunc(V, PT));
-      else
-        CallArgs.push_back(V);
+      CallArgs.push_back(unmarshal(V, D.ArgTys[I]));
     }
-    CallInst *Call = B.CreateCall(CalleeFT, Callee, CallArgs);
-    Call->setCallingConv(Callee->getCallingConv());
-    Call->setAttributes(Callee->getAttributes());
+
+    CallInst *Call;
+    if (D.Direct) {
+      Call = B.CreateCall(D.Direct, CallArgs);
+      Call->setCallingConv(D.Direct->getCallingConv());
+      Call->setAttributes(D.Direct->getAttributes());
+    } else {
+      Call = B.CreateCall(D.SiteFT, T->getArg(1), CallArgs);
+      Call->setCallingConv(CallingConv::C);
+    }
     Call->setTailCallKind(CallInst::TCK_None);
 
-    Type *RT = CalleeFT->getReturnType();
+    Type *RT = D.RetTy;
     if (RT->isVoidTy())
       B.CreateRet(B.getInt64(0));
     else if (RT->isPointerTy())
       B.CreateRet(B.CreatePtrToInt(Call, I64));
+    else if (RT->isFloatTy())
+      B.CreateRet(B.CreateZExt(B.CreateBitCast(Call, B.getInt32Ty()), I64));
+    else if (RT->isDoubleTy())
+      B.CreateRet(B.CreateBitCast(Call, I64));
     else if (RT->getIntegerBitWidth() < 64)
       B.CreateRet(B.CreateZExt(Call, I64));
     else
@@ -1883,6 +2141,195 @@ Function *VMRuntimeBuilder::createInterpreter() {
   emitBitIntrinsic(OP_BSWAP);
   emitBitIntrinsic(OP_BITREVERSE);
 
+  // ---- floating point ---------------------------------------------------
+  auto fpTy = [&](unsigned Code) -> Type * {
+    return Code == W_I32 ? Type::getFloatTy(Ctx) : Type::getDoubleTy(Ctx);
+  };
+  auto widenFP = [&](Value *V, unsigned Code) -> Value * {
+    return Code == W_I32 ? B.CreateZExt(V, I64) : V;
+  };
+  auto narrowFP = [&](Value *V, unsigned Code) -> Value * {
+    return Code == W_I32 ? B.CreateTrunc(V, I32) : V;
+  };
+  auto adv = [&]() {
+    B.CreateAlignedStore(B.CreateAdd(Pc, B.getInt32(1)), PcSlot, Align(4));
+    B.CreateBr(Loop);
+  };
+  auto fpBitsTy = [&](unsigned Code) -> Type * {
+    return Code == W_I32 ? (Type *)I32 : (Type *)I64;
+  };
+
+  auto emitFPBin = [&](VMOp Op) {
+    BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    SwitchInst *WSw = B.CreateSwitch(D.W, Trap, 2);
+    for (unsigned Idx = 0; Idx < 2; ++Idx) {
+      unsigned Code = Idx == 0 ? W_I32 : W_I64;
+      BasicBlock *CB = newBB();
+      B.SetInsertPoint(CB);
+      Type *FT = fpTy(Code);
+      Value *X = B.CreateBitCast(narrowFP(loadReg(D.B), Code), FT);
+      Value *Y = B.CreateBitCast(narrowFP(loadReg(D.C), Code), FT);
+      Value *R;
+      switch (Op) {
+      case OP_FADD: R = B.CreateFAdd(X, Y); break;
+      case OP_FSUB: R = B.CreateFSub(X, Y); break;
+      case OP_FMUL: R = B.CreateFMul(X, Y); break;
+      case OP_FDIV: R = B.CreateFDiv(X, Y); break;
+      default:      R = B.CreateFRem(X, Y); break;
+      }
+      storeReg(D.A, widenFP(B.CreateBitCast(R, fpBitsTy(Code)), Code));
+      adv();
+      WSw->addCase(ConstantInt::get(I32, Code), CB);
+    }
+    AddCase(Op, BB);
+  };
+  emitFPBin(OP_FADD);
+  emitFPBin(OP_FSUB);
+  emitFPBin(OP_FMUL);
+  emitFPBin(OP_FDIV);
+  emitFPBin(OP_FREM);
+
+  auto emitFPUn = [&](VMOp Op) {
+    BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    SwitchInst *WSw = B.CreateSwitch(D.W, Trap, 2);
+    for (unsigned Idx = 0; Idx < 2; ++Idx) {
+      unsigned Code = Idx == 0 ? W_I32 : W_I64;
+      BasicBlock *CB = newBB();
+      B.SetInsertPoint(CB);
+      Type *FT = fpTy(Code);
+      Value *X = B.CreateBitCast(narrowFP(loadReg(D.B), Code), FT);
+      Value *R;
+      if (Op == OP_FNEG)
+        R = B.CreateFNeg(X);
+      else if (Op == OP_FABS)
+        R = B.CreateUnaryIntrinsic(Intrinsic::fabs, X);
+      else
+        R = B.CreateUnaryIntrinsic(Intrinsic::sqrt, X);
+      storeReg(D.A, widenFP(B.CreateBitCast(R, fpBitsTy(Code)), Code));
+      adv();
+      WSw->addCase(ConstantInt::get(I32, Code), CB);
+    }
+    AddCase(Op, BB);
+  };
+  emitFPUn(OP_FNEG);
+  emitFPUn(OP_FABS);
+  emitFPUn(OP_FSQRT);
+
+  {
+    BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    SwitchInst *WSw = B.CreateSwitch(D.W, Trap, 2);
+    for (unsigned Idx = 0; Idx < 2; ++Idx) {
+      unsigned Code = Idx == 0 ? W_I32 : W_I64;
+      BasicBlock *CB = newBB();
+      B.SetInsertPoint(CB);
+      Type *FT = fpTy(Code);
+      Value *X = B.CreateBitCast(narrowFP(loadReg(D.B), Code), FT);
+      Value *Y = B.CreateBitCast(narrowFP(loadReg(D.C), Code), FT);
+      Value *Z = B.CreateBitCast(narrowFP(loadReg(D.Imm), Code), FT);
+      Value *Mul = B.CreateFMul(X, Y);
+      Value *R = B.CreateFAdd(Mul, Z);
+      storeReg(D.A, widenFP(B.CreateBitCast(R, fpBitsTy(Code)), Code));
+      adv();
+      WSw->addCase(ConstantInt::get(I32, Code), CB);
+    }
+    AddCase(OP_FMA, BB);
+  }
+
+  {
+    static const CmpInst::Predicate Preds[] = {
+        CmpInst::FCMP_FALSE, CmpInst::FCMP_OEQ, CmpInst::FCMP_OGT,
+        CmpInst::FCMP_OGE,   CmpInst::FCMP_OLT, CmpInst::FCMP_OLE,
+        CmpInst::FCMP_ONE,   CmpInst::FCMP_ORD, CmpInst::FCMP_UNO,
+        CmpInst::FCMP_UEQ,   CmpInst::FCMP_UGT, CmpInst::FCMP_UGE,
+        CmpInst::FCMP_ULT,   CmpInst::FCMP_ULE, CmpInst::FCMP_UNE,
+        CmpInst::FCMP_TRUE};
+    BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    SwitchInst *WSw = B.CreateSwitch(D.W, Trap, 2);
+    for (unsigned Idx = 0; Idx < 2; ++Idx) {
+      unsigned Code = Idx == 0 ? W_I32 : W_I64;
+      BasicBlock *CB = newBB();
+      B.SetInsertPoint(CB);
+      Type *FT = fpTy(Code);
+      Value *X = B.CreateBitCast(narrowFP(loadReg(D.B), Code), FT);
+      Value *Y = B.CreateBitCast(narrowFP(loadReg(D.C), Code), FT);
+      SwitchInst *PSw = B.CreateSwitch(D.Imm, Trap, 16);
+      for (CmpInst::Predicate P : Preds) {
+        BasicBlock *PB = newBB();
+        B.SetInsertPoint(PB);
+        Value *R = B.CreateFCmp(P, X, Y);
+        storeReg(D.A, B.CreateZExt(R, I64));
+        adv();
+        PSw->addCase(ConstantInt::get(I32, (unsigned)P), PB);
+      }
+      WSw->addCase(ConstantInt::get(I32, Code), CB);
+    }
+    AddCase(OP_FCMP, BB);
+  }
+
+  {
+    BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    Value *Bits = B.CreateTrunc(loadReg(D.B), I32);
+    Value *X = B.CreateBitCast(Bits, Type::getFloatTy(Ctx));
+    Value *R = B.CreateFPExt(X, Type::getDoubleTy(Ctx));
+    storeReg(D.A, B.CreateBitCast(R, I64));
+    adv();
+    AddCase(OP_FPEXT, BB);
+  }
+  {
+    BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    Value *X = B.CreateBitCast(loadReg(D.B), Type::getDoubleTy(Ctx));
+    Value *R = B.CreateFPTrunc(X, Type::getFloatTy(Ctx));
+    storeReg(D.A, B.CreateZExt(B.CreateBitCast(R, I32), I64));
+    adv();
+    AddCase(OP_FPTRUNC, BB);
+  }
+
+  auto emitFPToInt = [&](VMOp Op, bool Signed) {
+    BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    SwitchInst *WSw = B.CreateSwitch(D.Flags, Trap, 2);
+    for (unsigned Idx = 0; Idx < 2; ++Idx) {
+      unsigned Code = Idx == 0 ? W_I32 : W_I64;
+      BasicBlock *CB = newBB();
+      B.SetInsertPoint(CB);
+      Type *FT = fpTy(Code);
+      Value *X = B.CreateBitCast(narrowFP(loadReg(D.B), Code), FT);
+      Value *R = Signed ? B.CreateFPToSI(X, I64) : B.CreateFPToUI(X, I64);
+      storeReg(D.A, zextTo(R, D.W));
+      adv();
+      WSw->addCase(ConstantInt::get(I32, Code), CB);
+    }
+    AddCase(Op, BB);
+  };
+  emitFPToInt(OP_FPTOSI, true);
+  emitFPToInt(OP_FPTOUI, false);
+
+  auto emitIntToFP = [&](VMOp Op, bool Signed) {
+    BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    SwitchInst *WSw = B.CreateSwitch(D.W, Trap, 2);
+    for (unsigned Idx = 0; Idx < 2; ++Idx) {
+      unsigned Code = Idx == 0 ? W_I32 : W_I64;
+      BasicBlock *CB = newBB();
+      B.SetInsertPoint(CB);
+      Type *FT = fpTy(Code);
+      Value *X = loadReg(D.B);
+      Value *R = Signed ? B.CreateSIToFP(X, FT) : B.CreateUIToFP(X, FT);
+      storeReg(D.A, widenFP(B.CreateBitCast(R, fpBitsTy(Code)), Code));
+      adv();
+      WSw->addCase(ConstantInt::get(I32, Code), CB);
+    }
+    AddCase(Op, BB);
+  };
+  emitIntToFP(OP_SITOFP, true);
+  emitIntToFP(OP_UITOFP, false);
+
   // ---- OP_BR ------------------------------------------------------------
   {
     BasicBlock *BB = newBB();
@@ -1922,8 +2369,13 @@ Function *VMRuntimeBuilder::createInterpreter() {
     Value *FnPtr = B.CreateAlignedLoad(Ptr, Pp, Align(8), false);
     Value *ArgBase = B.CreateGEP(RegArrayTy, Regs,
                                  {B.getInt32(0), B.getInt32(kArgBase)});
-    FunctionType *ThunkFT = FunctionType::get(I64, {Ptr}, false);
-    CallInst *Call = B.CreateCall(ThunkFT, FnPtr, {ArgBase});
+    Value *HasFn = B.CreateICmpNE(B.CreateAnd(D.Flags, B.getInt32(0x80)),
+                                  B.getInt32(0));
+    Value *Target = B.CreateIntToPtr(loadReg(D.B), Ptr);
+    Value *FnArg = B.CreateSelect(
+        HasFn, Target, ConstantPointerNull::get(cast<PointerType>(Ptr)));
+    FunctionType *ThunkFT = FunctionType::get(I64, {Ptr, Ptr}, false);
+    CallInst *Call = B.CreateCall(ThunkFT, FnPtr, {ArgBase, FnArg});
     Call->setCallingConv(CallingConv::C);
     storeReg(B.getInt32(kRetReg), Call);
     B.CreateAlignedStore(B.CreateAdd(Pc, B.getInt32(1)), PcSlot, Align(4));
@@ -1964,9 +2416,14 @@ bool VMRuntimeBuilder::emitWrapper() {
   for (Argument &A : F.args()) {
     Value *V = &A;
     Value *S;
-    if (A.getType()->isPointerTy())
+    Type *AT = A.getType();
+    if (AT->isPointerTy())
       S = B.CreatePtrToInt(V, I64);
-    else if (A.getType()->getIntegerBitWidth() < 64)
+    else if (AT->isFloatTy())
+      S = B.CreateZExt(B.CreateBitCast(V, B.getInt32Ty()), I64);
+    else if (AT->isDoubleTy())
+      S = B.CreateBitCast(V, I64);
+    else if (AT->getIntegerBitWidth() < 64)
       S = B.CreateZExt(V, I64);
     else
       S = V;
@@ -1986,6 +2443,10 @@ bool VMRuntimeBuilder::emitWrapper() {
     B.CreateRetVoid();
   } else if (RT->isPointerTy()) {
     B.CreateRet(B.CreateIntToPtr(Call, RT));
+  } else if (RT->isFloatTy()) {
+    B.CreateRet(B.CreateBitCast(B.CreateTrunc(Call, B.getInt32Ty()), RT));
+  } else if (RT->isDoubleTy()) {
+    B.CreateRet(B.CreateBitCast(Call, RT));
   } else if (RT->getIntegerBitWidth() < 64) {
     B.CreateRet(B.CreateTrunc(Call, RT));
   } else {
@@ -2082,7 +2543,9 @@ bool llvm::virtualizeFunction(Function &F, const VirtualizeConfig &Cfg,
         "udiv", "sdiv", "urem", "srem", "and", "or", "xor", "shl", "lshr",
         "ashr", "eq", "ne", "ugt", "uge", "ult", "ule", "sgt", "sge", "slt",
         "sle", "select", "zext", "sext", "trunc", "ctpop", "ctlz", "cttz",
-        "bswap", "bitrev", "br", "cbr", "ret", "call", "trap"};
+        "bswap", "bitrev", "fadd", "fsub", "fmul", "fdiv", "frem", "fneg",
+        "fabs", "fsqrt", "fma", "fcmp", "fpext", "fptrunc", "fptosi",
+        "fptoui", "sitofp", "uitofp", "br", "cbr", "ret", "call", "trap"};
     errs() << "[dump] " << F.getName() << " key=" << T.Program.Key
            << " args=" << T.Program.ArgCount << "\n";
     for (unsigned I = 0; I < T.Program.Code.size(); ++I) {

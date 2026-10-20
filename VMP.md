@@ -39,21 +39,27 @@ VMP 不在 `PipelineStart` 运行，而是挂在 `OptimizerLast`（`FullLtoLast`
 
 支持（函数整体可翻译时）：
 
-- `i1/i8/i16/i32/i64` 与指针（32/64 位）标量
+- `i1/i8/i16/i32/i64`、指针（32/64 位）与 `float/double` 标量
 - 整数算术、位运算、移位、`icmp` 全部谓词、`select`
-- `trunc/zext/sext/ptrtoint/inttoptr/bitcast`（同宽）
+- 浮点 `fadd/fsub/fmul/fdiv/frem`、`fneg`、全部 `fcmp` 谓词、`fabs/sqrt/fmuladd`
+- `trunc/zext/sext/ptrtoint/inttoptr/bitcast`（同宽）、
+  `fpext/fptrunc/fptosi/fptoui/sitofp/uitofp`
 - 结构化 `getelementptr`（常量与动态下标，含全局基址）
 - 标量 `load/store`（非 volatile、非 atomic）
 - 分支、`switch`、PHI、循环、递归、直接调用
+- **间接调用**（函数指针、虚表、`std::function`）与 **variadic 调用点**
+  （如 `printf`）：按调用点签名生成两参数 thunk（参数块 + 动态 callee）
+- 返回 `void` 的函数
 - 入口块静态 `alloca`（局部数组/结构体，放在 wrapper 的 VM frame 中）
 - `llvm.memcpy/memmove/memset`（转 native thunk）
-- `llvm.ctpop/ctlz/cttz/bswap/bitreverse`
+- `llvm.ctpop/ctlz/cttz/bswap/bitreverse`、`llvm.smax/smin/umax/umin`、
+  `llvm.abs`、`llvm.trap`、`llvm.expect`
 - `llvm.lifetime.*`、`llvm.assume`、`llvm.dbg.*`、`llvm.prefetch`（丢弃）
 
 安全跳过（函数保持原样，不做部分虚拟化）：
 
-- 浮点/向量/聚合值、非 1/8/16/32/64 位整数（如循环优化产生的 `i33`）
-- 可变参数、间接调用、内联汇编、`musttail`
+- 向量/聚合值、`half`/`fp128`、非 1/8/16/32/64 位整数（如循环优化产生的 `i33`）
+- **函数本身**是 variadic（`int f(int, ...)`）、内联汇编、`musttail`
 - 异常处理（`invoke`/`landingpad`/`resume`）、`returns_twice`、`naked`
 - volatile/atomic 访存、动态 `alloca`、非入口块 `alloca`
 - `blockaddress`（与 INDBR 同函数时自动让路）
@@ -83,8 +89,11 @@ VMP 不在 `PipelineStart` 运行，而是挂在 `OptimizerLast`（`FullLtoLast`
 - **加密**：以 `(key + pc * 黄金比例常数)` 派生的 LCG 流对三个字做 XOR；解释器用
   `volatile` 读取代码字，优化器无法把密文折叠回明文。密钥每个函数不同。
 - **解释器**：每个被保护函数生成一个独立解释器（随机符号名、`noinline`），避免
-  整个 binary 共用同一个可识别的 dispatcher。调用外部函数通过每模块生成的
-  native thunk（按真实签名装载参数）完成，ABI 正确。
+  整个 binary 共用同一个可识别的 dispatcher。调用通过每次调用点签名对应的
+  native thunk 完成：thunk 形如 `i64 (ptr args, ptr fn)`，按调用点具体类型装载
+  参数，直接调用时 `fn` 为 null、间接调用时由寄存器传入目标指针。
+- **生成物标记**：解释器与 thunk 都带 `oboro.vmp.generated` 属性，任何驱动都不会
+  再虚拟化它们；管理器另有一层函数工作列表快照和“成功次数 ≤ 原函数数”的预算。
 - **边界检查**：PC 越界或未知 opcode 走 `llvm.trap()`，不会越界执行。
 - **常量**：整数常量放在常量池，指针常量放在指针池（保留重定位），常量在函数
   prologue 统一物化，避免条件分支里的 use 未定义。
@@ -102,11 +111,21 @@ VMP 不是密码学保护：密钥、加密字节码和解释器都在最终二�
 
 ## 5. 体积与性能
 
-以一个 ~200 条 IR 指令的函数为例：
+实测（x86_64，300 个各约 20 条 IR 指令的小函数，每个都是独立解释器）：
 
-- 代码段约 2–4 KiB 字节码 + 6–10 KiB 解释器（IR 生成后由后端展开）；
+| 指标 | 数值 |
+| --- | --- |
+| IR 体积 | 245 KB → 23.7 MB（约 97×） |
+| 二进制体积 | 181 KB → 4.26 MB（约 23×） |
+| `opt` 处理时间 | 0.37 s |
+
+单函数约 7 KiB 机器码的解释器开销。因此：
+
 - 运行开销主要来自每条指令的取指/解密/switch 分派，通常比原函数慢一个数量级；
-- 建议只对鉴权、密钥派生、协议校验等敏感函数开启，不要对热循环/音视频路径开启。
+- **必须按函数选择**：用 config `patterns`、源码注解或 `vmp` 红黄区把范围收敛到
+  鉴权、密钥派生、协议校验等敏感函数；不要对整包或热循环开启；
+- 需要对大量函数开启时，优先考虑后续的“模块级共享 runtime + 每函数描述符”模式
+  （体积可降一个数量级，代价是解释器成为单点特征）。
 
 ## 6. 与其它 pass 的组合
 
@@ -124,6 +143,10 @@ VMP 不是密码学保护：密钥、加密字节码和解释器都在最终二�
 - `-O0` 与 `-O2` 输入
 - 整数宽度、符号/无符号除余、移位、比较、结构体/GEP、全局、switch、嵌套循环、
   递归、直接调用、memcpy/memset、位运算 intrinsic
-- 50 轮随机函数差分（每轮 8 个函数、120 组输入）
+- 浮点算术/比较/转换、间接调用（函数指针表、C++ 虚函数、`std::function`）、
+  variadic 调用点、`void` 函数、C++ 模板/STL 子集
+- 300 函数规模用例（924 个 define，语义一致）
+- 5 个用例 × level 1/2 × 3 次随机种子 = 30 组差分，全部通过
+- 25 轮随机函数差分（每轮 8 个函数、120 组输入）
 
 `llvm/test/Transforms/Obfuscation/vmp-*.ll` 提供 IR 级回归（需要重新构建 opt）。
