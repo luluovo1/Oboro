@@ -150,6 +150,22 @@ static uint64_t splitmix64(uint64_t &State) {
   return Z ^ (Z >> 31);
 }
 
+// The keystream parameters are derived from the per-function key so the
+// binary never contains a recognisable LCG constant.
+static uint64_t streamStride(uint64_t Key) {
+  uint64_t S = Key ^ 0x243F6A8885A308D3ULL;
+  return splitmix64(S) | 1;
+}
+static uint64_t streamMul(uint64_t Key) {
+  uint64_t S = Key ^ 0x13198A2E03707344ULL;
+  return splitmix64(S) | 1;
+}
+static uint64_t streamInc(uint64_t Key) {
+  uint64_t S = Key ^ 0xA4093822299F31D0ULL;
+  return splitmix64(S);
+}
+
+
 struct VInst {
   uint8_t Op = 0;
   uint8_t W = 0;
@@ -1662,11 +1678,11 @@ bool VMRuntimeBuilder::createGlobals() {
     uint32_t W2 = V.Imm;
     // The stream is indexed by PC, not by execution order: a branch must not
     // desynchronise the decoder.
-    uint64_t K = P.Key + (uint64_t)I * 0x9E3779B97F4A7C15ULL;
+    uint64_t K = P.Key + (uint64_t)I * streamStride(P.Key);
     for (uint32_t W : {W0, W1, W2}) {
       uint32_t KS = (uint32_t)(K >> 32);
       Words.push_back(W ^ KS);
-      K = K * 6364136223846793005ULL + 1442695040888963407ULL;
+      K = K * streamMul(P.Key) + streamInc(P.Key);
     }
   }
   ArrayType *CodeTy = ArrayType::get(I32, Words.size());
@@ -1762,7 +1778,10 @@ Function *VMRuntimeBuilder::createInterpreter() {
   Type *I64 = B.getInt64Ty();
   IntegerType *I32 = B.getInt32Ty();
   Type *Ptr = B.getPtrTy();
-  Type *RegArrayTy = ArrayType::get(I64, 256);
+  // Randomised slot count: the register file is still indexed by an 8-bit
+  // operand, but the array no longer has a constant, recognisable size.
+  unsigned RegSlots = 256 + (unsigned)((P.Key >> 8) & 0x7f);
+  Type *RegArrayTy = ArrayType::get(I64, RegSlots);
 
   FunctionType *FT = FunctionType::get(I64, {Ptr, Ptr}, false);
   Function *Fn = Function::Create(FT, GlobalValue::InternalLinkage,
@@ -1816,13 +1835,12 @@ Function *VMRuntimeBuilder::createInterpreter() {
 
   Value *Ks = B.CreateAdd(
       B.getInt64(P.Key),
-      B.CreateMul(B.CreateZExt(Pc, I64),
-                  B.getInt64(0x9E3779B97F4A7C15ULL)));
+      B.CreateMul(B.CreateZExt(Pc, I64), B.getInt64(streamStride(P.Key))));
   auto Decode = [&](Value *E) {
     Value *K32 = B.CreateTrunc(B.CreateLShr(Ks, B.getInt64(32)), I32);
     Value *D = B.CreateXor(E, K32);
-    Ks = B.CreateAdd(B.CreateMul(Ks, B.getInt64(6364136223846793005ULL)),
-                     B.getInt64(1442695040888963407ULL));
+    Ks = B.CreateAdd(B.CreateMul(Ks, B.getInt64(streamMul(P.Key))),
+                     B.getInt64(streamInc(P.Key)));
     return D;
   };
   Value *D0 = Decode(E0);
