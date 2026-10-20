@@ -9,6 +9,7 @@
 
 #include "llvm/Transforms/Obfuscation/Virtualize.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
@@ -29,11 +30,27 @@ static uint64_t hashSeed(StringRef S) {
 struct VirtualizeLegacy : public FunctionPass {
   static char ID;
   ObfuscationOptions *Options;
+  size_t Budget = 0; // functions that existed before this pass started
+  size_t Done = 0;
 
   explicit VirtualizeLegacy(ObfuscationOptions *O)
       : FunctionPass(ID), Options(O) {}
 
+  bool doInitialization(Module &M) override {
+    // Every virtualisation replaces one function and adds runtime helpers.
+    // Counting against the original population makes a runaway impossible
+    // even if some future pass forgets to tag what it emits.
+    Budget = M.size();
+    Done = 0;
+    return false;
+  }
+
   bool runOnFunction(Function &F) override {
+    if (F.hasFnAttribute("oboro.vmp.generated"))
+      return false;
+    if (Done >= Budget)
+      return false;
+
     ObfOpt Opt = Options->toObfuscate(Options->vmpOpt(), &F);
     if (!Opt.isEnabled())
       return false;
@@ -50,6 +67,7 @@ struct VirtualizeLegacy : public FunctionPass {
                         << "\n");
       return false;
     }
+    ++Done;
     return true;
   }
 };

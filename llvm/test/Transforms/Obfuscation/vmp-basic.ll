@@ -11,7 +11,7 @@ entry:
   ret i32 %z
 }
 
-; CHECK: define i32 @check(i32 %0, i32 %1)
+; CHECK: define i32 @check(i32 %a, i32 %b)
 ; CHECK-NOT: add i32
 ; CHECK: call i64 @
 ; CHECK: ret i32

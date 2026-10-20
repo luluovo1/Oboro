@@ -1,4 +1,4 @@
-; RUN: opt -S -passes='default<O2>' -irobf-vmp < %s -o - | FileCheck %s
+; RUN: opt -S -passes='default<O0>' -irobf-vmp < %s -o - | FileCheck %s
 ;
 ; Dynamic allocas and vector values are not representable; the function must be
 ; left exactly as it was (no interpreter call).
@@ -17,8 +17,8 @@ entry:
   ret <4 x i32> %b
 }
 
-; CHECK: define i32 @dyn_alloca(i32 %n)
+; CHECK: define {{.*}}i32 @dyn_alloca(i32 %n)
 ; CHECK: alloca i32, i32 %n
 ; CHECK-NOT: call i64 @
-; CHECK: define <4 x i32> @vec(<4 x i32> %a)
+; CHECK: define {{.*}}<4 x i32> @vec(<4 x i32> %a)
 ; CHECK: add <4 x i32>

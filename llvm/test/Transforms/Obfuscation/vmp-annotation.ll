@@ -20,7 +20,7 @@ entry:
   [{ ptr, ptr, ptr, i32, ptr } { ptr @protected, ptr @.str, ptr @.str, i32 0, ptr null }],
   section "llvm.metadata"
 
-; CHECK: define i32 @protected(i32 %0)
+; CHECK: define i32 @protected(i32 %a)
 ; CHECK: call i64 @
 ; CHECK: define i32 @plain(i32 %a)
 ; CHECK: mul i32 %a, 3

@@ -168,8 +168,16 @@ struct ObfuscationPassManager : public ModulePass {
   bool runFunctionPass(Module &M, FunctionPass *P) {
     bool Changed = false;
     Changed |= P->doInitialization(M);
-    for (Function &F : M) {
-      Changed |= P->runOnFunction(F);
+    // Snapshot the worklist.  A function pass may append functions to the
+    // module (VMP emits an interpreter and one thunk per callee); iterating
+    // the live ilist would then visit those fresh functions and virtualise
+    // them in turn, which grows the module without bound.
+    SmallVector<Function *, 64> Work;
+    Work.reserve(M.size());
+    for (Function &F : M)
+      Work.push_back(&F);
+    for (Function *F : Work) {
+      Changed |= P->runOnFunction(*F);
     }
     return Changed;
   }
