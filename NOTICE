@@ -1,0 +1,34 @@
+Third-party notices
+===================
+
+amice
+-----
+https://github.com/fuqiuluo/amice
+Copyright the amice contributors
+Licensed under the Apache License, Version 2.0.
+
+Oboro's IR virtualizer (llvm/lib/Transforms/Obfuscation/Virtualize.cpp)
+reimplements three mechanisms whose design comes from amice.  No Rust source
+was copied; the code is an independent C++ implementation operating on LLVM IR
+and LLVM bytecode structures.
+
+  * Block-local virtual-register reuse, including the "pin PHIs and values
+    used outside their defining block, recycle only same-block temporaries"
+    rule.  Derived from crates/amice/src/aotu/vm_virtualize/translator.rs
+    (build_reuse_plan, alloc_vreg_or_spill).
+
+  * Opcode aliasing: one semantic may be encoded by several byte values, with
+    the value chosen deterministically from the function key and the
+    instruction position.  Derived from crates/amice-vm/src/isa.rs
+    (opcode alias selection).
+
+  * Compare-and-branch superinstruction, which folds a comparison into the
+    branch that consumes it.  Derived from crates/amice-vm/src/lowering.rs
+    (fuse_icmp_br_if).  Oboro decides fusion from IR use-def information
+    instead of scanning bytecode.
+
+Files carrying derived work state the origin in their header and next to the
+relevant code.
+
+No other amice source, profile data, ISA description or runtime asset is
+included in this repository.

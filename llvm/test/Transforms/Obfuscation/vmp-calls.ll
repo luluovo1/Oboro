@@ -17,5 +17,10 @@ entry:
   ret i32 %s
 }
 
-; CHECK-COUNT-5: define
+; CHECK: define i32 @callee
+; CHECK: define i32 @caller
 ; CHECK: call i64 @
+; CHECK: define internal i64 @
+; CHECK: define internal i64 @
+; CHECK: define internal i64 @
+; CHECK-NOT: define

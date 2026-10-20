@@ -1,17 +1,28 @@
 //===- Virtualize.cpp - IR-level code virtualization ----------------------===//
 //
-// The VM is a 64-bit register machine.  Every SSA value that survives
-// translation owns one virtual register; registers hold the zero-extended bit
-// pattern of the value.  Signed operations sign-extend at use time and
-// truncate the result back, so two's-complement semantics match the source.
+// The VM is a 64-bit register machine.  Registers hold the zero-extended bit
+// pattern of the value; signed operations sign-extend at use time and truncate
+// the result back, so two's-complement semantics match the source.  A value
+// owns a register only for its live range: values defined and consumed inside
+// one block are recycled, everything else (PHIs, cross-block values) is pinned.
 //
 // Bytecode is a sequence of fixed 12-byte records (three i32 words).  Every
-// word is XOR-encrypted with a rolling LCG stream keyed by a per-function
-// constant.  The interpreter loads code words with `volatile`, so the
-// optimizer cannot fold the encrypted program back into the original code.
+// word is XOR-encrypted with a rolling stream whose parameters are derived from
+// the per-function key.  The interpreter loads code words with `volatile`, so
+// the optimizer cannot fold the encrypted program back into the original code.
 //
 // The interpreter is emitted per function: every virtualized function gets its
-// own handler order, opcode permutation and global names.
+// own handler order, opcode aliases and global names.
+//
+// Attribution: three mechanisms follow the design of amice (Apache-2.0,
+// https://github.com/fuqiuluo/amice), adapted to LLVM IR and reimplemented in
+// C++ -- no Rust source was copied:
+//   * block-local register reuse -- amice
+//     crates/amice/src/aotu/vm_virtualize/translator.rs (build_reuse_plan)
+//   * opcode aliasing -- amice crates/amice-vm/src/isa.rs (alias selection)
+//   * compare+branch superinstruction -- amice crates/amice-vm/src/lowering.rs
+//     (fuse_icmp_br_if)
+// See NOTICE in the repository root.
 //
 //===----------------------------------------------------------------------===//
 
@@ -41,6 +52,7 @@ constexpr const char *kGeneratedAttr = "oboro.vmp.generated";
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <random>
@@ -110,6 +122,20 @@ enum VMOp : uint8_t {
   OP_FPTOUI,
   OP_SITOFP,
   OP_UITOFP,
+  // icmp+br superinstructions: the compare result never reaches the register
+  // file, so one dispatch replaces two.  Same idea as amice's IcmpBrIf
+  // (crates/amice-vm/src/lowering.rs, Apache-2.0), implemented on IR use-def
+  // instead of bytecode so the "single use" test stays exact.
+  OP_ICMP_EQ_CBR,
+  OP_ICMP_NE_CBR,
+  OP_ICMP_UGT_CBR,
+  OP_ICMP_UGE_CBR,
+  OP_ICMP_ULT_CBR,
+  OP_ICMP_ULE_CBR,
+  OP_ICMP_SGT_CBR,
+  OP_ICMP_SGE_CBR,
+  OP_ICMP_SLT_CBR,
+  OP_ICMP_SLE_CBR,
   OP_BR,
   OP_CBR,
   OP_RET,
@@ -192,7 +218,12 @@ struct VMProgram {
   std::vector<Constant *> Ptrs;
   std::vector<VMThunk> Thunks;
   uint32_t EntryPC = 0;
+  // Opcode aliasing, modelled on amice's `opcode_alias_selection_uses_
+  // function_key` (crates/amice-vm/src/isa.rs, Apache-2.0): one semantic can be
+  // encoded by several byte values, chosen per instruction from the function
+  // key so the same opcode never maps to a single stable constant.
   uint8_t OpMap[OP_COUNT] = {};
+  std::array<std::vector<uint8_t>, OP_COUNT> Aliases;
   uint64_t Key = 0;
   unsigned Level = 1;
   unsigned ArgCount = 0;
@@ -322,6 +353,26 @@ private:
   unsigned Level;
 
   DenseMap<Value *, uint8_t> Regs;
+  // Register reuse, modelled on amice's block-local reuse plan
+  // (crates/amice/src/aotu/vm_virtualize/translator.rs, Apache-2.0).
+  // A value may only be recycled when it is defined and consumed inside the
+  // same basic block and is not a PHI: anything that can be read on a path the
+  // linear scan does not describe stays pinned.
+  DenseMap<Value *, BasicBlock *> DefBlock;
+  DenseSet<Value *> PinnedSet;
+  DenseMap<BasicBlock *, DenseMap<Value *, unsigned>> LastUse;
+  SmallVector<uint8_t, 8> FreeRegs;
+  // Set when an icmp has exactly one user, a conditional branch in the same
+  // block.  The compare is then emitted by the terminator as one fused opcode.
+  // The deferred compare must survive until the terminator consumes it, so it
+  // is only cleared when a block starts (and when the branch is emitted).
+  ICmpInst *DeferredCmp = nullptr;
+  // True only for the instruction that was just deferred; lets the driver tell
+  // "this instruction produced nothing" from "this instruction is normal".
+  bool JustDeferred = false;
+  // Operands of a deferred icmp are consumed by the terminator, not by the
+  // icmp itself, so their release is postponed until the block ends.
+  SmallVector<Value *, 4> DeferredOps;
   DenseSet<Constant *> ConstSeen;
   std::vector<Constant *> ConstOrder;
   DenseMap<BasicBlock *, uint32_t> BlockPC;
@@ -344,6 +395,8 @@ private:
   uint64_t nextRand() { return splitmix64(RngState); }
 
   uint8_t allocReg() {
+    if (!FreeRegs.empty())
+      return FreeRegs.pop_back_val();
     if (NextReg > kMaxRegs) {
       fail("too many SSA values (register file exhausted)");
       return 0;
@@ -353,6 +406,10 @@ private:
 
   uint8_t regOf(Value *V);
   bool materialize(Value *V, uint8_t Dst, Type *Ty);
+  bool cmpJumpsTo(ICmpInst &CI, uint8_t &Op, uint8_t &W, uint8_t &A, uint8_t &B);
+  void buildReuseInfo();
+  void releaseDeadOperands(Instruction &I, unsigned Idx);
+  void releaseValue(Value *V);
   void collectConstant(Value *V);
 
   void emit(uint8_t Op, uint8_t W, uint8_t A = 0, uint8_t B = 0,
@@ -454,6 +511,104 @@ private:
     return (unsigned)Program.Thunks.size() - 1;
   }
 };
+
+// Resolve the operands of an icmp that is fused into its branch.  Signed
+// relational predicates on pointers become their unsigned form because a
+// register holds ptrtoint, exactly like the non-fused path.
+bool VMTranslator::cmpJumpsTo(ICmpInst &CI, uint8_t &Op, uint8_t &W, uint8_t &A,
+                              uint8_t &B) {
+  Type *OT = CI.getOperand(0)->getType();
+  if (!storageWidthCode(OT, DL, W))
+    return fail("icmp width");
+  bool IsPtr = OT->isPointerTy();
+  switch (CI.getPredicate()) {
+  case CmpInst::ICMP_EQ:  Op = OP_ICMP_EQ_CBR; break;
+  case CmpInst::ICMP_NE:  Op = OP_ICMP_NE_CBR; break;
+  case CmpInst::ICMP_UGT: Op = OP_ICMP_UGT_CBR; break;
+  case CmpInst::ICMP_UGE: Op = OP_ICMP_UGE_CBR; break;
+  case CmpInst::ICMP_ULT: Op = OP_ICMP_ULT_CBR; break;
+  case CmpInst::ICMP_ULE: Op = OP_ICMP_ULE_CBR; break;
+  case CmpInst::ICMP_SGT: Op = IsPtr ? OP_ICMP_UGT_CBR : OP_ICMP_SGT_CBR; break;
+  case CmpInst::ICMP_SGE: Op = IsPtr ? OP_ICMP_UGE_CBR : OP_ICMP_SGE_CBR; break;
+  case CmpInst::ICMP_SLT: Op = IsPtr ? OP_ICMP_ULT_CBR : OP_ICMP_SLT_CBR; break;
+  case CmpInst::ICMP_SLE: Op = IsPtr ? OP_ICMP_ULE_CBR : OP_ICMP_SLE_CBR; break;
+  default:
+    return fail("unsupported icmp predicate for fusion");
+  }
+  A = regOf(CI.getOperand(0));
+  B = regOf(CI.getOperand(1));
+  return !Failed;
+}
+
+// Build the block-local liveness table.  The rule is deliberately
+// conservative: only values defined and used in one block are eligible, so a
+// register can never be recycled while a path might still read it.  PHIs and
+// cross-block values stay pinned for the whole function.
+void VMTranslator::buildReuseInfo() {
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (!I.getType()->isVoidTy())
+        DefBlock[&I] = &BB;
+      if (isa<PHINode>(I))
+        PinnedSet.insert(&I);
+    }
+  }
+
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      bool IsPhi = isa<PHINode>(I);
+      for (Value *Op : I.operands()) {
+        if (isa<Constant>(Op))
+          continue;
+        auto It = DefBlock.find(Op);
+        if (It == DefBlock.end() || It->second != &BB || IsPhi)
+          PinnedSet.insert(Op);
+      }
+    }
+  }
+
+  for (BasicBlock &BB : F) {
+    auto &LU = LastUse[&BB];
+    unsigned Idx = 0;
+    for (Instruction &I : BB) {
+      for (Value *Op : I.operands()) {
+        if (isa<Constant>(Op) || PinnedSet.count(Op))
+          continue;
+        auto It = DefBlock.find(Op);
+        if (It == DefBlock.end() || It->second != &BB)
+          continue;
+        LU[Op] = Idx;
+      }
+      ++Idx;
+    }
+  }
+}
+
+void VMTranslator::releaseValue(Value *V) {
+  auto R = Regs.find(V);
+  if (R == Regs.end())
+    return;
+  FreeRegs.push_back(R->second);
+  Regs.erase(R);
+}
+
+void VMTranslator::releaseDeadOperands(Instruction &I, unsigned Idx) {
+  BasicBlock *BB = I.getParent();
+  auto It = LastUse.find(BB);
+  if (It == LastUse.end())
+    return;
+  for (Value *Op : I.operands()) {
+    auto J = It->second.find(Op);
+    if (J == It->second.end() || J->second != Idx)
+      continue;
+    auto R = Regs.find(Op);
+    if (R == Regs.end())
+      continue;
+    FreeRegs.push_back(R->second);
+    Regs.erase(R);
+    It->second.erase(J);
+  }
+}
 
 void VMTranslator::collectConstant(Value *V) {
   auto *C = dyn_cast<Constant>(V);
@@ -859,19 +1014,50 @@ bool VMTranslator::translateTerminator(Instruction &I) {
     }
     BasicBlock *T = BI->getSuccessor(0);
     BasicBlock *F = BI->getSuccessor(1);
-    uint8_t Cond = regOf(BI->getCondition());
-    if (Failed)
-      return false;
+
+    // Fused layout is identical to CBR: true jumps to the first successor,
+    // false falls through to the BR that follows.
+    uint8_t FOp = 0, FW = 0, FA = 0, FB = 0;
+    bool Fused = false;
+    if (auto *CI = dyn_cast<ICmpInst>(BI->getCondition())) {
+      if (DeferredCmp == CI) {
+        DeferredCmp = nullptr;
+        Fused = cmpJumpsTo(*CI, FOp, FW, FA, FB);
+        if (!Fused)
+          return false;
+      }
+    }
+
+    uint8_t Cond = 0;
+    if (!Fused) {
+      Cond = regOf(BI->getCondition());
+      if (Failed)
+        return false;
+    }
+
+    auto EmitCond = [&](uint32_t Pc, BasicBlock *Target) {
+      if (Fused) {
+        if (Target)
+          emitFixup(FOp, FW, FA, FB, 0, 0, Target);
+        else
+          emit(FOp, FW, FA, FB, 0, 0, Pc);
+      } else {
+        if (Target)
+          emitFixup(OP_CBR, 0, Cond, 0, 0, 0, Target);
+        else
+          emit(OP_CBR, 0, Cond, 0, 0, 0, Pc);
+      }
+    };
 
     bool TPhi = hasPhi(T), FPhi = hasPhi(F);
     if (!TPhi && !FPhi) {
-      emitFixup(OP_CBR, 0, Cond, 0, 0, 0, T);
+      EmitCond(0, T);
       emitFixup(OP_BR, 0, 0, 0, 0, 0, F);
       return true;
     }
 
     uint32_t TrueStub = (uint32_t)Program.Code.size() + 2;
-    emit(OP_CBR, 0, Cond, 0, 0, 0, TrueStub);
+    EmitCond(TrueStub, nullptr);
     uint32_t FalseBrIdx = (uint32_t)Program.Code.size();
     emit(OP_BR, 0, 0, 0, 0, 0, 0);
     if (!phiCopiesFor(BB, T))
@@ -909,6 +1095,20 @@ bool VMTranslator::translateTerminator(Instruction &I) {
 bool VMTranslator::translateInst(Instruction &I) {
   if (isa<PHINode>(I))
     return true;
+
+  // Defer an icmp that feeds a conditional branch of this block; hasOneUse
+  // makes the decision exact -- nothing else can observe the compare result.
+  if (auto *CI = dyn_cast<ICmpInst>(&I)) {
+    if (!DeferredCmp && CI->hasOneUse()) {
+      User *U = *CI->user_begin();
+      if (auto *BI = dyn_cast<BranchInst>(U))
+        if (BI->isConditional() && BI->getParent() == CI->getParent()) {
+          DeferredCmp = CI;
+          JustDeferred = true;
+          return true;
+        }
+    }
+  }
   if (isa<DbgInfoIntrinsic>(I))
     return true;
 
@@ -1375,9 +1575,30 @@ bool VMTranslator::translateBlock(BasicBlock &BB) {
       Regs[&PN] = R;
     }
   }
-  for (Instruction &I : BB)
+  unsigned Idx = 0;
+  DeferredOps.clear();
+  DeferredCmp = nullptr;
+  for (Instruction &I : BB) {
+    JustDeferred = false;
     if (!translateInst(I))
       return false;
+    if (JustDeferred) {
+      // The compare is emitted by the terminator, which is the only place its
+      // operands are read.  Keeping them until then also keeps their registers
+      // out of the free list while the terminator still needs them.
+      for (Value *Op : I.operands())
+        if (!isa<Constant>(Op))
+          DeferredOps.push_back(Op);
+    } else {
+      releaseDeadOperands(I, Idx);
+    }
+    ++Idx;
+  }
+  // The terminator has run; now the deferred operands are genuinely dead.
+  for (Value *V : DeferredOps)
+    if (!PinnedSet.count(V))
+      releaseValue(V);
+  DeferredOps.clear();
   return true;
 }
 
@@ -1408,6 +1629,39 @@ bool VMTranslator::run() {
   }
   for (unsigned I = 0; I < OP_COUNT; ++I)
     Program.OpMap[I] = Perm[I];
+
+  // Level 2+: give every semantic between two and four encodings.  The pool is
+  // shared, so the 59 semantics still fit in one byte (worst case 236 values).
+  if (Level >= 2) {
+    std::vector<uint8_t> Pool(256);
+    for (unsigned I = 0; I < 256; ++I)
+      Pool[I] = (uint8_t)I;
+    for (unsigned I = 256; I > 1; --I) {
+      unsigned J = (unsigned)(nextRand() % I);
+      std::swap(Pool[I - 1], Pool[J]);
+    }
+    // Every semantic gets the same base number of encodings; the remainder is
+    // handed out in random order, so the total never exceeds one byte.
+    unsigned Base = 256 / OP_COUNT;
+    unsigned Extra = 256 % OP_COUNT;
+    std::vector<unsigned> Order(OP_COUNT);
+    for (unsigned I = 0; I < OP_COUNT; ++I)
+      Order[I] = I;
+    for (unsigned I = OP_COUNT; I > 1; --I) {
+      unsigned J = (unsigned)(nextRand() % I);
+      std::swap(Order[I - 1], Order[J]);
+    }
+    unsigned Cursor = 0;
+    for (unsigned K = 0; K < OP_COUNT; ++K) {
+      unsigned Op = Order[K];
+      unsigned N = Base + (K < Extra ? 1 : 0);
+      for (unsigned M = 0; M < N; ++M)
+        Program.Aliases[Op].push_back(Pool[Cursor++]);
+    }
+  } else {
+    for (unsigned Op = 0; Op < OP_COUNT; ++Op)
+      Program.Aliases[Op].push_back(Program.OpMap[Op]);
+  }
 
   std::vector<BasicBlock *> Order;
   DenseSet<BasicBlock *> Seen;
@@ -1509,6 +1763,7 @@ bool VMTranslator::run() {
     }
   }
   Program.FrameSize = FrameSize;
+  buildReuseInfo();
   Program.EntryPC = 0;
   for (BasicBlock *BB : Order) {
     BlockPC[BB] = (uint32_t)Program.Code.size();
@@ -1694,7 +1949,10 @@ bool VMRuntimeBuilder::createGlobals() {
   Words.reserve(P.Code.size() * 3);
   for (uint32_t I = 0; I < P.Code.size(); ++I) {
     const VInst &V = P.Code[I];
-    uint32_t W0 = (uint32_t)P.OpMap[V.Op] | ((uint32_t)V.W << 8) |
+    const std::vector<uint8_t> &Aliases = P.Aliases[V.Op];
+    uint32_t Fold = I * 2654435761u ^ (uint32_t)P.Key;
+    uint8_t EncOp = Aliases[Fold % Aliases.size()];
+    uint32_t W0 = (uint32_t)EncOp | ((uint32_t)V.W << 8) |
                   ((uint32_t)V.A << 16) | ((uint32_t)V.B << 24);
     uint32_t W1 = (uint32_t)V.C | ((uint32_t)V.Flags << 8);
     uint32_t W2 = V.Imm;
@@ -1800,6 +2058,18 @@ Function *VMRuntimeBuilder::createInterpreter() {
   Type *I64 = B.getInt64Ty();
   IntegerType *I32 = B.getInt32Ty();
   Type *Ptr = B.getPtrTy();
+
+  // Only emit handlers this program actually uses.  A function that never
+  // compares anything should not carry ten compare handlers, and one without
+  // floating point should not carry twenty FP handlers: on a per-function
+  // interpreter that is most of the size.  `Covered` lets the builder reject
+  // a program whose bytecode mentions an opcode it failed to emit, instead of
+  // silently trapping at run time.
+  DenseSet<uint8_t> Used;
+  for (const VInst &V : P.Code)
+    Used.insert(V.Op);
+  DenseSet<uint8_t> Covered;
+
   // Randomised slot count: the register file is still indexed by an 8-bit
   // operand, but the array no longer has a constant, recognisable size.
   unsigned RegSlots = 256 + (unsigned)((P.Key >> 8) & 0x7f);
@@ -1919,11 +2189,13 @@ Function *VMRuntimeBuilder::createInterpreter() {
   auto newBB = [&]() { return BasicBlock::Create(Ctx, "", Fn); };
 
   auto AddCase = [&](VMOp Op, BasicBlock *BB) {
-    Sw->addCase(ConstantInt::get(I32, P.OpMap[Op]), BB);
+    Covered.insert((uint8_t)Op);
+    for (uint8_t Alias : P.Aliases[Op])
+      Sw->addCase(ConstantInt::get(I32, Alias), BB);
   };
 
   // ---- OP_NOP -----------------------------------------------------------
-  {
+  if (Used.count(OP_NOP)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     B.CreateAlignedStore(B.CreateAdd(Pc, B.getInt32(1)), PcSlot, Align(4));
@@ -1932,7 +2204,7 @@ Function *VMRuntimeBuilder::createInterpreter() {
   }
 
   // ---- OP_MOV -----------------------------------------------------------
-  {
+  if (Used.count(OP_MOV)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     storeReg(D.A, zextTo(loadReg(D.B), D.W));
@@ -1942,7 +2214,7 @@ Function *VMRuntimeBuilder::createInterpreter() {
   }
 
   // ---- OP_IMM -----------------------------------------------------------
-  {
+  if (Used.count(OP_IMM)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     Value *Cp = B.CreateGEP(I64, IntGV, D.Imm);
@@ -1961,7 +2233,7 @@ Function *VMRuntimeBuilder::createInterpreter() {
   }
 
   // ---- OP_PTR -----------------------------------------------------------
-  {
+  if (Used.count(OP_PTR)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     Value *Pp = B.CreateGEP(Ptr, PtrGV, D.Imm);
@@ -1973,7 +2245,7 @@ Function *VMRuntimeBuilder::createInterpreter() {
   }
 
   // ---- OP_LOAD ----------------------------------------------------------
-  {
+  if (Used.count(OP_LOAD)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     Value *AddrBits = B.CreateAnd(loadReg(D.B), ptrMask());
@@ -2000,7 +2272,7 @@ Function *VMRuntimeBuilder::createInterpreter() {
   }
 
   // ---- OP_STORE ---------------------------------------------------------
-  {
+  if (Used.count(OP_STORE)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     Value *AddrBits = B.CreateAnd(loadReg(D.A), ptrMask());
@@ -2052,16 +2324,16 @@ Function *VMRuntimeBuilder::createInterpreter() {
     AddCase(Op, BB);
     (void)Div;
   };
-  emitBin(OP_ADD, false, false);
-  emitBin(OP_SUB, false, false);
-  emitBin(OP_MUL, false, false);
-  emitBin(OP_AND, false, false);
-  emitBin(OP_OR, false, false);
-  emitBin(OP_XOR, false, false);
-  emitBin(OP_UDIV, false, true);
-  emitBin(OP_SDIV, true, true);
-  emitBin(OP_UREM, false, true);
-  emitBin(OP_SREM, true, true);
+  if (Used.count(OP_ADD)) emitBin(OP_ADD, false, false);
+  if (Used.count(OP_SUB)) emitBin(OP_SUB, false, false);
+  if (Used.count(OP_MUL)) emitBin(OP_MUL, false, false);
+  if (Used.count(OP_AND)) emitBin(OP_AND, false, false);
+  if (Used.count(OP_OR)) emitBin(OP_OR, false, false);
+  if (Used.count(OP_XOR)) emitBin(OP_XOR, false, false);
+  if (Used.count(OP_UDIV)) emitBin(OP_UDIV, false, true);
+  if (Used.count(OP_SDIV)) emitBin(OP_SDIV, true, true);
+  if (Used.count(OP_UREM)) emitBin(OP_UREM, false, true);
+  if (Used.count(OP_SREM)) emitBin(OP_SREM, true, true);
 
   auto emitShift = [&](VMOp Op) {
     BasicBlock *BB = newBB();
@@ -2084,9 +2356,9 @@ Function *VMRuntimeBuilder::createInterpreter() {
     B.CreateBr(Loop);
     AddCase(Op, BB);
   };
-  emitShift(OP_SHL);
-  emitShift(OP_LSHR);
-  emitShift(OP_ASHR);
+  if (Used.count(OP_SHL)) emitShift(OP_SHL);
+  if (Used.count(OP_LSHR)) emitShift(OP_LSHR);
+  if (Used.count(OP_ASHR)) emitShift(OP_ASHR);
 
   auto emitCmp = [&](VMOp Op, CmpInst::Predicate Pred, bool Signed) {
     BasicBlock *BB = newBB();
@@ -2099,19 +2371,45 @@ Function *VMRuntimeBuilder::createInterpreter() {
     B.CreateBr(Loop);
     AddCase(Op, BB);
   };
-  emitCmp(OP_ICMP_EQ, CmpInst::ICMP_EQ, false);
-  emitCmp(OP_ICMP_NE, CmpInst::ICMP_NE, false);
-  emitCmp(OP_ICMP_UGT, CmpInst::ICMP_UGT, false);
-  emitCmp(OP_ICMP_UGE, CmpInst::ICMP_UGE, false);
-  emitCmp(OP_ICMP_ULT, CmpInst::ICMP_ULT, false);
-  emitCmp(OP_ICMP_ULE, CmpInst::ICMP_ULE, false);
-  emitCmp(OP_ICMP_SGT, CmpInst::ICMP_SGT, true);
-  emitCmp(OP_ICMP_SGE, CmpInst::ICMP_SGE, true);
-  emitCmp(OP_ICMP_SLT, CmpInst::ICMP_SLT, true);
-  emitCmp(OP_ICMP_SLE, CmpInst::ICMP_SLE, true);
+  if (Used.count(OP_ICMP_EQ)) emitCmp(OP_ICMP_EQ, CmpInst::ICMP_EQ, false);
+  if (Used.count(OP_ICMP_NE)) emitCmp(OP_ICMP_NE, CmpInst::ICMP_NE, false);
+  if (Used.count(OP_ICMP_UGT)) emitCmp(OP_ICMP_UGT, CmpInst::ICMP_UGT, false);
+  if (Used.count(OP_ICMP_UGE)) emitCmp(OP_ICMP_UGE, CmpInst::ICMP_UGE, false);
+  if (Used.count(OP_ICMP_ULT)) emitCmp(OP_ICMP_ULT, CmpInst::ICMP_ULT, false);
+  if (Used.count(OP_ICMP_ULE)) emitCmp(OP_ICMP_ULE, CmpInst::ICMP_ULE, false);
+  if (Used.count(OP_ICMP_SGT)) emitCmp(OP_ICMP_SGT, CmpInst::ICMP_SGT, true);
+  if (Used.count(OP_ICMP_SGE)) emitCmp(OP_ICMP_SGE, CmpInst::ICMP_SGE, true);
+  if (Used.count(OP_ICMP_SLT)) emitCmp(OP_ICMP_SLT, CmpInst::ICMP_SLT, true);
+  if (Used.count(OP_ICMP_SLE)) emitCmp(OP_ICMP_SLE, CmpInst::ICMP_SLE, true);
+
+  // Fused compare-and-branch: operands in A/B, width in W, true target in Imm.
+  // False simply advances the PC, so the following BR still owns the other
+  // edge and PHI copies keep working unchanged.
+  auto emitCmpBr = [&](VMOp Op, CmpInst::Predicate Pred, bool Signed) {
+    BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    Value *X = Signed ? sextTo(loadReg(D.A), D.W) : zextTo(loadReg(D.A), D.W);
+    Value *Y = Signed ? sextTo(loadReg(D.B), D.W) : zextTo(loadReg(D.B), D.W);
+    Value *Cmp = B.CreateICmp(Pred, X, Y);
+    Value *Next = B.CreateAdd(Pc, B.getInt32(1));
+    Value *Tgt = B.CreateSelect(Cmp, D.Imm, Next);
+    B.CreateAlignedStore(Tgt, PcSlot, Align(4));
+    B.CreateBr(Loop);
+    AddCase(Op, BB);
+  };
+  if (Used.count(OP_ICMP_EQ_CBR)) emitCmpBr(OP_ICMP_EQ_CBR, CmpInst::ICMP_EQ, false);
+  if (Used.count(OP_ICMP_NE_CBR)) emitCmpBr(OP_ICMP_NE_CBR, CmpInst::ICMP_NE, false);
+  if (Used.count(OP_ICMP_UGT_CBR)) emitCmpBr(OP_ICMP_UGT_CBR, CmpInst::ICMP_UGT, false);
+  if (Used.count(OP_ICMP_UGE_CBR)) emitCmpBr(OP_ICMP_UGE_CBR, CmpInst::ICMP_UGE, false);
+  if (Used.count(OP_ICMP_ULT_CBR)) emitCmpBr(OP_ICMP_ULT_CBR, CmpInst::ICMP_ULT, false);
+  if (Used.count(OP_ICMP_ULE_CBR)) emitCmpBr(OP_ICMP_ULE_CBR, CmpInst::ICMP_ULE, false);
+  if (Used.count(OP_ICMP_SGT_CBR)) emitCmpBr(OP_ICMP_SGT_CBR, CmpInst::ICMP_SGT, true);
+  if (Used.count(OP_ICMP_SGE_CBR)) emitCmpBr(OP_ICMP_SGE_CBR, CmpInst::ICMP_SGE, true);
+  if (Used.count(OP_ICMP_SLT_CBR)) emitCmpBr(OP_ICMP_SLT_CBR, CmpInst::ICMP_SLT, true);
+  if (Used.count(OP_ICMP_SLE_CBR)) emitCmpBr(OP_ICMP_SLE_CBR, CmpInst::ICMP_SLE, true);
 
   // ---- OP_SELECT --------------------------------------------------------
-  {
+  if (Used.count(OP_SELECT)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     Value *Cond = B.CreateAnd(loadReg(D.B), B.getInt64(1));
@@ -2140,9 +2438,9 @@ Function *VMRuntimeBuilder::createInterpreter() {
     B.CreateBr(Loop);
     AddCase(Op, BB);
   };
-  emitCast(OP_ZEXT);
-  emitCast(OP_SEXT);
-  emitCast(OP_TRUNC);
+  if (Used.count(OP_ZEXT)) emitCast(OP_ZEXT);
+  if (Used.count(OP_SEXT)) emitCast(OP_SEXT);
+  if (Used.count(OP_TRUNC)) emitCast(OP_TRUNC);
 
   auto emitBitIntrinsic = [&](VMOp Op) {
     BasicBlock *BB = newBB();
@@ -2175,11 +2473,11 @@ Function *VMRuntimeBuilder::createInterpreter() {
     B.CreateBr(Loop);
     AddCase(Op, BB);
   };
-  emitBitIntrinsic(OP_CTPOP);
-  emitBitIntrinsic(OP_CTLZ);
-  emitBitIntrinsic(OP_CTTZ);
-  emitBitIntrinsic(OP_BSWAP);
-  emitBitIntrinsic(OP_BITREVERSE);
+  if (Used.count(OP_CTPOP)) emitBitIntrinsic(OP_CTPOP);
+  if (Used.count(OP_CTLZ)) emitBitIntrinsic(OP_CTLZ);
+  if (Used.count(OP_CTTZ)) emitBitIntrinsic(OP_CTTZ);
+  if (Used.count(OP_BSWAP)) emitBitIntrinsic(OP_BSWAP);
+  if (Used.count(OP_BITREVERSE)) emitBitIntrinsic(OP_BITREVERSE);
 
   // ---- floating point ---------------------------------------------------
   auto fpTy = [&](unsigned Code) -> Type * {
@@ -2224,11 +2522,11 @@ Function *VMRuntimeBuilder::createInterpreter() {
     }
     AddCase(Op, BB);
   };
-  emitFPBin(OP_FADD);
-  emitFPBin(OP_FSUB);
-  emitFPBin(OP_FMUL);
-  emitFPBin(OP_FDIV);
-  emitFPBin(OP_FREM);
+  if (Used.count(OP_FADD)) emitFPBin(OP_FADD);
+  if (Used.count(OP_FSUB)) emitFPBin(OP_FSUB);
+  if (Used.count(OP_FMUL)) emitFPBin(OP_FMUL);
+  if (Used.count(OP_FDIV)) emitFPBin(OP_FDIV);
+  if (Used.count(OP_FREM)) emitFPBin(OP_FREM);
 
   auto emitFPUn = [&](VMOp Op) {
     BasicBlock *BB = newBB();
@@ -2253,9 +2551,9 @@ Function *VMRuntimeBuilder::createInterpreter() {
     }
     AddCase(Op, BB);
   };
-  emitFPUn(OP_FNEG);
-  emitFPUn(OP_FABS);
-  emitFPUn(OP_FSQRT);
+  if (Used.count(OP_FNEG)) emitFPUn(OP_FNEG);
+  if (Used.count(OP_FABS)) emitFPUn(OP_FABS);
+  if (Used.count(OP_FSQRT)) emitFPUn(OP_FSQRT);
 
   {
     BasicBlock *BB = newBB();
@@ -2347,8 +2645,8 @@ Function *VMRuntimeBuilder::createInterpreter() {
     }
     AddCase(Op, BB);
   };
-  emitFPToInt(OP_FPTOSI, true);
-  emitFPToInt(OP_FPTOUI, false);
+  if (Used.count(OP_FPTOSI)) emitFPToInt(OP_FPTOSI, true);
+  if (Used.count(OP_FPTOUI)) emitFPToInt(OP_FPTOUI, false);
 
   auto emitIntToFP = [&](VMOp Op, bool Signed) {
     BasicBlock *BB = newBB();
@@ -2367,11 +2665,11 @@ Function *VMRuntimeBuilder::createInterpreter() {
     }
     AddCase(Op, BB);
   };
-  emitIntToFP(OP_SITOFP, true);
-  emitIntToFP(OP_UITOFP, false);
+  if (Used.count(OP_SITOFP)) emitIntToFP(OP_SITOFP, true);
+  if (Used.count(OP_UITOFP)) emitIntToFP(OP_UITOFP, false);
 
   // ---- OP_BR ------------------------------------------------------------
-  {
+  if (Used.count(OP_BR)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     B.CreateAlignedStore(D.Imm, PcSlot, Align(4));
@@ -2380,7 +2678,7 @@ Function *VMRuntimeBuilder::createInterpreter() {
   }
 
   // ---- OP_CBR -----------------------------------------------------------
-  {
+  if (Used.count(OP_CBR)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     Value *Cond = B.CreateAnd(loadReg(D.A), B.getInt64(1));
@@ -2393,7 +2691,7 @@ Function *VMRuntimeBuilder::createInterpreter() {
   }
 
   // ---- OP_RET -----------------------------------------------------------
-  {
+  if (Used.count(OP_RET)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     Value *V = zextTo(loadReg(D.A), D.W);
@@ -2402,7 +2700,7 @@ Function *VMRuntimeBuilder::createInterpreter() {
   }
 
   // ---- OP_CALL ----------------------------------------------------------
-  {
+  if (Used.count(OP_CALL)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     Value *Pp = B.CreateGEP(Ptr, ThunkGV, D.Imm);
@@ -2424,7 +2722,7 @@ Function *VMRuntimeBuilder::createInterpreter() {
   }
 
   // ---- OP_TRAP ----------------------------------------------------------
-  {
+  if (Used.count(OP_TRAP)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     B.CreateBr(Trap);
@@ -2437,6 +2735,11 @@ Function *VMRuntimeBuilder::createInterpreter() {
   B.CreateCall(TrapFn);
   B.CreateUnreachable();
 
+  for (uint8_t Op : Used)
+    if (!Covered.count(Op)) {
+      Reason = "no handler for opcode " + std::to_string((unsigned)Op);
+      return nullptr;
+    }
   return Fn;
 }
 
@@ -2585,7 +2888,9 @@ bool llvm::virtualizeFunction(Function &F, const VirtualizeConfig &Cfg,
         "sle", "select", "zext", "sext", "trunc", "ctpop", "ctlz", "cttz",
         "bswap", "bitrev", "fadd", "fsub", "fmul", "fdiv", "frem", "fneg",
         "fabs", "fsqrt", "fma", "fcmp", "fpext", "fptrunc", "fptosi",
-        "fptoui", "sitofp", "uitofp", "br", "cbr", "ret", "call", "trap"};
+        "fptoui", "sitofp", "uitofp", "ieq_cbr", "ine_cbr", "iugt_cbr",
+        "iuge_cbr", "iult_cbr", "iule_cbr", "isgt_cbr", "isge_cbr",
+        "islt_cbr", "isle_cbr", "br", "cbr", "ret", "call", "trap"};
     errs() << "[dump] " << F.getName() << " key=" << T.Program.Key
            << " args=" << T.Program.ArgCount << "\n";
     for (unsigned I = 0; I < T.Program.Code.size(); ++I) {

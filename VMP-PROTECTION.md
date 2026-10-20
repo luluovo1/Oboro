@@ -15,14 +15,14 @@
 | 维度 | Oboro | amice |
 | --- | --- | --- |
 | 执行模型 | 寄存器 VM，每 SSA 值一个 64 位槽 | 寄存器 VM，`x0..x31` + `q0..q64` |
-| 寄存器分配 | 无复用，>235 个值直接跳过函数 | 块内复用 + 溢出到 VM 帧，预算不足才跳过 |
+| 寄存器分配 | 块内复用（PHI/跨块值固定），>236 槽位跳过 | 块内复用 + 溢出到 VM 帧，预算不足才跳过 |
 | runtime 粒度 | **每函数一个解释器** | **模块级共享 runtime + descriptor table** |
 | 解释器符号 | 随机名，无固定字符串 | 默认 `.amice.vm.dispatch`（`runtime.rs:128`） |
 | 字节码编码 | 固定 12 字节记录，3×i32 | profile 定义，支持 varint opcode |
 | 指令流保护 | 每函数密钥派生的 LCG 流 XOR，PC 索引，volatile 取指 | `decoder.vm` 流水线（`xor_stream key=function_key`、`varint_decode` 等），可配置 |
 | 常量池 | level 2 起 XOR 掩码 + volatile 读取 | `const_pool encryption`（`xor_stream`/`add_stream`，`profile.rs:2757`） |
-| opcode 随机化 | 每函数一次置换（1 opcode ↔ 1 语义） | **opcode alias 集合 + `(function_key, pc)` 选择**（`isa.rs:1889`） |
-| 超级指令 | 无 | 27 种模板（`iadd_xor`、`icmp_br_if`、`gep_load`、`load_iadd` …） |
+| opcode 随机化 | 每函数置换；level 2 起每语义 3–4 个 alias，按 `(key, pc)` 选 | **opcode alias 集合 + `(function_key, pc)` 选择**（`isa.rs:1889`） |
+| 超级指令 | `icmp_*_cbr`（比较结果不进寄存器） | 27 种模板（`iadd_xor`、`icmp_br_if`、`gep_load`、`load_iadd` …） |
 | 覆盖 | 标量整数/指针/float/double、间接与变参调用、void | 上述 + 固定向量、原子、volatile、饱和/溢出 intrinsic、half |
 | 反调试/完整性 | 无 | 无 |
 
@@ -30,12 +30,12 @@
 
 | 指标 | 数值 | 测量方式 |
 | --- | --- | --- |
-| 二进制体积 | 181 KB → 4.26 MB（**23×**） | 300 个 ~20 条 IR 指令的小函数 |
-| IR 体积 | 245 KB → 23.7 MB（97×） | 同上 |
+| 二进制体积 | 185 KB → 2.23 MB（**12×**） | 300 个 ~20 条 IR 指令的小函数 |
+| IR 体积 | 245 KB → 10.3 MB（42×） | 同上 |
 | 运行开销 | 48 ms → 312 ms（**6.5×**） | 20M 次迭代的整数循环，均以 `-O2` 编译 |
 | `opt` 时间 | 0.37 s / 300 函数 | 同上 |
 
-23× 体积是“每函数独立解释器”的直接代价；amice 的共享 runtime 通常能把这一项
+12× 体积仍是“每函数独立解释器”的代价；amice 的共享 runtime 通常能把这一项
 压到个位数倍率。6.5× 是解释器循环被后端优化后的结果，比朴素解释器好，但仍
 意味着**只能用于敏感函数**。
 
