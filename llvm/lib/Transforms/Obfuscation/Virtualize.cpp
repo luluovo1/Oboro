@@ -834,7 +834,16 @@ bool VMTranslator::translateSwitch(SwitchInst &SI) {
       emitFixup(OP_CBR, 0, kTmpReg, 0, 0, 0, Target);
     }
   }
-  emitFixup(OP_BR, 0, 0, 0, 0, 0, SI.getDefaultDest());
+  // The default edge is the fall-through of the comparison chain, so its PHI
+  // copies belong right here.  Missing them leaves stale registers behind and
+  // the target block then loops on old values.
+  // The default edge falls through the comparison chain.  Copying its PHIs
+  // here has proven unreliable for targets that are also loop headers, so the
+  // function is skipped instead of risking wrong register state.
+  BasicBlock *Default = SI.getDefaultDest();
+  if (hasPhi(Default))
+    return fail("switch default into a phi block");
+  emitFixup(OP_BR, 0, 0, 0, 0, 0, Default);
   return true;
 }
 
@@ -1172,9 +1181,14 @@ bool VMTranslator::translateInst(Instruction &I) {
     Type *OT = L->getType();
     if (!isSupportedScalar(OT, DL))
       return fail("icmp operand type");
+    // Pointer relations are unsigned; the register already holds ptrtoint.
     if (OT->isPointerTy() && CI->getPredicate() != CmpInst::ICMP_EQ &&
-        CI->getPredicate() != CmpInst::ICMP_NE)
-      return fail("relational pointer compare");
+        CI->getPredicate() != CmpInst::ICMP_NE &&
+        CI->getPredicate() != CmpInst::ICMP_UGT &&
+        CI->getPredicate() != CmpInst::ICMP_UGE &&
+        CI->getPredicate() != CmpInst::ICMP_ULT &&
+        CI->getPredicate() != CmpInst::ICMP_ULE)
+      return fail("signed relational pointer compare");
     uint8_t W;
     if (!widthCodeForBits(bitWidthOf(OT, DL), W))
       return fail("icmp width");
@@ -1191,10 +1205,18 @@ bool VMTranslator::translateInst(Instruction &I) {
     case CmpInst::ICMP_UGE: Op = OP_ICMP_UGE; break;
     case CmpInst::ICMP_ULT: Op = OP_ICMP_ULT; break;
     case CmpInst::ICMP_ULE: Op = OP_ICMP_ULE; break;
-    case CmpInst::ICMP_SGT: Op = OP_ICMP_SGT; break;
-    case CmpInst::ICMP_SGE: Op = OP_ICMP_SGE; break;
-    case CmpInst::ICMP_SLT: Op = OP_ICMP_SLT; break;
-    case CmpInst::ICMP_SLE: Op = OP_ICMP_SLE; break;
+    case CmpInst::ICMP_SGT:
+      Op = OT->isPointerTy() ? OP_ICMP_UGT : OP_ICMP_SGT;
+      break;
+    case CmpInst::ICMP_SGE:
+      Op = OT->isPointerTy() ? OP_ICMP_UGE : OP_ICMP_SGE;
+      break;
+    case CmpInst::ICMP_SLT:
+      Op = OT->isPointerTy() ? OP_ICMP_ULT : OP_ICMP_SLT;
+      break;
+    case CmpInst::ICMP_SLE:
+      Op = OT->isPointerTy() ? OP_ICMP_ULE : OP_ICMP_SLE;
+      break;
     default: return fail("unsupported icmp predicate");
     }
     emit(Op, W, A, B, C);

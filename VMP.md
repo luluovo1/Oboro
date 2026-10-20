@@ -63,6 +63,7 @@ VMP 不在 `PipelineStart` 运行，而是挂在 `OptimizerLast`（`FullLtoLast`
 - 异常处理（`invoke`/`landingpad`/`resume`）、`returns_twice`、`naked`
 - volatile/atomic 访存、动态 `alloca`、非入口块 `alloca`
 - `blockaddress`（与 INDBR 同函数时自动让路）
+- `switch` 的 **default 目标是 PHI 块**：保守跳过（见“已知限制”）
 - 超过 235 个 SSA 值、超过 16 个调用实参
 - 无法用 64 位槽精确表示的常量表达式
 
@@ -129,6 +130,16 @@ VMP 不是密码学保护：密钥、加密字节码和解释器都在最终二�
 - 需要对大量函数开启时，优先考虑后续的“模块级共享 runtime + 每函数描述符”模式
   （体积可降一个数量级，代价是解释器成为单点特征）。
 
+## 5.1 已知限制
+
+- `switch` 的 default 边如果落到带 PHI 的块，当前**整函数跳过**而不是冒险生成
+  错误的 PHI 拷贝。真实正则库里有 7/62 个函数命中这一条（主要是把 switch 当作
+  状态机跳转的解析器）。这是当前最大的覆盖率损失项，后续用显式的“边拆分块”
+  实现替代。
+- 235 个虚拟寄存器的上限没有做复用/溢出，超过就跳过；Release 代码里存在
+  少量超大函数会命中。
+- 固定向量、原子、volatile 访存仍整体跳过（见上）。
+
 ## 6. 与其它 pass 的组合
 
 - `bcf`/`fla` 在 `PipelineStart` 先跑，VMP 在末尾看到的是已经混淆过的 CFG；可以
@@ -148,6 +159,8 @@ VMP 不是密码学保护：密钥、加密字节码和解释器都在最终二�
 - 浮点算术/比较/转换、间接调用（函数指针表、C++ 虚函数、`std::function`）、
   variadic 调用点、`void` 函数、C++ 模板/STL 子集
 - 300 函数规模用例（924 个 define，语义一致）
+- 真实第三方代码：LLVM 自带 BSD regex 库（`regcomp/regexec/regfree`，2.1k 行 C），
+  O0/O1/O2 输入 × level 1/2 共 6 组，全部与基线逐字节一致
 - 5 个用例 × level 1/2 × 3 次随机种子 = 30 组差分，全部通过
 - 25 轮随机函数差分（每轮 8 个函数、120 组输入）
 
