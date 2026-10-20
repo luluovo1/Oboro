@@ -108,6 +108,31 @@ VMP 不在 `PipelineStart` 运行，而是挂在 `OptimizerLast`（`FullLtoLast`
 - **栈帧**：入口块静态 alloca 统一映射到 wrapper 的 frame；VM 寄存器区 2 KiB，
   每个 VM 调用额外占用 wrapper + 解释器两层栈帧。
 
+## 3.1 目标平台
+
+pass 只生成目标无关的 LLVM IR，ABI 由后端处理，因此同一份实现覆盖所有
+LLVM 支持的目标。已实测（同一份 `suite.c`，基线与虚拟化产物逐字节对比）：
+
+| 目标 | 工具链 | 结果 |
+| --- | --- | --- |
+| Windows x86-64（MSVC ABI） | clang 21 | 输出一致 |
+| Windows i686（MSVC ABI，含 `__stdcall` 间接调用） | clang 21 | 输出一致 |
+| Linux x86-64（glibc） | clang 21 / WSL Ubuntu | 输出一致 |
+| Android aarch64（bionic，NDK r30） | NDK clang | 真机输出一致 |
+| Android armv7（bionic，AAPCS） | NDK clang | 真机输出一致 |
+
+平台相关的处理只有三处，且都不分支：
+
+- 指针宽度从 `DataLayout` 读取（32/64 位），`ptrtoint` 掩码同步；
+- thunk 按**调用点**的 calling convention 发起调用，`__stdcall`/`__fastcall`
+  这种 callee 清栈的约定不会被改成 C；
+- 参数打包成 8 字节槽的参数块，解包时按真实类型截断/位转，不依赖寄存器传参规则。
+
+普通调用约定（`__stdcall`/`__fastcall`/AAPCS/AAPCS-VFP）不影响保护。函数签名或
+调用点带 `byval`、`sret`、`inalloca`、`preallocated`、`swiftself`、
+`swifterror`、`nest` 属性时整函数跳过——这些属性会把结构体布局或隐藏参数
+带进 ABI，超出标量 VM 的表达范围。
+
 ## 4. 安全边界
 
 VMP 不是密码学保护：密钥、加密字节码和解释器都在最终二进制里，有能力的攻击者

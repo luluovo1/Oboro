@@ -210,6 +210,9 @@ struct VMThunk {
   FunctionType *SiteFT = nullptr;
   SmallVector<Type *, 8> ArgTys;
   Type *RetTy = nullptr;
+  // Kept so an indirect call through __stdcall / __fastcall / a target
+  // specific convention keeps working: the thunk used to issue a plain C call.
+  CallingConv::ID CC = CallingConv::C;
 };
 
 struct VMProgram {
@@ -456,13 +459,14 @@ private:
     Function *Direct = CI.getCalledFunction();
     FunctionType *SiteFT = CI.getFunctionType();
     Type *RetTy = CI.getType();
+    CallingConv::ID CC = CI.getCallingConv();
     SmallVector<Type *, 8> ArgTys;
     for (Value *A : CI.args())
       ArgTys.push_back(A->getType());
 
     for (unsigned I = 0; I < Program.Thunks.size(); ++I) {
       const VMThunk &T = Program.Thunks[I];
-      if (T.Direct != Direct || T.RetTy != RetTy ||
+      if (T.Direct != Direct || T.RetTy != RetTy || T.CC != CC ||
           T.ArgTys.size() != ArgTys.size())
         continue;
       if (!Direct && T.SiteFT != SiteFT)
@@ -481,6 +485,7 @@ private:
     T.Direct = Direct;
     T.SiteFT = SiteFT;
     T.RetTy = RetTy;
+    T.CC = CC;
     T.ArgTys.assign(ArgTys.begin(), ArgTys.end());
     Program.Thunks.push_back(T);
     return (unsigned)Program.Thunks.size() - 1;
@@ -1914,11 +1919,11 @@ bool VMRuntimeBuilder::createThunks() {
     CallInst *Call;
     if (D.Direct) {
       Call = B.CreateCall(D.Direct, CallArgs);
-      Call->setCallingConv(D.Direct->getCallingConv());
+      Call->setCallingConv(D.CC);
       Call->setAttributes(D.Direct->getAttributes());
     } else {
       Call = B.CreateCall(D.SiteFT, T->getArg(1), CallArgs);
-      Call->setCallingConv(CallingConv::C);
+      Call->setCallingConv(D.CC);
     }
     Call->setTailCallKind(CallInst::TCK_None);
 
