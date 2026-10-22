@@ -96,6 +96,21 @@ static cl::opt<bool>
 EnableBogusControlFlow("irobf-bcf", cl::init(false), cl::NotHidden,
   cl::desc("Enable Bogus Control Flow (causes IDA optimizations loop too much)."),
   cl::ZeroOrMore);
+// 每函数毒点绝对上限。0 = 不设绝对上限；与百分比同时给出时取较小值。
+static cl::opt<uint32_t>
+BCFBudget("irobf-bcf_budget", cl::init(0), cl::NotHidden,
+          cl::desc("Absolute cap on BCF sites per function "
+                   "(0 = no absolute cap). Default: 0"),
+          cl::ZeroOrMore);
+
+// 每函数毒点占可插桩块的百分比。0 = 不用百分比（退回绝对上限）；
+// 与绝对上限都为 0 时按默认 20%，0 只表示自动，不会放大。
+static cl::opt<uint32_t>
+BCFBudgetPct("irobf-bcf_budget_pct", cl::init(20), cl::NotHidden,
+             cl::desc("Percentage of eligible blocks to protect per "
+                      "function, 0-100 (0 = auto: absolute cap, or 20%). "
+                      "Default: 20"),
+             cl::ZeroOrMore);
 
 
 
@@ -181,6 +196,9 @@ struct ObfuscationPassManager : public ModulePass {
     Opt->rttiOpt()->readOpt(EnableRttiEraser);
 
     Opt->bcfOpt()->readOpt(EnableBogusControlFlow);
+    Opt->bcfOpt()->readBudgetOpt(BCFBudget);
+    Opt->bcfOpt()->readBudgetPctOpt(BCFBudgetPct);
+    // CLI is an explicit opt-in; when absent, the config value stands.
     return Opt;
   }
 
@@ -230,7 +248,10 @@ struct ObfuscationPassManager : public ModulePass {
     // BCF 必须在 IndirectBranch 之前跑：BCF 在原始 CFG 上做 split+fixStack
     // 是线性的；若 indbr 先把条件分支全部换成 indirectbr，BCF 再在其上
     // split 会引发后端寄存器分配/EH 准备的组合爆炸（实测编译卡死）。
-    if (EnableBogusControlFlow || Options->bcfOpt()->isEnabled()) {
+    // pattern / 函数注解也可能单独开启 BCF（config 统一管理），
+    // 因此用 mayBeEnabled 判断，而不是只看全局开关。
+    if (EnableBogusControlFlow ||
+        Options->mayBeEnabled(Options->bcfOpt(), M)) {
       add(llvm::createBogusControlFlowPass(Options.get()));
       // DecoyPass 绑定 BCF 开关（用户侧零变化：-irobf-bcf + config decoy
       // 声明即生效）。资格门在 pass 内：无注解/config 声明时空转。

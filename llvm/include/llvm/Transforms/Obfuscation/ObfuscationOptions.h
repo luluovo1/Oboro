@@ -42,6 +42,10 @@ struct ConfigPatternRule {
     std::optional<uint32_t> Decoy;
     // L3 值污染开关（仅对 decoy>0 的函数有效）。缺省 false = 只做 L1。
     std::optional<bool>     DecoyPollute;
+    // BCF 每函数毒点上限（0 = 不设绝对上限）。仅 BCF 读取。
+    std::optional<uint32_t> Budget;
+    // BCF 毒点占可插桩块数的百分比（0-100，0 = 禁用百分比）。
+    std::optional<uint32_t> BudgetPct;
   };
   llvm::StringMap<OptOverride> Overrides;
 };
@@ -55,6 +59,17 @@ protected:
   uint32_t    Decoy   : 7;
   // L3 值污染：仅 decoy>0 时生效；默认关（只做 L1 重汇聚）。
   uint32_t    DecoyPollute : 1;
+  // CSE 专用：true = 全模块共用 i8/i16 各一个解密器（体积优先）。
+  // 只能由 config 的 "cse": {"shared": true} 打开；没有对应命令行参数，
+  // 该取舍属于项目级策略，不应该被散落的编译指令左右。
+  uint32_t    SharedDecrypt : 1;
+  // BCF 每函数毒点上限（绝对数）：0 = 不设绝对上限。仅在 BudgetPct == 0
+  // 时单独生效。其他 pass 不读取该字段。
+  uint32_t    Budget = 0;
+  // BCF 毒点占可插桩块数的百分比（0-100）：0 = 不用百分比，退回 Budget
+  // 绝对上限；若 Budget 也为 0，按默认 20% 处理（0 只表示自动，不放大）。
+  // 默认 20% 随函数规模线性增长，避免大函数只保护前几个块。
+  uint32_t    BudgetPct = 20;
   std::string AttributeName;
 
 public:
@@ -63,6 +78,7 @@ public:
     this->Level = std::min<uint32_t>(level, 3);
     this->Decoy = 0;
     this->DecoyPollute = 0;
+    this->SharedDecrypt = 0;
     this->AttributeName = attributeName;
   }
 
@@ -71,6 +87,7 @@ public:
     this->Level = 0;
     this->Decoy = 0;
     this->DecoyPollute = 0;
+    this->SharedDecrypt = 0;
     this->AttributeName = attributeName;
   }
 
@@ -86,6 +103,18 @@ public:
     if (levelOpt.getNumOccurrences()) {
       Level = levelOpt.getValue();
     }
+  }
+
+  // BCF 专用：每函数毒点上限（绝对数）；0 = 不设绝对上限。
+  void readBudgetOpt(const cl::opt<uint32_t> &budgetOpt) {
+    if (budgetOpt.getNumOccurrences())
+      setBudget(budgetOpt.getValue());
+  }
+
+  // BCF 专用：毒点占可插桩块数的百分比；0 = 禁用百分比。
+  void readBudgetPctOpt(const cl::opt<uint32_t> &budgetPctOpt) {
+    if (budgetPctOpt.getNumOccurrences())
+      setBudgetPct(budgetPctOpt.getValue());
   }
 
   void setEnable(bool enabled) {
@@ -104,6 +133,14 @@ public:
     this->DecoyPollute = pollute ? 1 : 0;
   }
 
+  void setBudget(uint32_t budget) {
+    this->Budget = std::min<uint32_t>(budget, 4096);
+  }
+
+  void setBudgetPct(uint32_t pct) {
+    this->BudgetPct = std::min<uint32_t>(pct, 100);
+  }
+
   bool isEnabled() const {
     return this->Enabled;
   }
@@ -118,6 +155,23 @@ public:
 
   bool decoyPollute() const {
     return this->DecoyPollute != 0;
+  }
+
+  // CSE 专用：全局共享解密器。只有 config 能设置（见字段注释）。
+  void setSharedDecrypt(bool Shared) {
+    this->SharedDecrypt = Shared ? 1 : 0;
+  }
+
+  bool sharedDecrypt() const {
+    return this->SharedDecrypt != 0;
+  }
+
+  uint32_t budget() const {
+    return this->Budget;
+  }
+
+  uint32_t budgetPct() const {
+    return this->BudgetPct;
   }
 
   const std::string &attributeName() const {

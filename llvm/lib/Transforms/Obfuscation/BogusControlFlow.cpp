@@ -183,9 +183,28 @@ struct BogusControlFlow : public FunctionPass {
       Prob = 100;
 
     // 每函数 BCF 处理块数上限：iostream 等展开的巨型函数有几百个块，
-    // 全块 BCF + fixStack 全函数 demote 会让编译时间爆炸。每函数 16 个
-    // 毒点对 IDA/Hex-Rays 的破坏效果已经足够。
-    unsigned MaxBlocks = 16;
+    // 全块 BCF + fixStack 全函数 demote 会让编译时间爆炸。
+    //
+    // 优先级：
+    //   1) budget_pct > 0：按可插桩块数的百分比（向上取整，至少 1 个）；
+    //      若同时给了绝对上限 budget > 0，再取 min（双保险）。
+    //   2) budget_pct == 0 且 budget > 0：只按绝对上限。
+    //   3) 两者都为 0：等价于“未指定”，回落到默认 20%。0 只表示自动，
+    //      不是“解除限制”，更不会放大到旧档位（大函数 64 个）。
+    static constexpr unsigned DefaultBudgetPct = 20;
+    unsigned MaxBlocks = Opt.budget();
+    unsigned Pct = Opt.budgetPct();
+    if (Pct == 0 && MaxBlocks == 0)
+      Pct = DefaultBudgetPct;
+    if (Pct > 0) {
+      const size_t N = Targets.size();
+      unsigned PctCap =
+          static_cast<unsigned>((N * Pct + 99) / 100);
+      if (PctCap == 0 && N > 0)
+        PctCap = 1;
+      MaxBlocks = (MaxBlocks > 0) ? std::min(MaxBlocks, PctCap) : PctCap;
+      MaxBlocks = std::min(MaxBlocks, 4096u);
+    }
 
     for (BasicBlock *BB : Targets) {
       if (MaxBlocks == 0)

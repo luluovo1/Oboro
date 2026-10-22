@@ -412,6 +412,18 @@ std::shared_ptr<ObfuscationOptions> ObfuscationOptions::readConfigFile(
         if (auto level = optObj->getInteger("level")) {
           obfOpt->setLevel(static_cast<uint32_t>(level.value()));
         }
+        // BCF 专用；其他 pass 忽略这些字段。
+        // budget = 绝对上限（0 = 不设上限）；budget_pct = 百分比（0 = 禁用）。
+        if (auto budget = optObj->getInteger("budget"))
+          obfOpt->setBudget(static_cast<uint32_t>(std::min<int64_t>(
+              4096, std::max<int64_t>(0, budget.value()))));
+        if (auto pct = optObj->getInteger("budget_pct"))
+          obfOpt->setBudgetPct(static_cast<uint32_t>(
+              std::min<int64_t>(100, std::max<int64_t>(0, pct.value()))));
+        // CSE 专用；其他 pass 忽略 "shared"。全模块共用一个解密器以换体积，
+        // 只能经 config 打开——命令行不提供对应开关。
+        if (auto shared = optObj->getBoolean("shared"))
+          obfOpt->setSharedDecrypt(shared.value());
         // 全局 pass 配置里的 decoy 一律忽略：decoy 资格只能由函数注解或
         // pattern 规则显式声明，防止一个全局 config 把所有函数卷进 decoy。
         if (optObj->getInteger("decoy")) {
@@ -525,6 +537,12 @@ std::shared_ptr<ObfuscationOptions> ObfuscationOptions::readConfigFile(
                     std::min<int64_t>(100, std::max<int64_t>(0, dv.value())));
               if (auto pv = vo->getBoolean("decoy_pollute"))
                 ov.DecoyPollute = pv.value();
+              if (auto bv = vo->getInteger("budget"))
+                ov.Budget = static_cast<uint32_t>(std::min<int64_t>(
+                    4096, std::max<int64_t>(0, bv.value())));
+              if (auto pv = vo->getInteger("budget_pct"))
+                ov.BudgetPct = static_cast<uint32_t>(std::min<int64_t>(
+                    100, std::max<int64_t>(0, pv.value())));
               rule.Overrides[key] = ov;
             } else {
               llvm::errs() << "warning: pattern value for \"" << key
@@ -613,6 +631,8 @@ ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
   // decoy 资格只能由 pattern / 注解显式设置；全局 config 与 CLI 一律不参与。
   uint32_t patternDecoy = 0;
   bool     patternPollute = false;
+  uint32_t patternBudget = option->budget();
+  uint32_t patternBudgetPct = option->budgetPct();
   if (!PatternRules.empty()) {
     StringRef FileName;
     if (const Module *M = f->getParent()) {
@@ -636,6 +656,10 @@ ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
         patternDecoy = *It->second.Decoy;
       if (It->second.DecoyPollute)
         patternPollute = *It->second.DecoyPollute;
+      if (It->second.Budget)
+        patternBudget = *It->second.Budget;
+      if (It->second.BudgetPct)
+        patternBudgetPct = *It->second.BudgetPct;
     };
     // 第一遍：纯文件 pattern（低优先级）
     for (const ConfigPatternRule &Rule : PatternRules) {
@@ -785,6 +809,9 @@ ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
   if (!polluteSet) {
     result.setDecoyPollute(patternPollute);
   }
+  // BCF 预算没有函数注解通道，只按 CLI / config / pattern 级联。
+  result.setBudget(patternBudget);
+  result.setBudgetPct(patternBudgetPct);
   return result;
 }
 
