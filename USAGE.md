@@ -47,6 +47,14 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 | `-irobf-cfe` | bool | false | 浮点常量加密：对 double/float 字面量加密 · [查看混淆前后效果对比](#cfe-浮点常量加密) |
 | `-level-cfe` | int | 0 | 浮点常量加密强度 |
 | `-irobf-rtti` | bool | false | 擦除 C++ RTTI 类型信息（实验性） |
+| `-irobf-indbr-dual` | bool | false | 双目标间接跳转：条件分支 → `indirectbr(select(cond, blockaddress(T), blockaddress(F)))`，在末端管线执行；与页表模式二选一 |
+| `-irobf-rename` | bool | false | 内部符号随机重命名（函数/全局/别名）；导出符号与 `main` 保留 |
+| `-level-rename` | int | 0 | 重命名级别：1=函数，2=含全局，3=额外剥离调试信息 |
+| `-irobf-fwrap` | bool | false | 为直接调用插入内部转发函数，打断调用图 |
+| `-irobf-fwrap_prob` | int | 100 | 每个函数被包装的概率（0-100） |
+| `-irobf-shuffle` | bool | false | 基本块物理顺序随机化（末端执行） |
+| `-irobf-split` | bool | false | 优化后切分基本块，阻止 SimplifyCFG 合并 |
+| `-irobf-split_num` | int | 3 | 每函数最多切分次数 |
 | `-oboro-cfg` | string | "" | 指向 JSON 格式的混淆配置文件路径 |
 
 ---

@@ -46,6 +46,14 @@ All obfuscation flags are passed to the compiler via `-mllvm -<flag>`.
 | `-irobf-cfe` | bool | false | Floating-point constant encryption (double/float literals) · [before/after](#cfe-floating-point-constant-encryption) |
 | `-level-cfe` | int | 0 | Floating-point constant encryption strength |
 | `-irobf-rtti` | bool | false | Erase C++ RTTI type information (experimental) |
+| `-irobf-indbr-dual` | bool | false | Two-target indirect branch: conditional branch becomes `indirectbr(select(cond, blockaddress(T), blockaddress(F)))`, run in the late pipeline; mutually exclusive with the page-table mode |
+| `-irobf-rename` | bool | false | Rename internal functions/globals/aliases; exported symbols and `main` are kept |
+| `-level-rename` | int | 0 | Rename level: 1=functions, 2=globals too, 3=also strip debug info |
+| `-irobf-fwrap` | bool | false | Insert internal forwarding wrappers for direct calls |
+| `-irobf-fwrap_prob` | int | 100 | Per-function wrapper probability (0-100) |
+| `-irobf-shuffle` | bool | false | Randomise basic block layout (late pipeline) |
+| `-irobf-split` | bool | false | Split blocks after optimization so SimplifyCFG cannot merge them |
+| `-irobf-split_num` | int | 3 | Maximum splits per function |
 | `-oboro-cfg` | string | "" | Path to a JSON obfuscation config file |
 
 ---
