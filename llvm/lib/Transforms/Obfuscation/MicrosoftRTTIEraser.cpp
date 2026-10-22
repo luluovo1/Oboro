@@ -9,9 +9,8 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/CryptoUtils.h"
 #include "llvm/ADT/SmallString.h"
-#include "llvm/CryptoUtils.h"
+#include "llvm/Support/BLAKE3.h"
 #include "llvm/Transforms/Obfuscation/MicrosoftRTTIEraser.h"
 
 #define DEBUG_TYPE "ms_rtti_eraser"
@@ -23,13 +22,14 @@ namespace {
 class MsRttiEraser : public ModulePass {
 protected:
   ObfuscationOptions *ArgsOptions;
+  llvm::BLAKE3        Blake3;
 
 public:
   static char ID;
 
   MsRttiEraser(ObfuscationOptions *argsOptions) : ModulePass(ID) {
     this->ArgsOptions = argsOptions;
-    initializeStringEncryptionPass(*PassRegistry::getPassRegistry());
+    initializeMsRttiEraserPass(*PassRegistry::getPassRegistry());
   }
 
   StringRef getPassName() const override {
@@ -73,7 +73,13 @@ public:
       Constant *newRttiNameConstant = ConstantDataArray::getString(
           ctx, newRttiName, newRttiName[newRttiName.size() - 1] != '\0');
 
-      initStruct->setOperand(2, newRttiNameConstant);
+      // Rebuild the initializer instead of mutating a uniqued ConstantStruct:
+      // Constants are immutable and shared across the module.
+      SmallVector<Constant *, 4> Ops;
+      for (unsigned k = 0; k < initStruct->getNumOperands(); ++k)
+        Ops.push_back(initStruct->getOperand(k));
+      Ops[2] = newRttiNameConstant;
+      gv.setInitializer(ConstantStruct::get(initStruct->getType(), Ops));
       changed = true;
     }
     return changed;
@@ -87,8 +93,9 @@ public:
     SmallString<512> passwd;
     passwd.append(ArgsOptions->randomSeed());
     passwd.append(rtti);
-    uint8_t hash[32];
-    cryptoutils->sha256(passwd.c_str(), hash);
+    Blake3.init();
+    Blake3.update(passwd);
+    const auto hash = Blake3.final();
 
     SmallString<256> result = rtti;
 
