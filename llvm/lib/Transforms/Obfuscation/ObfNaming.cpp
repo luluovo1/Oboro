@@ -10,6 +10,7 @@
 #include "llvm/Transforms/Obfuscation/ObfNaming.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringExtras.h"
@@ -145,7 +146,14 @@ std::string obf::metaName(Module &M, StringRef Tag) {
 }
 
 StringRef obf::sectionName(Module &M) {
-  (void)M;
+  Triple T(M.getTargetTriple());
+  // 只有 ELF/COFF 的 ".text" 是可直接寻址的扁平代码节区。Mach-O 使用
+  // "segment,section" 命名、Wasm/XCOFF 各有自己的节区模型，硬塞 ".text"
+  // 会生成目标不认识的节区。未知 triple（纯 IR 测试）沿用主机构建行为。
+  const bool FlatCodeSection = T.getArch() == Triple::UnknownArch ||
+                               T.isOSBinFormatELF() || T.isOSBinFormatCOFF();
+  if (!FlatCodeSection)
+    return StringRef();
   // 生产模式并入主代码段：节区表里没有独立条目可供定位。
   // 调试模式保留独立节区，便于测试观察毒载荷。
   return debugNames() ? StringRef(".text.aux") : StringRef(".text");
