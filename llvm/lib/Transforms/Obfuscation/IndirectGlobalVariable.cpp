@@ -31,6 +31,11 @@ struct IndirectGlobalVariable : public FunctionPass {
 
   uint64_t    PtrEncKey = 0;
   bool RunOnFuncChanged = false;
+  // AArch64 PAC: signed counterpart of GVPageTable.  Data pointers use the
+  // DA key (2), so a stale/copied code signature cannot be reused here.
+  GlobalVariable *SignedObjects = nullptr;
+  uint64_t        PtrAuthDisc = 0;
+  bool            UsePtrAuth = false;
 
   IndirectGlobalVariable(ObfuscationOptions *argsOptions) : FunctionPass(ID) {
     this->ArgsOptions = argsOptions;
@@ -160,6 +165,76 @@ struct IndirectGlobalVariable : public FunctionPass {
       enhancedPageTable(createPageTableArgs, &FuncGVIndex);
     }
 
+    // Count GV references for deduplication.  Repeated GVs are decrypted once
+    // at function entry and reloaded from an alloca instead of rebuilding the
+    // whole page-table walk at every use.  Iteration follows first-use order so
+    // alloca numbering and PRNG consumption stay deterministic.
+    std::unordered_map<GlobalVariable *, unsigned> GVUseCount;
+    std::vector<GlobalVariable *> GVUseOrder;
+    for (inst_iterator I = inst_begin(Fn), E = inst_end(Fn); I != E; ++I) {
+      Instruction *Inst = &*I;
+      if (isa<CallInst>(Inst) || isa<CatchReturnInst>(Inst) ||
+          isa<ResumeInst>(Inst) || Inst->isEHPad())
+        continue;
+      for (unsigned i = 0; i < Inst->getNumOperands(); ++i) {
+        auto *GV = dyn_cast<GlobalVariable>(Inst->getOperand(i));
+        if (!GV || !GVIndex.count(GV))
+          continue;
+        unsigned &Cnt = GVUseCount[GV];
+        if (Cnt++ == 0)
+          GVUseOrder.push_back(GV);
+      }
+    }
+
+    std::unordered_map<GlobalVariable *, AllocaInst *> GVDedupCache;
+    auto &EntryBB = Fn.getEntryBlock();
+    Instruction *AllocaInsertPt = &*EntryBB.begin();
+    auto *PtrTy = PointerType::getUnqual(Fn.getContext());
+    for (auto *GV : GVUseOrder) {
+      if (GVUseCount[GV] <= 1)
+        continue;
+      IRBuilder<> AIB(AllocaInsertPt);
+      GVDedupCache[GV] = AIB.CreateAlloca(PtrTy, nullptr);
+    }
+
+    if (!GVDedupCache.empty()) {
+      Instruction *DecryptPt = nullptr;
+      for (auto &I : EntryBB) {
+        if (!isa<AllocaInst>(&I)) {
+          DecryptPt = &I;
+          break;
+        }
+      }
+      if (!DecryptPt)
+        DecryptPt = EntryBB.getTerminator();
+      for (auto *GV : GVUseOrder) {
+        auto CacheIt = GVDedupCache.find(GV);
+        if (CacheIt == GVDedupCache.end())
+          continue;
+        BuildDecryptArgs buildDecrypt;
+        buildDecrypt.FuncLoopCount = opt.level();
+        buildDecrypt.NextIndex =
+            opt.level() ? FuncGVIndex[GV] : GVIndex[GV];
+        buildDecrypt.NextIndexValue = nullptr;
+        buildDecrypt.Fn = &Fn;
+        buildDecrypt.InsertBefore = DecryptPt;
+        buildDecrypt.LoadTy = GV->getType();
+        buildDecrypt.ModulePageTable = &GVPageTable;
+        buildDecrypt.FuncPageTable = &FuncGVPageTable;
+        buildDecrypt.ModuleKey = GVKeys[GV];
+        buildDecrypt.FuncKey = FuncKeys[GV];
+        buildDecrypt.PtrEncKey = PtrEncKey;
+        buildDecrypt.SignedObjects = SignedObjects;
+        buildDecrypt.PtrAuthKey =
+            (UsePtrAuth && hasPtrAuth(Fn)) ? 2 : -1;
+        buildDecrypt.PtrAuthDisc = PtrAuthDisc;
+
+        auto GVPtr = buildPageTableDecryptIR(buildDecrypt);
+        IRBuilder<> SIB(DecryptPt);
+        SIB.CreateAlignedStore(GVPtr, CacheIt->second, Align{1}, true);
+      }
+    }
+
     for (inst_iterator I = inst_begin(Fn), E = inst_end(Fn); I != E; ++I) {
       Instruction *Inst = &*I;
       if (isa<CallInst>(Inst) || isa<CatchReturnInst>(Inst) || isa<ResumeInst>(Inst) || Inst->isEHPad()) {
@@ -175,6 +250,18 @@ struct IndirectGlobalVariable : public FunctionPass {
           auto PHI = dyn_cast<PHINode>(Inst);
           auto InsertPoint = PHI ? PHI->getIncomingBlock(i)->getTerminator() : Inst;
           IRBuilder<> IRB(InsertPoint);
+
+          auto CacheIt = GVDedupCache.find(GV);
+          if (CacheIt != GVDedupCache.end()) {
+            auto *GVPtr = IRB.CreateAlignedLoad(GV->getType(),
+                                                CacheIt->second, Align{1}, true);
+            if (PHI)
+              PHI->setIncomingValue(i, GVPtr);
+            else
+              Inst->replaceUsesOfWith(GV, GVPtr);
+            RunOnFuncChanged = true;
+            continue;
+          }
 
           BuildDecryptArgs buildDecrypt;
           buildDecrypt.FuncLoopCount = opt.level();
