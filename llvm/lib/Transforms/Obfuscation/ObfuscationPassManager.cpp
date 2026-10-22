@@ -7,6 +7,8 @@
 #include "llvm/Transforms/Obfuscation/DecoyPass.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationPassManager.h"
+#include "llvm/Transforms/Obfuscation/AuxPasses.h"
+#include "llvm/Transforms/Obfuscation/SymbolRename.h"
 // CryptoUtils.h defines a function-like macro `R`, which collides with
 // std::function template parameters in CommandLine.h if included earlier.
 #include "llvm/CryptoUtils.h"
@@ -134,13 +136,49 @@ EnablePtrAuth("irobf-ptrauth", cl::init(false), cl::NotHidden,
                        "(requires +pauth; off by default)."),
               cl::ZeroOrMore);
 
+
+// ---- late / structural passes -------------------------------------------------
+static cl::opt<bool>
+EnableIndBrDual("irobf-indbr-dual", cl::init(false), cl::NotHidden,
+                cl::desc("Use two-target indirectbr (blockaddress select) "
+                         "and run it in the late pipeline."),
+                cl::ZeroOrMore);
+static cl::opt<bool>
+EnableSymbolRename("irobf-rename", cl::init(false), cl::NotHidden,
+                   cl::desc("Rename internal symbols to opaque names."),
+                   cl::ZeroOrMore);
+static cl::opt<uint32_t>
+LevelSymbolRename("level-rename", cl::init(0), cl::NotHidden,
+                  cl::desc("Rename level 1..3 (2=globals, 3=strip debug)."),
+                  cl::ZeroOrMore);
+static cl::opt<bool>
+EnableFunctionWrapper("irobf-fwrap", cl::init(false), cl::NotHidden,
+                      cl::desc("Insert forwarding wrappers and retarget calls."),
+                      cl::ZeroOrMore);
+static cl::opt<uint32_t>
+FunctionWrapperProb("irobf-fwrap_prob", cl::init(100), cl::NotHidden,
+                    cl::desc("Per-function wrapper probability (0-100)."),
+                    cl::ZeroOrMore);
+static cl::opt<bool>
+EnableShuffleBlocks("irobf-shuffle", cl::init(false), cl::NotHidden,
+                    cl::desc("Shuffle basic block layout."), cl::ZeroOrMore);
+static cl::opt<bool>
+EnableSplitBlocks("irobf-split", cl::init(false), cl::NotHidden,
+                  cl::desc("Split basic blocks after optimization."),
+                  cl::ZeroOrMore);
+static cl::opt<uint32_t>
+SplitBlocksCount("irobf-split_num", cl::init(3), cl::NotHidden,
+                 cl::desc("Maximum block splits per function."), cl::ZeroOrMore);
+
 namespace llvm {
 
 struct ObfuscationPassManager : public ModulePass {
   static char            ID; // Pass identification
   SmallVector<Pass *, 8> Passes;
+  bool                   Late;
 
-  ObfuscationPassManager() : ModulePass(ID) {
+  explicit ObfuscationPassManager(bool Late = false)
+      : ModulePass(ID), Late(Late) {
     initializeObfuscationPassManagerPass(*PassRegistry::getPassRegistry());
   };
 
@@ -211,16 +249,44 @@ struct ObfuscationPassManager : public ModulePass {
     // CLI is an explicit opt-in; when absent, the config value stands.
     if (EnablePtrAuth.getNumOccurrences())
       Opt->setPtrAuthEnabled(EnablePtrAuth);
+    Opt->renameOpt()->readOpt(EnableSymbolRename, LevelSymbolRename);
+    Opt->fwrapOpt()->readOpt(EnableFunctionWrapper);
+    Opt->shuffleOpt()->readOpt(EnableShuffleBlocks);
+    Opt->splitOpt()->readOpt(EnableSplitBlocks);
+    if (EnableIndBrDual)
+      Opt->indBrOpt()->setEnable(true);
     return Opt;
   }
 
   bool runOnModule(Module &M) override {
+    if (Late) {
+      // These passes must see final, optimized IR; at PipelineStart the
+      // optimizer folds their work back.
+      const auto Options(getOptions());
+      const bool WantShuffle =
+          EnableShuffleBlocks || Options->shuffleOpt()->isEnabled();
+      const bool WantSplit =
+          EnableSplitBlocks || Options->splitOpt()->isEnabled();
+      if (!WantShuffle && !WantSplit && !EnableIndBrDual)
+        return false;
+      if (!Options->randomSeed().empty())
+        cryptoutils->prng_seed(std::string(Options->randomSeed()));
+      if (WantShuffle)
+        add(llvm::createShuffleBlocksPass(Options.get()));
+      if (WantSplit)
+        add(llvm::createSplitBlocksPass(Options.get(), SplitBlocksCount));
+      if (EnableIndBrDual)
+        add(llvm::createIndirectBranchPass(Options.get(), /*Dual=*/true));
+      return run(M);
+    }
+
 
     if (EnableIndirectBr || EnableIndirectCall || EnableIndirectGV ||
         EnableIRFlattening || EnableIRStringEncryption ||
         EnableIRConstantIntEncryption || EnableIRConstantFPEncryption ||
         EnableRttiEraser ||
-        EnableBogusControlFlow || !OboroConfigPath.empty()) {
+        EnableBogusControlFlow || EnableFunctionWrapper ||
+        EnableSymbolRename || EnableIndBrDual || !OboroConfigPath.empty()) {
       EnableIRObfuscation = true;
     }
 
@@ -256,6 +322,8 @@ struct ObfuscationPassManager : public ModulePass {
 
     add(llvm::createIndirectGlobalVariablePass(Options.get()));
 
+    if (EnableFunctionWrapper || Options->fwrapOpt()->isEnabled())
+      add(llvm::createFunctionWrapperPass(Options.get(), FunctionWrapperProb));
     add(llvm::createIndirectCallPass(Options.get()));
     add(llvm::createFlatteningPass(pointerSize, Options.get()));
 
@@ -274,11 +342,15 @@ struct ObfuscationPassManager : public ModulePass {
       add(llvm::createDecoyPass(Options.get()));
     }
 
-    add(llvm::createIndirectBranchPass(Options.get()));
+    if (!EnableIndBrDual)
+      add(llvm::createIndirectBranchPass(Options.get(), /*Dual=*/false));
 
     if (EnableRttiEraser || Options->rttiOpt()->isEnabled()) {
       add(llvm::createMsRttiEraserPass(Options.get()));
     }
+
+    if (EnableSymbolRename || Options->renameOpt()->isEnabled())
+      add(llvm::createSymbolRenamePass(Options.get()));
 
 
     bool Changed = run(M);
@@ -290,8 +362,8 @@ struct ObfuscationPassManager : public ModulePass {
 
 char ObfuscationPassManager::ID = 0;
 
-ModulePass *llvm::createObfuscationPassManager() {
-  return new ObfuscationPassManager();
+ModulePass *llvm::createObfuscationPassManager(bool Late) {
+  return new ObfuscationPassManager(Late);
 }
 
 // Legacy pass registration name must NOT collide with the cl::opt "irobf"

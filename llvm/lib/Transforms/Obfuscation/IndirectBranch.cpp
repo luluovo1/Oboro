@@ -35,6 +35,10 @@ namespace {
 struct IndirectBranch : public FunctionPass {
   static char ID;
   ObfuscationOptions *ArgsOptions;
+  // Dual mode replaces each conditional branch with
+  // indirectbr(select(cond, blockaddress(T), blockaddress(F))) and does
+  // not build a module page table at all.
+  bool Dual = false;
 
   std::unordered_map<Function *, std::vector<Constant *>> FunctionBBs;
   std::unordered_map<Function *, std::vector<BranchInst *>> FunctionBrs;
@@ -60,9 +64,8 @@ struct IndirectBranch : public FunctionPass {
   uint64_t        PtrAuthDisc = 0;
   bool            UsePtrAuth = false;
 
-  IndirectBranch(ObfuscationOptions *argsOptions) : FunctionPass(ID) {
-    this->ArgsOptions = argsOptions;
-  }
+  IndirectBranch(ObfuscationOptions *argsOptions, bool Dual)
+      : FunctionPass(ID), ArgsOptions(argsOptions), Dual(Dual) {}
 
   StringRef getPassName() const override { return {"IndirectBranch"}; }
 
@@ -133,6 +136,15 @@ struct IndirectBranch : public FunctionPass {
             unsigned N = BI->getNumSuccessors();
             for (unsigned I = 0; I < N; I++) {
               BasicBlock *Successor = BI->getSuccessor(I);
+              // A numeric label cannot be referenced by a blockaddress that
+              // escapes the function body (the page table is a global).  Real
+              // code -- JNI entry points in particular -- is full of
+              // unnamed blocks, so give the target a name before taking its
+              // address, otherwise the module fails to re-parse with
+              // "cannot take address of numeric label after the function is
+              // defined".
+              if (!Successor->hasName())
+                Successor->setName("bb");
               auto BBAddr = BlockAddress::get(Successor);
               if (BBSeen[&F].insert(BBAddr).second)
                 FunctionBBs[&F].push_back(BBAddr);
@@ -151,6 +163,9 @@ struct IndirectBranch : public FunctionPass {
     // 未启用则跳过整个模块级收集与页表构建：否则即使没开 INDBR，
     // NumberBasicBlock 的 SplitAllCriticalEdges 也会无谓修改 CFG，
     // 且页表全局会被无条件塞进产物。
+    // Dual mode builds no page table at all.
+    if (Dual)
+      return false;
     if (!ArgsOptions->mayBeEnabled(ArgsOptions->indBrOpt(), M)) {
       return false;
     }
@@ -216,6 +231,36 @@ struct IndirectBranch : public FunctionPass {
     const auto opt = ArgsOptions->toObfuscate(ArgsOptions->indBrOpt(), &Fn);
     if (!opt.isEnabled()) {
       return false;
+    }
+
+    if (Dual) {
+      SmallVector<BranchInst *, 16> Cands;
+      for (BasicBlock &BB : Fn)
+        if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator()))
+          if (BI->isConditional())
+            Cands.push_back(BI);
+
+      bool Changed = false;
+      for (BranchInst *BI : Cands) {
+        BasicBlock *TBB = BI->getSuccessor(0);
+        BasicBlock *FBB = BI->getSuccessor(1);
+        // The blockaddress escapes into a global, so unnamed targets must get
+        // a name first (see the same constraint in NumberBasicBlock).
+        for (BasicBlock *Succ : {TBB, FBB})
+          if (!Succ->hasName())
+            Succ->setName("bb");
+        IRBuilder<> IRB(BI);
+        Value *Sel = IRB.CreateSelect(BI->getCondition(),
+                                      BlockAddress::get(TBB),
+                                      BlockAddress::get(FBB));
+        auto *IBI = IndirectBrInst::Create(Sel, 2, BI->getIterator());
+        IBI->addDestination(TBB);
+        IBI->addDestination(FBB);
+        BI->eraseFromParent();
+        Changed = true;
+      }
+      RunOnFuncChanged |= Changed;
+      return Changed;
     }
 
     LLVMContext &Ctx = Fn.getContext();
@@ -342,7 +387,8 @@ struct IndirectBranch : public FunctionPass {
 } // namespace llvm
 
 char IndirectBranch::ID = 0;
-FunctionPass *llvm::createIndirectBranchPass(ObfuscationOptions *argsOptions) {
-  return new IndirectBranch(argsOptions);
+FunctionPass *llvm::createIndirectBranchPass(ObfuscationOptions *argsOptions,
+                                             bool Dual) {
+  return new IndirectBranch(argsOptions, Dual);
 }
 INITIALIZE_PASS(IndirectBranch, "indbr", "Enable IR Indirect Branch Obfuscation", false, false)

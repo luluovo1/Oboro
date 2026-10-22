@@ -196,6 +196,10 @@ protected:
   std::shared_ptr<ObfOpt> RttiOpt = nullptr;
   std::shared_ptr<ObfOpt> PsoOpt  = nullptr;
   std::shared_ptr<ObfOpt> BcfOpt  = nullptr;
+  std::shared_ptr<ObfOpt> RenameOpt = nullptr;
+  std::shared_ptr<ObfOpt> FwrapOpt = nullptr;
+  std::shared_ptr<ObfOpt> SplitOpt = nullptr;
+  std::shared_ptr<ObfOpt> ShuffleOpt = nullptr;
 
   SmallString<32> RandomSeed;
   // AArch64 PAC pointer-table signing is opt-in: it needs a module
@@ -212,7 +216,7 @@ protected:
 
 public:
   SmallVector<std::shared_ptr<ObfOpt>> getAllOpt() const {
-    SmallVector<std::shared_ptr<ObfOpt>, 9> allOpt;
+    SmallVector<std::shared_ptr<ObfOpt>, 13> allOpt;
     allOpt.push_back(IndBrOpt);
     allOpt.push_back(ICallOpt);
     allOpt.push_back(IndGvOpt);
@@ -223,6 +227,10 @@ public:
     allOpt.push_back(RttiOpt);
     allOpt.push_back(PsoOpt);
     allOpt.push_back(BcfOpt);
+    allOpt.push_back(RenameOpt);
+    allOpt.push_back(FwrapOpt);
+    allOpt.push_back(SplitOpt);
+    allOpt.push_back(ShuffleOpt);
     return allOpt;
   }
 
@@ -235,7 +243,11 @@ public:
                      const std::shared_ptr<ObfOpt> &cfeOpt,
                      const std::shared_ptr<ObfOpt> &rttiOpt,
                      const std::shared_ptr<ObfOpt> &psoOpt,
-                     const std::shared_ptr<ObfOpt> &bcfOpt) {
+                     const std::shared_ptr<ObfOpt> &bcfOpt,
+                     const std::shared_ptr<ObfOpt> &renameOpt,
+                     const std::shared_ptr<ObfOpt> &fwrapOpt,
+                     const std::shared_ptr<ObfOpt> &splitOpt,
+                     const std::shared_ptr<ObfOpt> &shuffleOpt) {
     this->IndBrOpt = indBrOpt;
     this->ICallOpt = iCallOpt;
     this->IndGvOpt = indGvOpt;
@@ -246,6 +258,10 @@ public:
     this->RttiOpt = rttiOpt;
     this->PsoOpt  = psoOpt;
     this->BcfOpt  = bcfOpt;
+    this->RenameOpt = renameOpt;
+    this->FwrapOpt = fwrapOpt;
+    this->SplitOpt = splitOpt;
+    this->ShuffleOpt = shuffleOpt;
   }
 
   ObfuscationOptions() : ObfuscationOptions{
@@ -258,7 +274,11 @@ public:
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "cfe")),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "rtti")),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "pso")),
-                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "bcf"))
+                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "bcf")),
+                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "rename")),
+                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "fwrap")),
+                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "split")),
+                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "shuffle"))
                        } {}
 
   auto indBrOpt() const {
@@ -296,6 +316,10 @@ public:
   auto psoOpt() const { return PsoOpt; }
 
   auto bcfOpt() const { return BcfOpt; }
+  auto renameOpt() const { return RenameOpt; }
+  auto fwrapOpt() const { return FwrapOpt; }
+  auto splitOpt() const { return SplitOpt; }
+  auto shuffleOpt() const { return ShuffleOpt; }
 
   auto &randomSeed() {
     return RandomSeed;
