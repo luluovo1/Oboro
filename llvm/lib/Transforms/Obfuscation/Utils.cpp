@@ -270,8 +270,17 @@ static void prependToGlobalCtors(Module &M, Function *F, int Priority) {
   Entries.push_back(Entry);
   for (unsigned I = 0; I < CA->getNumOperands(); ++I)
     Entries.push_back(CA->getOperand(I));
+
+  // A GlobalVariable's value type is immutable: setInitializer() with a larger
+  // array leaves the declared type stale and the module then fails
+  // verification ("initializer type does not match global variable type"),
+  // which aborts the compiler.  Replace the variable instead, exactly as
+  // LLVM's own transformGlobalArray() does.
+  GV->eraseFromParent();
   auto *NewAT = ArrayType::get(AT->getElementType(), Entries.size());
-  GV->setInitializer(ConstantArray::get(NewAT, Entries));
+  new GlobalVariable(M, NewAT, /*isConstant=*/false,
+                     GlobalValue::AppendingLinkage,
+                     ConstantArray::get(NewAT, Entries), "llvm.global_ctors");
 }
 
 // Emit a module constructor that converts the encrypted object table into a
