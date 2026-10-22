@@ -163,11 +163,23 @@ struct IndirectBranch : public FunctionPass {
     BrSeen.clear();
     BBAddrTargets.clear();
     BBKeys.clear();
+    SignedObjects = nullptr;
 
     NumberBasicBlock(M);
     if (BBAddrTargets.empty()) {
       return false;
     }
+
+    UsePtrAuth = false;
+    if (ArgsOptions->ptrAuthEnabled()) {
+      for (auto &KV : FunctionBBs) {
+        if (hasPtrAuth(*KV.first)) {
+          UsePtrAuth = true;
+          break;
+        }
+      }
+    }
+    PtrAuthDisc = cryptoutils->get_uint64_t();
 
     PtrEncKey = cryptoutils->get_uint64_t();
 
@@ -182,11 +194,20 @@ struct IndirectBranch : public FunctionPass {
     createPageTableArgs.ObjectKeys = &BBKeys;
     createPageTableArgs.OutPageTable = &BBPageTable;
     createPageTableArgs.PtrEncKey = PtrEncKey;
+    createPageTableArgs.EnablePtrAuth = UsePtrAuth;
+    createPageTableArgs.PtrAuthKey = 0; // IA: indirect branch targets
+    createPageTableArgs.PtrAuthDisc = PtrAuthDisc;
+    createPageTableArgs.OutSignedObjects = &SignedObjects;
 
     createPageTable(createPageTableArgs);
+    auto *KeyTy = getPageTableIntTy(M);
+    IndexKeyGV = new GlobalVariable(
+        M, KeyTy, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(KeyTy, 0), obf::freshName(M, "idx_key"));
+    IndexKeyGV->setAlignment(Align(8));
+
     return false;
   }
-
 
   bool runOnFunction(Function &Fn) override {
     // 弱符号等红黄区函数的跳过已统一收敛到

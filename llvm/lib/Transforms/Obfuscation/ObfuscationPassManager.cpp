@@ -124,6 +124,15 @@ OboroConfigPath("oboro-cfg", cl::init(std::string{}), cl::NotHidden,
                  cl::desc("Oboro config path."),
                  cl::ZeroOrMore);
 
+// Opt-in only.  The PAC table needs a module constructor and the +pauth
+// subtarget feature; enabling it implicitly from -march would change the
+// runtime ABI surface of builds that never asked for it.
+static cl::opt<bool>
+EnablePtrAuth("irobf-ptrauth", cl::init(false), cl::NotHidden,
+              cl::desc("Enable AArch64 PAC signing of indirect pointer tables "
+                       "(requires +pauth; off by default)."),
+              cl::ZeroOrMore);
+
 namespace llvm {
 
 struct ObfuscationPassManager : public ModulePass {
@@ -199,6 +208,8 @@ struct ObfuscationPassManager : public ModulePass {
     Opt->bcfOpt()->readBudgetOpt(BCFBudget);
     Opt->bcfOpt()->readBudgetPctOpt(BCFBudgetPct);
     // CLI is an explicit opt-in; when absent, the config value stands.
+    if (EnablePtrAuth.getNumOccurrences())
+      Opt->setPtrAuthEnabled(EnablePtrAuth);
     return Opt;
   }
 

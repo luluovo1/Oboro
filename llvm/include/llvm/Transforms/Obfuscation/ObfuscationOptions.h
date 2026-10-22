@@ -198,6 +198,10 @@ protected:
   std::shared_ptr<ObfOpt> BcfOpt  = nullptr;
 
   SmallString<32> RandomSeed;
+  // AArch64 PAC pointer-table signing is opt-in: it needs a module
+  // constructor and the +pauth target feature, so it must never be enabled
+  // implicitly by -march=armv8.3-a on platforms we have not validated.
+  bool PtrAuthEnabled = false;
   // config "deny" 段：用户自定义红区名单（红区语义，注解也无法解锁），
   // 匹配 demangled 函数名（'*' 不跨 "::"，'**' 跨 "::"）。
   std::vector<std::string> DenyList;
@@ -295,6 +299,14 @@ public:
 
   auto &randomSeed() {
     return RandomSeed;
+  }
+
+  void setPtrAuthEnabled(bool Enabled) {
+    PtrAuthEnabled = Enabled;
+  }
+
+  bool ptrAuthEnabled() const {
+    return PtrAuthEnabled;
   }
 
   auto &denyList() {

@@ -3,6 +3,7 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
+#include "llvm/Transforms/Obfuscation/ObfNaming.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/IR/Constants.h"
@@ -478,6 +479,21 @@ std::shared_ptr<ObfuscationOptions> ObfuscationOptions::readConfigFile(
       }
       continue;
     }
+    if (obj.getFirst().str() == "ptrauth") {
+      // Opt-in AArch64 pointer authentication.  Accept both
+      // "ptrauth": true and "ptrauth": {"enable": true}.
+      if (auto b = obj.getSecond().getAsBoolean()) {
+        result->setPtrAuthEnabled(b.value());
+      } else if (auto o = obj.getSecond().getAsObject()) {
+        if (auto b = o->getBoolean("enable"))
+          result->setPtrAuthEnabled(b.value());
+        else
+          llvm::errs() << "warning: \"ptrauth\" object needs \"enable\"\n";
+      } else {
+        llvm::errs() << "warning: \"ptrauth\" must be a boolean or object\n";
+      }
+      continue;
+    }
     if (obj.getFirst().str() == "deny") {
       if (auto denyArr = obj.getSecond().getAsArray()) {
         for (auto &entry : *denyArr) {
@@ -581,6 +597,11 @@ ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
   if (f->isDeclaration()) {
     return result;
   }
+
+  // Internal runtime glue (e.g. the PAC table initializer) must never be
+  // rewritten by any pass: it runs before the obfuscated tables are usable.
+  if (f->getMetadata(obf::metaName(*f->getParent(), "noobf")))
+    return result;
 
   // Coroutines are not ordinary control flow: the split-coroutine CFG carries
   // coro.suspend/coro.end semantics that flattening and block-splitting do not

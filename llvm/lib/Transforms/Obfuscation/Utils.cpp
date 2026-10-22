@@ -2,11 +2,15 @@
 #include "llvm/Transforms/Obfuscation/ObfNaming.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/EHPersonalities.h"
 #include "llvm/IR/NoFolder.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/TargetParser/Triple.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/CryptoUtils.h"
 
@@ -216,6 +220,134 @@ IntegerType *getPageTableIntTy(Module &M) {
                           M.getDataLayout().getPointerSizeInBits());
 }
 
+// The ptrauth intrinsics are only selectable when the backend sees the
+// "pauth" subtarget feature.  Checking the function attribute (rather than
+// the triple alone) keeps non-armv8.3 builds untouched.
+bool hasPtrAuth(const Function &F) {
+  const Module *M = F.getParent();
+  if (!M || !Triple(M->getTargetTriple()).isAArch64())
+    return false;
+  return F.getFnAttribute("target-features")
+      .getValueAsString()
+      .contains("+pauth");
+}
+
+// Same as appendToGlobalCtors, but put the new entry at the front of the
+// array.  llvm.global_ctors is emitted into .init_array.<priority>; within
+// the same priority, array order is run order.  A user constructor written
+// as constructor(0) would otherwise run before the PAC tables are ready.
+//
+// WARNING (Darwin arm64e only).  With -fptrauth-init-fini the frontend emits
+// every existing ctor entry as a signed pointer, i.e. a ConstantPtrAuth
+// `ptrauth (ptr @f, i32 0, i64 0xD9D4)`, while the entry inserted below is a
+// raw function pointer.  dyld authenticates every .init_array slot, so the
+// raw entry would fail authentication and the process would crash before
+// main.  The combination is NOT supported; it is unreachable on our targets
+// because we emit Android/Linux and -fptrauth-init-fini is an explicit
+// opt-in that the arm64e driver does not add by itself.  If arm64e support is
+// ever added, sign F with an existing entry's schema first:
+//   if (auto *CPA = dyn_cast<ConstantPtrAuth>(ExistingEntryFn))
+//     F = CPA->getWithSameSchema(F);
+static void prependToGlobalCtors(Module &M, Function *F, int Priority) {
+  GlobalVariable *GV = M.getNamedGlobal("llvm.global_ctors");
+  auto *CA = GV ? dyn_cast_or_null<ConstantArray>(GV->getInitializer())
+                : nullptr;
+  auto *AT = CA ? dyn_cast<ArrayType>(CA->getType()) : nullptr;
+  auto *ST = AT ? dyn_cast<StructType>(AT->getElementType()) : nullptr;
+  if (!ST || ST->getNumElements() != 3) {
+    appendToGlobalCtors(M, F, Priority);
+    return;
+  }
+
+  LLVMContext &Ctx = M.getContext();
+  auto *PtrTy = PointerType::getUnqual(Ctx);
+  Constant *Entry = ConstantStruct::get(
+      ST, {ConstantInt::get(Type::getInt32Ty(Ctx), Priority), F,
+           ConstantPointerNull::get(PtrTy)});
+
+  std::vector<Constant *> Entries;
+  Entries.reserve(CA->getNumOperands() + 1);
+  Entries.push_back(Entry);
+  for (unsigned I = 0; I < CA->getNumOperands(); ++I)
+    Entries.push_back(CA->getOperand(I));
+  auto *NewAT = ArrayType::get(AT->getElementType(), Entries.size());
+  GV->setInitializer(ConstantArray::get(NewAT, Entries));
+}
+
+// Emit a module constructor that converts the encrypted object table into a
+// table of signed pointers.  Signing at startup is what gives the scheme
+// integrity: sign+auth at the use site alone would authenticate whatever the
+// attacker just supplied.  The discriminator is bound to the object index so
+// a signed entry cannot be copied over a different slot.
+static void emitPtrAuthInit(Module &M, GlobalVariable *Objects,
+                            GlobalVariable *Signed, uint64_t PtrEncKey,
+                            int Key, uint64_t Disc) {
+  auto *AT = dyn_cast<ArrayType>(Objects->getValueType());
+  if (!AT || AT->getNumElements() == 0)
+    return;
+  auto *IntTy = getPageTableIntTy(M);
+  LLVMContext &Ctx = M.getContext();
+
+  std::string Features;
+  std::string CPU;
+  for (Function &F : M) {
+    if (!hasPtrAuth(F))
+      continue;
+    Features = F.getFnAttribute("target-features").getValueAsString().str();
+    Attribute CPUAttr = F.getFnAttribute("target-cpu");
+    if (CPUAttr.isStringAttribute())
+      CPU = CPUAttr.getValueAsString().str();
+    break;
+  }
+  if (Features.empty())
+    return;
+
+  Function *Ctor = Function::Create(
+      FunctionType::get(Type::getVoidTy(Ctx), false),
+      GlobalValue::InternalLinkage,
+      obf::freshName(M, M.getName().str() + "_pac_init"), &M);
+  Ctor->addFnAttr(Attribute::NoInline);
+  Ctor->addFnAttr("target-features", Features);
+  if (!CPU.empty())
+    Ctor->addFnAttr("target-cpu", CPU);
+  Ctor->addMetadata(obf::metaName(M, "noobf"), *MDNode::get(Ctx, {}));
+
+  BasicBlock *Enter = BasicBlock::Create(Ctx, "", Ctor);
+  BasicBlock *Loop = BasicBlock::Create(Ctx, "", Ctor);
+  BasicBlock *Body = BasicBlock::Create(Ctx, "", Ctor);
+  BasicBlock *Exit = BasicBlock::Create(Ctx, "", Ctor);
+
+  IRBuilder<> IRB(Enter);
+  IRB.CreateBr(Loop);
+  IRB.SetInsertPoint(Loop);
+  PHINode *Idx = IRB.CreatePHI(IntTy, 2);
+  Idx->addIncoming(ConstantInt::get(IntTy, 0), Enter);
+  Value *Done = IRB.CreateICmpUGE(
+      Idx, ConstantInt::get(IntTy, AT->getNumElements()));
+  IRB.CreateCondBr(Done, Exit, Body);
+
+  IRB.SetInsertPoint(Body);
+  Value *Zero = ConstantInt::get(IntTy, 0);
+  Value *GEP = IRB.CreateGEP(Objects->getValueType(), Objects, {Zero, Idx});
+  Value *Enc = IRB.CreateLoad(IntTy, GEP);
+  Value *Raw = IRB.CreateSub(Enc, ConstantInt::get(IntTy, PtrEncKey));
+  Value *SlotDisc = IRB.CreateAdd(ConstantInt::get(IntTy, Disc), Idx);
+  Value *SignedVal = IRB.CreateCall(
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::ptrauth_sign),
+      {Raw, ConstantInt::get(Type::getInt32Ty(Ctx), Key), SlotDisc});
+  Value *SGEP = IRB.CreateGEP(Signed->getValueType(), Signed, {Zero, Idx});
+  IRB.CreateStore(SignedVal, SGEP);
+  Idx->addIncoming(IRB.CreateAdd(Idx, ConstantInt::get(IntTy, 1)), Body);
+  IRB.CreateBr(Loop);
+
+  IRB.SetInsertPoint(Exit);
+  IRB.CreateRetVoid();
+
+  // Priority 0 puts the table initialization ahead of ordinary user
+  // constructors (which use 65535 by default).
+  prependToGlobalCtors(M, Ctor, 0);
+}
+
 // 16 种操作的索引加密链（Arkari 23.x 算法）：
 // 每种操作对 (objKey, newIndex) 组合产生不同的可逆变换，
 // 加密侧与 buildPageTableDecryptIR 的 createDecIndexSwitch 互为逆操作。
@@ -301,12 +433,28 @@ void createPageTable(const CreatePageTableArgs &args) {
                         obf::freshName(*args.M, "objects"));
     auto ATy = ArrayType::get(IntTy, GVObjects.size());
     auto CA = ConstantArray::get(ATy, ArrayRef(GVObjects));
-    auto GV = new GlobalVariable(*args.M, ATy, false, 
+    auto GV = new GlobalVariable(*args.M, ATy, true,
                                  GlobalValue::LinkageTypes::InternalLinkage,
                                  CA, GVNameObjects);
     GV->addMetadata(obf::metaName(*args.M, "noobf"),
                     *MDNode::get(args.M->getContext(), {}));
     args.OutPageTable->push_back(GV);
+
+    if (args.EnablePtrAuth && args.PtrAuthKey >= 0 &&
+        args.OutSignedObjects) {
+      auto *SignedTy = ArrayType::get(IntTy, GVObjects.size());
+      auto *SignedGV = new GlobalVariable(
+          *args.M, SignedTy, /*isConstant=*/false,
+          GlobalValue::LinkageTypes::InternalLinkage,
+          Constant::getNullValue(SignedTy),
+          args.GVNamePrefix + "_" +
+              obf::freshName(*args.M, "signed_objects"));
+      SignedGV->addMetadata(obf::metaName(*args.M, "noobf"),
+                            *MDNode::get(args.M->getContext(), {}));
+      *args.OutSignedObjects = SignedGV;
+      emitPtrAuthInit(*args.M, GV, SignedGV, args.PtrEncKey, args.PtrAuthKey,
+                      args.PtrAuthDisc);
+    }
   }
 
   for (unsigned i = 0; i < args.CountLoop; ++i) {
@@ -335,7 +483,10 @@ void createPageTable(const CreatePageTableArgs &args) {
           obf::freshName(*args.M, "page_table_" + std::to_string(i)));
       auto IATy = ArrayType::get(IntTy, ConstantObjectIndex.size());
       auto IA = ConstantArray::get(IATy, ArrayRef(ConstantObjectIndex));
-      auto GV = new GlobalVariable(*args.M, IATy, false,
+      // Page tables are pure read-only data after construction; placing them
+      // in .rodata (or .data.rel.ro when a relocation is needed) keeps a
+      // runtime attacker from rewriting the index chain in place.
+      auto GV = new GlobalVariable(*args.M, IATy, true,
                                    GlobalValue::LinkageTypes::InternalLinkage,
                                    IA, GVNameObjPageTable);
       GV->addMetadata(obf::metaName(*args.M, "noobf"),
@@ -378,7 +529,7 @@ void enhancedPageTable(const CreatePageTableArgs &args, std::unordered_map<Const
           obf::freshName(*args.M, "enhanced_page_table_" + std::to_string(i)));
       auto IATy = ArrayType::get(IntTy, ConstantObjectIndex.size());
       auto IA = ConstantArray::get(IATy, ArrayRef(ConstantObjectIndex));
-      auto GV = new GlobalVariable(*args.M, IATy, false, GlobalValue::LinkageTypes::PrivateLinkage,
+      auto GV = new GlobalVariable(*args.M, IATy, true, GlobalValue::LinkageTypes::PrivateLinkage,
         IA, GVNameObjPage);
       GV->addMetadata(obf::metaName(*args.M, "noobf"),
                       *MDNode::get(args.M->getContext(), {}));
@@ -546,6 +697,21 @@ Value * buildPageTableDecryptIR(const BuildDecryptArgs &args) {
         NextIndex = createDecIndexSwitch(maskIndex.at(j), NextIndex, PrevIndex, ConstantModuleKey);
       }
       continue;
+    }
+    if (args.PtrAuthKey >= 0 && args.SignedObjects) {
+      // The signed table was filled by the module constructor.  Authenticate
+      // the entry before use; a patched/copied entry fails authentication.
+      auto *SignedGEP = IRB.CreateGEP(args.SignedObjects->getValueType(),
+                                      args.SignedObjects, {Zero, NextIndex});
+      Value *SignedInt = IRB.CreateLoad(IntTy, SignedGEP);
+      Value *SlotDisc = IRB.CreateAdd(
+          ConstantInt::get(IntTy, args.PtrAuthDisc), NextIndex);
+      Value *AuthInt = IRB.CreateCall(
+          Intrinsic::getOrInsertDeclaration(M, Intrinsic::ptrauth_auth),
+          {SignedInt,
+           ConstantInt::get(Type::getInt32Ty(Ctx), args.PtrAuthKey),
+           SlotDisc});
+      return IRB.CreateIntToPtr(AuthInt, args.LoadTy);
     }
     // Objects 数组存的是加密整数：ptrtoint(Obj) + PtrEncKey
     auto EncInt = IRB.CreateLoad(IntTy, GEP);

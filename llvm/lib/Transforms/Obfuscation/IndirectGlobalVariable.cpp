@@ -97,11 +97,23 @@ struct IndirectGlobalVariable : public FunctionPass {
     FunctionGVs.clear();
     GlobalVariables.clear();
     GVKeys.clear();
+    SignedObjects = nullptr;
 
     NumberGlobalVariable(M);
     if (GlobalVariables.empty()) {
       return false;
     }
+
+    UsePtrAuth = false;
+    if (ArgsOptions->ptrAuthEnabled()) {
+      for (auto &KV : FunctionGVs) {
+        if (hasPtrAuth(*KV.first)) {
+          UsePtrAuth = true;
+          break;
+        }
+      }
+    }
+    PtrAuthDisc = cryptoutils->get_uint64_t();
 
     PtrEncKey = cryptoutils->get_uint64_t();
 
@@ -116,6 +128,10 @@ struct IndirectGlobalVariable : public FunctionPass {
     createPageTableArgs.ObjectKeys = &GVKeys;
     createPageTableArgs.OutPageTable = &GVPageTable;
     createPageTableArgs.PtrEncKey = PtrEncKey;
+    createPageTableArgs.EnablePtrAuth = UsePtrAuth;
+    createPageTableArgs.PtrAuthKey = 2; // DA: data pointers
+    createPageTableArgs.PtrAuthDisc = PtrAuthDisc;
+    createPageTableArgs.OutSignedObjects = &SignedObjects;
 
     createPageTable(createPageTableArgs);
     return false;
@@ -277,6 +293,10 @@ struct IndirectGlobalVariable : public FunctionPass {
           buildDecrypt.ModuleKey = GVKeys[GV];
           buildDecrypt.FuncKey = FuncKeys[GV];
           buildDecrypt.PtrEncKey = PtrEncKey;
+          buildDecrypt.SignedObjects = SignedObjects;
+          buildDecrypt.PtrAuthKey =
+              (UsePtrAuth && hasPtrAuth(Fn)) ? 2 : -1;
+          buildDecrypt.PtrAuthDisc = PtrAuthDisc;
 
           auto GVPtr = buildPageTableDecryptIR(buildDecrypt);
           if (PHI)

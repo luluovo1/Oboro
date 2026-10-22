@@ -40,6 +40,11 @@ struct IndirectCall : public FunctionPass {
 
   uint64_t    PtrEncKey = 0;
   bool RunOnFuncChanged = false;
+  // AArch64 PAC: signed counterpart of CalleePageTable.  Filled by a module
+  // constructor; used only by functions carrying the +pauth feature.
+  GlobalVariable *SignedObjects = nullptr;
+  uint64_t        PtrAuthDisc = 0;
+  bool            UsePtrAuth = false;
 
   IndirectCall(ObfuscationOptions *argsOptions) : FunctionPass(ID) {
     this->ArgsOptions = argsOptions;
@@ -116,6 +121,7 @@ struct IndirectCall : public FunctionPass {
     Callees.clear();
     CalleePageTable.clear();
     CalleeKeys.clear();
+    SignedObjects = nullptr;
 
     FuncOpts.clear();
     for (Function &F : M)
@@ -127,6 +133,17 @@ struct IndirectCall : public FunctionPass {
     if (!Callees.size()) {
       return false;
     }
+
+    UsePtrAuth = false;
+    if (ArgsOptions->ptrAuthEnabled()) {
+      for (auto &KV : FunctionCallSites) {
+        if (hasPtrAuth(*KV.first)) {
+          UsePtrAuth = true;
+          break;
+        }
+      }
+    }
+    PtrAuthDisc = cryptoutils->get_uint64_t();
 
     PtrEncKey = cryptoutils->get_uint64_t();
 
@@ -141,6 +158,10 @@ struct IndirectCall : public FunctionPass {
     createPageTableArgs.ObjectKeys = &CalleeKeys;
     createPageTableArgs.OutPageTable = &CalleePageTable;
     createPageTableArgs.PtrEncKey = PtrEncKey;
+    createPageTableArgs.EnablePtrAuth = UsePtrAuth;
+    createPageTableArgs.PtrAuthKey = 0; // IA: call targets
+    createPageTableArgs.PtrAuthDisc = PtrAuthDisc;
+    createPageTableArgs.OutSignedObjects = &SignedObjects;
 
     createPageTable(createPageTableArgs);
     return false;
@@ -249,6 +270,10 @@ struct IndirectCall : public FunctionPass {
         buildDecrypt.ModuleKey = CalleeKeys[Callee];
         buildDecrypt.FuncKey = FuncKeys[Callee];
         buildDecrypt.PtrEncKey = PtrEncKey;
+        buildDecrypt.SignedObjects = SignedObjects;
+        buildDecrypt.PtrAuthKey =
+            (UsePtrAuth && hasPtrAuth(Fn)) ? 0 : -1;
+        buildDecrypt.PtrAuthDisc = PtrAuthDisc;
 
         auto DecPtr = buildPageTableDecryptIR(buildDecrypt);
         IRBuilder<> SIB(DecryptPt);
@@ -290,6 +315,10 @@ struct IndirectCall : public FunctionPass {
         buildDecrypt.ModuleKey = CalleeKeys[Callee];
         buildDecrypt.FuncKey = FuncKeys[Callee];
         buildDecrypt.PtrEncKey = PtrEncKey;
+        buildDecrypt.SignedObjects = SignedObjects;
+        buildDecrypt.PtrAuthKey =
+            (UsePtrAuth && hasPtrAuth(Fn)) ? 0 : -1;
+        buildDecrypt.PtrAuthDisc = PtrAuthDisc;
 
         auto FnPtr = buildPageTableDecryptIR(buildDecrypt);
         FnPtr->setName("Call_" + Callee->getName());
