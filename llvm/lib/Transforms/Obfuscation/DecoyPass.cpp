@@ -641,10 +641,8 @@ struct DecoyPass : public FunctionPass {
     Instruction *OldTerm = BB->getTerminator();
     {
       IRBuilder<> B(OldTerm);
-      Value *Opaque = B.CreateLoad(B.getInt64Ty(),
-                                   bcfGetOpaqueGlobal(*F.getParent()),
-                                   /*isVolatile=*/true, bcfName("bcf.ctr"));
-      Value *Cond = bcfBuildOpaqueCond(B, *F.getParent(), Opaque);
+      Value *Opaque = bcfGetOpaqueSource(B, F);
+      Value *Cond = bcfBuildOpaqueCond(B, F, Opaque);
       // env 从函数入口的 alloca 读取（入口已 getenv 一次）。
       Value *Env =
           B.CreateLoad(Type::getInt32Ty(Ctx), EnvSlot, bcfName("bcf.env"));
