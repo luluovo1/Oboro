@@ -614,6 +614,16 @@ static Value *buildMBAXor(IRBuilder<NoFolder> &IRB, Value *A, Value *B, unsigned
   }
 }
 
+// Fill the full APInt width, not just the low 64 bits.  The old
+// get_uint64_t()+ConstantInt::get() path zero-extended for i128 constants,
+// halving the effective key space.
+static APInt getRandomAPInt(CryptoUtils &RE, unsigned BitWidth) {
+  APInt Result = APInt::getZero(BitWidth);
+  for (unsigned Offset = 0; Offset < BitWidth; Offset += 64)
+    Result |= APInt(BitWidth, RE.get_uint64_t()) << Offset;
+  return Result;
+}
+
 Value * encryptConstant(Constant *plainConstant, Instruction *insertBefore, CryptoUtils *randomEngine, unsigned level) {
   auto& Ctx = insertBefore->getContext();
   auto OriginValTy = plainConstant->getType();
@@ -627,13 +637,14 @@ Value * encryptConstant(Constant *plainConstant, Instruction *insertBefore, Cryp
   
   const auto Key = ConstantInt::get(
       IntegerType::get(Ctx, BitWidth),
-      randomEngine->get_uint64_t());
+      getRandomAPInt(*randomEngine, BitWidth));
 
   const auto ConstantIntVal = ConstantExpr::getBitCast(plainConstant, Key->getType());
   auto Enc = ConstantExpr::getSub(ConstantIntVal, Key);
   Constant *XorKey = nullptr;
   if (level) {
-    XorKey = ConstantInt::get(Key->getType(), randomEngine->get_uint64_t());
+    XorKey = ConstantInt::get(Key->getType(),
+                              getRandomAPInt(*randomEngine, BitWidth));
     Enc = ConstantExpr::getXor(Enc, XorKey);
     if (level > 1) {
       Enc = ConstantExpr::getXor(Enc, ConstantExpr::get(Instruction::Mul, XorKey, Key));
@@ -642,7 +653,9 @@ Value * encryptConstant(Constant *plainConstant, Instruction *insertBefore, Cryp
       Enc = ConstantExpr::getXor(Enc, ConstantExpr::getNeg(XorKey));
     }
   }
-  auto EncGV = new GlobalVariable(*insertBefore->getModule(), Enc->getType(), false,
+  // Encrypted constants are never written after emission.  Marking the
+  // global constant moves it to read-only storage instead of .data.
+  auto EncGV = new GlobalVariable(*insertBefore->getModule(), Enc->getType(), true,
                                   GlobalValue::InternalLinkage, Enc);
   EncGV->addMetadata(obf::metaName(*insertBefore->getModule(), "noobf"),
                      *MDNode::get(Ctx, {}));
