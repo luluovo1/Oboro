@@ -47,6 +47,7 @@ constexpr const char *kGeneratedAttr = "oboro.vmp.generated";
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -54,6 +55,7 @@ constexpr const char *kGeneratedAttr = "oboro.vmp.generated";
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <set>
 #include <cstdlib>
 #include <random>
 #include <string>
@@ -365,6 +367,10 @@ private:
   DenseSet<Value *> PinnedSet;
   DenseMap<BasicBlock *, DenseMap<Value *, unsigned>> LastUse;
   SmallVector<uint8_t, 8> FreeRegs;
+  // (predecessor, phi) pairs whose edge copy has been emitted.  Verified once
+  // translation finishes: a PHI that never receives a copy keeps a stale or
+  // zero register, which for a pointer is an immediate wild access.
+  std::set<std::pair<BasicBlock *, PHINode *>> PhiEdgesDone;
   // Set when an icmp has exactly one user, a conditional branch in the same
   // block.  The compare is then emitted by the terminator as one fused opcode.
   // The deferred compare must survive until the terminator consumes it, so it
@@ -936,8 +942,27 @@ bool VMTranslator::translateGEP(GetElementPtrInst &GEP) {
   return true;
 }
 
+// PHI copies on one edge are a *parallel* assignment, not a sequence: two
+// phis may swap their values, and a phi may take its incoming value from
+// another phi of the same block (legal SSA, since the source is defined in the
+// predecessor and only read here).  Emitting the moves in block order would
+// clobber a value that a later move still needs -- exactly the failure that
+// turned a NULL into an argument register in the regex corpus.
+//
+// Standard schedule: repeatedly emit any move whose source is not still a
+// pending destination; when every remaining source is blocked, the pending
+// moves form at least one cycle, so stash one source in a scratch register to
+// break it.
 bool VMTranslator::phiCopiesFor(BasicBlock *From, BasicBlock *To) {
+  struct PendingCopy {
+    uint8_t Dst;
+    uint8_t Src;
+    uint8_t Width;
+  };
+  SmallVector<PendingCopy, 8> Pending;
+
   for (PHINode &PN : To->phis()) {
+    PhiEdgesDone.insert({From, &PN});
     auto It = Regs.find(&PN);
     if (It == Regs.end()) {
       uint8_t R = allocReg();
@@ -954,7 +979,44 @@ bool VMTranslator::phiCopiesFor(BasicBlock *From, BasicBlock *To) {
     uint8_t S = regOf(Src);
     if (Failed)
       return false;
-    emit(OP_MOV, W, Dst, S);
+    if (S != Dst)
+      Pending.push_back({Dst, S, W});
+  }
+
+  // A copy may only run when its destination is not still a source of another
+  // pending copy -- writing it would destroy the old value that copy must read.
+  // The naive condition (source is not a destination) is wrong: for
+  //   %a = phi [%b] ; %b = phi [%a]        (a rotation)
+  // it lets "%a = %b" run first and "%b = %a" then reads the value just
+  // written.  That is exactly how a pointer came out wrong in the regex
+  // state machine.
+  while (!Pending.empty()) {
+    bool Progress = false;
+    for (unsigned I = 0; I < Pending.size(); ++I) {
+      uint8_t Dst = Pending[I].Dst;
+      bool Blocked = false;
+      for (unsigned J = 0; J < Pending.size(); ++J)
+        if (J != I && Pending[J].Src == Dst) {
+          Blocked = true;
+          break;
+        }
+      if (Blocked)
+        continue;
+      emit(OP_MOV, Pending[I].Width, Pending[I].Dst, Pending[I].Src);
+      Pending.erase(Pending.begin() + I);
+      Progress = true;
+      break;
+    }
+    if (Progress)
+      continue;
+    // All remaining sources are live destinations: a cycle exists.  Allocate a
+    // scratch slot (phi registers and their sources are pinned, so this cannot
+    // collide with a live value) and redirect one copy through it.
+    uint8_t Tmp = allocReg();
+    if (Failed)
+      return false;
+    emit(OP_MOV, Pending[0].Width, Tmp, Pending[0].Src);
+    Pending[0].Src = Tmp;
   }
   return true;
 }
@@ -1001,8 +1063,8 @@ bool VMTranslator::translateSwitch(SwitchInst &SI) {
   // here has proven unreliable for targets that are also loop headers, so the
   // function is skipped instead of risking wrong register state.
   BasicBlock *Default = SI.getDefaultDest();
-  if (hasPhi(Default))
-    return fail("switch default into a phi block");
+  if (hasPhi(Default) && !phiCopiesFor(From, Default))
+    return false;
   emitFixup(OP_BR, 0, 0, 0, 0, 0, Default);
   return true;
 }
@@ -1781,6 +1843,24 @@ bool VMTranslator::run() {
     if (It == BlockPC.end())
       return fail("branch to unreachable block");
     Program.Code[FX.first].Imm = It->second;
+  }
+
+  // Every PHI of every translated block must have been copied on every
+  // reachable incoming edge.  This is a structural invariant: if a copy is
+  // missing, the destination register holds whatever the previous block left
+  // behind, which for a pointer means a wild access at run time.  Checking it
+  // here costs one skipped function, not a corrupt binary.
+  for (BasicBlock &BB : F) {
+    if (!BlockPC.count(&BB))
+      continue;
+    for (PHINode &PN : BB.phis()) {
+      for (BasicBlock *Pred : predecessors(&BB)) {
+        if (!BlockPC.count(Pred))
+          continue;
+        if (!PhiEdgesDone.count({Pred, &PN}))
+          return fail(Twine("phi edge not copied for ") + PN.getName());
+      }
+    }
   }
 
   Program.Key = nextRand() | 1;
