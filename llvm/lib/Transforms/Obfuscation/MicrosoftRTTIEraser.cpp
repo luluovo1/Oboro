@@ -13,6 +13,8 @@
 #include "llvm/Support/BLAKE3.h"
 #include "llvm/Transforms/Obfuscation/MicrosoftRTTIEraser.h"
 
+#include <chrono>
+
 #define DEBUG_TYPE "ms_rtti_eraser"
 
 
@@ -38,10 +40,12 @@ public:
 
   bool runOnModule(Module &M) override {
     auto &seed = ArgsOptions->randomSeed();
-    if (seed.empty()) {
-      report_fatal_error(
-          "No random seed found in config file, but rtti eraser enabled.");
-    }
+    // A pass must never abort the compiler because a config file is missing.
+    // Fall back to a per-run random seed: the output is still opaque, and an
+    // explicit "seed" in the config keeps builds reproducible.
+    if (seed.empty())
+      seed = std::to_string(
+          std::chrono::system_clock::now().time_since_epoch().count());
     bool         changed = false;
     LLVMContext &ctx = M.getContext();
     for (GlobalVariable &gv : M.globals()) {
