@@ -29,12 +29,17 @@ All obfuscation flags are passed to the compiler via `-mllvm -<flag>`.
 | `-irobf-fla` | bool | false | Control-flow flattening: scatter all basic blocks into a switch dispatcher · [before/after](#fla-control-flow-flattening) |
 | `-irobf-bcf` | bool | false | Bogus control flow: inject branches that can never be taken · [before/after](#bcf-bogus-control-flow) |
 | `-irobf-bcf_prob` | int | 70 | BCF injection probability (0-100); higher = denser protection |
-| `-irobf-indbr` | bool | false | Indirect branches: jump targets decrypted at runtime, triggering IDA JUMPOUT · [before/after](#indbr-indirect-branches) |
+| `-irobf-bcf_budget_pct` | int | 20 | Fraction of eligible blocks to protect per function, 0-100; 0 = no percentage (falls back to 20% when budget is also 0) |
+| `-irobf-bcf_budget` | int | 0 | Absolute site cap (0 = none); when >0, the smaller of the two applies, and it applies alone when the percentage is 0 |
+| `-irobf-indbr` | bool | false | Indirect branches: jump targets decrypted at runtime · [before/after](#indbr-indirect-branches) |
 | `-level-indbr` | int | 0 | Indirect-branch encryption loop layers (1 recommended, 3+ with caution) |
+| `-irobf-indbr_full` | bool | false | Route unconditional `br` through the encrypted page table too (full CFG edge indirection). Under O2, single-target `indirectbr` may be folded back; multi-target conditional edges survive |
+| `-irobf-indbr_split` | int | 0 | Split basic blocks to at most N instructions before indirection (0 = off, max 256 new blocks per function) |
 | `-irobf-icall` | bool | false | Indirect calls: function addresses decrypted at runtime · [before/after](#icall-indirect-calls) |
 | `-level-icall` | int | 0 | Indirect-call encryption loop layers (1 recommended) |
 | `-irobf-indgv` | bool | false | Indirect global variables: global access addresses decrypted at runtime |
 | `-level-indgv` | int | 0 | Global-variable encryption loop layers (1 recommended; Lv3 is extremely costly) |
+| `-irobf-ptrauth` | bool | false | AArch64 PAC: a module constructor signs indirect pointer tables and uses authenticate them (requires `+pauth`; off by default, opt-in only). Config key: `"ptrauth": true`. **Note**: incompatible with Darwin arm64e `-fptrauth-init-fini`, which signs existing ctor entries while this pass inserts a raw one; dyld authentication fails and the process crashes before `main` |
 | `-irobf-cse` | bool | false | String encryption: C string literals decrypted at runtime · [before/after](#cse-string-encryption) |
 | `-irobf-cie` | bool | false | Integer constant encryption (e.g. `0xDEADBEEF`) · [before/after](#cie-integer-constant-encryption) |
 | `-level-cie` | int | 0 | Integer constant encryption strength |
@@ -67,6 +72,8 @@ Puts all basic blocks of a function into a switch-loop dispatcher, hiding the or
 ```bash
 -mllvm -irobf-bcf
 -mllvm -irobf-bcf_prob=70      # optional, per-block injection probability 0~100, default 70
+-mllvm -irobf-bcf_budget_pct=20   # optional, protect 20% of eligible blocks (default)
+-mllvm -irobf-bcf_budget=16       # optional, absolute cap; min(pct, cap) applies
 -mllvm -irobf-bcf_pred=3       # optional, force predicate family 1~12 (0=random, testing)
 ```
 
@@ -188,7 +195,6 @@ Testing knobs (hidden): `-mllvm -irobf-force-decoy`, `-mllvm -irobf-force-real`,
 -mllvm -irobf-indbr
 -mllvm -level-indbr=1        # optional, encryption loop layers, higher = stronger
 ```
-Branch targets are XOR-decrypted at runtime through an encrypted page table, so IDA cannot statically resolve jump targets (triggers `JUMPOUT`).
 
 #### Indirect Calls (ICALL)
 ```bash
@@ -308,12 +314,17 @@ script, never the source**:
 |---|---|
 | `<pass>.enable` | On/off switch (`true`/`false`) |
 | `<pass>.level` | Encryption strength 0~3 (CIE/CFE/INDBR/ICALL/INDGV) |
+| `bcf.budget_pct` | Fraction of eligible blocks to protect, 0-100 (default 20) |
+| `bcf.budget` | Absolute BCF site cap (0 = none; min(pct, cap) applies) |
+| `cse.shared` | `true` = one shared i8/i16 decryptor per module with runtime lengths (size first); default is one decryptor per string (anti-analysis first). **Config only; there is no command-line flag** |
 | `seed` / `randomSeed` | Fixed 32-hex (16-byte) PRNG seed for **tests / audits / bug reproducers only**; empty means a random seed per build (production default). Never reuse one seed across releases |
 | `deny` | **Red-zone list**: matched functions are never obfuscated, even by annotation |
 | `patterns[].match` | Match demangled function names (class/namespace) |
 | `patterns[].file` | Match the source file name (no path) |
 | `patterns[].bcf.decoy` | decoy eligibility + ratio (0~100) |
 | `patterns[].bcf.decoy_pollute` | L3 value-pollution switch |
+| `patterns[].bcf.budget_pct` | Per-rule BCF percentage (0 = inherit global) |
+| `patterns[].bcf.budget` | Per-rule absolute BCF cap (0 = inherit global) |
 
 ### Matching rules
 

@@ -29,12 +29,18 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 | `-irobf-fla` | bool | false | 控制流平坦化：打散所有基本块至 switch 分发器 · [查看混淆前后效果对比](#fla-控制流平坦化) |
 | `-irobf-bcf` | bool | false | 虚假控制流：注入永远不会到达的假分支 · [查看混淆前后效果对比](#bcf-虚假控制流) |
 | `-irobf-bcf_prob` | int | 70 | BCF 注入概率（0-100），越大执行保护越密集 |
-| `-irobf-indbr` | bool | false | 间接分支：跳转目标运行时解密，触发 IDA JUMPOUT · [查看混淆前后效果对比](#indbr-间接分支) |
+| `-irobf-bcf_budget_pct` | int | 20 | 每函数毒点占可插桩块的百分比（0–100）；0 = 不用百分比（与 budget 都为 0 时按 20%） |
+| `-irobf-bcf_budget` | int | 0 | 毒点绝对上限（0 = 不设）；>0 时与百分比取较小值，百分比为 0 时单独生效 |
+| `-irobf-bcf_sources` | int | 3 | 不透明谓词熵源：1=模块全局池、2=函数栈锚点、3=两者 |
+| `-irobf-indbr` | bool | false | 间接分支：跳转目标运行时解密 · [查看混淆前后效果对比](#indbr-间接分支) |
 | `-level-indbr` | int | 0 | 间接分支加密循环层数（推荐 1，慎用 3+） |
+| `-irobf-indbr_full` | bool | false | 无条件 `br` 也走加密页表（全 CFG 边间接化）。O2 下单目标 `indirectbr` 可能被优化器还原，多目标条件边保留 |
+| `-irobf-indbr_split` | int | 0 | 间接化前把基本块拆到最多 N 条指令（0 = 不拆，每函数新增块上限 256） |
 | `-irobf-icall` | bool | false | 间接调用：函数地址运行时解密 · [查看混淆前后效果对比](#icall-间接函数调用) |
 | `-level-icall` | int | 0 | 间接调用加密循环层数（推荐 1） |
 | `-irobf-indgv` | bool | false | 间接全局变量：全局变量访问地址运行时解密 |
 | `-level-indgv` | int | 0 | 全局变量加密循环层数（推荐 1，Lv3 性能损耗极大） |
+| `-irobf-ptrauth` | bool | false | AArch64 PAC：构造器为间接页表签名、使用点认证（需函数带 `+pauth`；默认关闭，仅显式开启）。config 等价键 `"ptrauth": true`。**注意**：与 Darwin arm64e 的 `-fptrauth-init-fini` 不兼容——该选项会把已有构造器条目签名，而本选项插入的条目仍是裸指针，dyld 认证失败会在 `main` 前崩溃 |
 | `-irobf-cse` | bool | false | 字符串加密：C 字符串常量在运行时解密 · [查看混淆前后效果对比](#cse-字符串加密) |
 | `-irobf-cie` | bool | false | 整数常量加密：对如 `0xDEADBEEF` 等整数加密 · [查看混淆前后效果对比](#cie-整数常量加密) |
 | `-level-cie` | int | 0 | 整数常量加密强度 |
@@ -67,13 +73,18 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 ```bash
 -mllvm -irobf-bcf
 -mllvm -irobf-bcf_prob=70      # 可选，块注入概率 0~100，默认 70
+-mllvm -irobf-bcf_budget_pct=20   # 可选，每函数 20% 的块做毒点（默认）
+-mllvm -irobf-bcf_budget=16       # 可选，绝对上限；与百分比取较小值
+-mllvm -irobf-bcf_sources=3    # 可选，谓词熵源：1=模块全局池 2=栈锚点 3=两者（默认）
 -mllvm -irobf-bcf_pred=3       # 可选，强制谓词族 1~12（0=随机，测试用）
 ```
 
 为每个基本块注入**不透明谓词菱形**：真路走原代码，假路是永不执行的死块（内含
 反编译器毒载荷）。谓词**每次编译随机**从 12 个数学族中选择（全部对 2^64 回绕
 安全、经 InstSimplify 折叠筛选存活），并叠加随机输入变换、随机极性翻转、1/5
-概率双族组合。
+概率双族组合。谓词输入来自**多个独立熵源**：模块级 volatile 全局池与函数栈
+锚点（entry 块 alloca 地址，指针宽度按 DataLayout 取），每个站点独立选源；
+naked / 协程 / 带 personality 或 funclet 的函数自动回退到全局池。
 
 生产权重只使用规则引擎不可折叠的族（5/8 连续积链、9/11 popcount、12 八连积），
 按 d810 代理（`obftest/d810_proxy.py`）实测：这 5 族的规则可折叠率为 **0%**；
@@ -173,7 +184,8 @@ L3 站点。
 -mllvm -irobf-indbr
 -mllvm -level-indbr=1        # 可选，加密循环层数，越高越强
 ```
-条件分支目标地址通过加密页表（PageTable）在运行时 XOR 解密后跳转，IDA 无法静态分析跳转目标（触发 `JUMPOUT`）。
+条件分支目标地址通过加密页表（PageTable）在运行时 XOR 解密后跳转，IDA 无法静态分析跳转目标。
+
 
 #### 间接调用 (ICALL)
 ```bash
@@ -292,12 +304,17 @@ L3 站点。
 |---|---|
 | `<pass>.enable` | 开关（`true`/`false`） |
 | `<pass>.level` | 加密强度 0~3（CIE/CFE/INDBR/ICALL/INDGV 有效） |
+| `bcf.budget_pct` | BCF 每函数毒点占可插桩块的百分比（0–100，默认 20） |
+| `bcf.budget` | BCF 毒点绝对上限（0 = 不设；>0 时与百分比取较小值） |
+| `cse.shared` | `true` = 全模块共用 i8/i16 各一个解密器（长度运行期传参），体积优先；默认每个字符串独立解密器（抗分析优先）。**仅 config 可用，没有对应命令行开关** |
 | `seed` / `randomSeed` | 32 位十六进制（16 字节）固定随机种子，**仅用于测试/审计/问题复现**；不填则每次构建随机（生产默认）。不要跨版本复用同一个 seed |
 | `deny` | **红区名单**：命中的函数永不混淆，注解也无法解锁 |
 | `patterns[].match` | 按 demangled 函数名匹配（类/命名空间） |
 | `patterns[].file` | 按源文件名匹配（不含路径） |
 | `patterns[].bcf.decoy` | decoy 资格 + 比例（0~100） |
 | `patterns[].bcf.decoy_pollute` | L3 值污染开关 |
+| `patterns[].bcf.budget_pct` | 规则内覆盖 BCF 百分比（0 = 继承全局） |
+| `patterns[].bcf.budget` | 规则内覆盖 BCF 绝对上限（0 = 继承全局） |
 
 ### 匹配规则
 
