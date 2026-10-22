@@ -1,8 +1,7 @@
 //===- AuxPasses.cpp - wrapper / block shuffle / block split -------------===//
 //
 // Three structural passes that make the call graph and the CFG less directly
-// readable.  They are deliberately independent of the VMP translator so they
-// can be enabled alone.
+// readable.  Each one is self-contained and can be enabled alone.
 //
 //===----------------------------------------------------------------------===//
 
