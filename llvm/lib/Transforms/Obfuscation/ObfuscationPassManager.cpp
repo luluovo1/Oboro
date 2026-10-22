@@ -96,11 +96,12 @@ static cl::opt<bool>
 EnableBogusControlFlow("irobf-bcf", cl::init(false), cl::NotHidden,
   cl::desc("Enable Bogus Control Flow (causes IDA optimizations loop too much)."),
   cl::ZeroOrMore);
-// 每函数毒点绝对上限。0 = 不设绝对上限；与百分比同时给出时取较小值。
+// 每函数毒点绝对上限。默认 16（与历史行为一致，限制大函数的编译时间）；
+// 显式设 0 表示解除绝对上限，此时只受百分比约束。
 static cl::opt<uint32_t>
-BCFBudget("irobf-bcf_budget", cl::init(0), cl::NotHidden,
+BCFBudget("irobf-bcf_budget", cl::init(16), cl::NotHidden,
           cl::desc("Absolute cap on BCF sites per function "
-                   "(0 = no absolute cap). Default: 0"),
+                   "(0 = no absolute cap). Default: 16"),
           cl::ZeroOrMore);
 
 // 每函数毒点占可插桩块的百分比。0 = 不用百分比（退回绝对上限）；

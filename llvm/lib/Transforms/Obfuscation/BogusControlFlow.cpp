@@ -189,8 +189,9 @@ struct BogusControlFlow : public FunctionPass {
     //   1) budget_pct > 0：按可插桩块数的百分比（向上取整，至少 1 个）；
     //      若同时给了绝对上限 budget > 0，再取 min（双保险）。
     //   2) budget_pct == 0 且 budget > 0：只按绝对上限。
-    //   3) 两者都为 0：等价于“未指定”，回落到默认 20%。0 只表示自动，
-    //      不是“解除限制”，更不会放大到旧档位（大函数 64 个）。
+    //   3) 两者都为 0：等价于“未指定”，回落到默认 20% + 绝对上限 16。
+    // 默认值是 min(16, 20%)：大函数回到历史的 16 个站点（编译时间可控），
+    // 小函数按 20% 进一步收敛。显式 budget=0 才会解除绝对上限。
     static constexpr unsigned DefaultBudgetPct = 20;
     unsigned MaxBlocks = Opt.budget();
     unsigned Pct = Opt.budgetPct();

@@ -29,8 +29,8 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 | `-irobf-fla` | bool | false | 控制流平坦化：打散所有基本块至 switch 分发器 · [查看混淆前后效果对比](#fla-控制流平坦化) |
 | `-irobf-bcf` | bool | false | 虚假控制流：注入永远不会到达的假分支 · [查看混淆前后效果对比](#bcf-虚假控制流) |
 | `-irobf-bcf_prob` | int | 70 | BCF 注入概率（0-100），越大执行保护越密集 |
-| `-irobf-bcf_budget_pct` | int | 20 | 每函数毒点占可插桩块的百分比（0–100）；0 = 不用百分比（与 budget 都为 0 时按 20%） |
-| `-irobf-bcf_budget` | int | 0 | 毒点绝对上限（0 = 不设）；>0 时与百分比取较小值，百分比为 0 时单独生效 |
+| `-irobf-bcf_budget_pct` | int | 20 | 每函数毒点占可插桩块的百分比（0–100）；0 = 不用百分比（此时只受 budget 绝对上限约束） |
+| `-irobf-bcf_budget` | int | 16 | 毒点绝对上限（0 = 不设）；默认与 20% 百分比取较小值，即大函数最多 16 个站点、小函数按 20% |
 | `-irobf-bcf_sources` | int | 3 | 不透明谓词熵源：1=模块全局池、2=函数栈锚点、3=两者 |
 | `-irobf-indbr` | bool | false | 间接分支：跳转目标运行时解密 · [查看混淆前后效果对比](#indbr-间接分支) |
 | `-level-indbr` | int | 0 | 间接分支加密循环层数（推荐 1，慎用 3+） |

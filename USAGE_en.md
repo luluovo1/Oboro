@@ -29,8 +29,8 @@ All obfuscation flags are passed to the compiler via `-mllvm -<flag>`.
 | `-irobf-fla` | bool | false | Control-flow flattening: scatter all basic blocks into a switch dispatcher · [before/after](#fla-control-flow-flattening) |
 | `-irobf-bcf` | bool | false | Bogus control flow: inject branches that can never be taken · [before/after](#bcf-bogus-control-flow) |
 | `-irobf-bcf_prob` | int | 70 | BCF injection probability (0-100); higher = denser protection |
-| `-irobf-bcf_budget_pct` | int | 20 | Fraction of eligible blocks to protect per function, 0-100; 0 = no percentage (falls back to 20% when budget is also 0) |
-| `-irobf-bcf_budget` | int | 0 | Absolute site cap (0 = none); when >0, the smaller of the two applies, and it applies alone when the percentage is 0 |
+| `-irobf-bcf_budget_pct` | int | 20 | Fraction of eligible blocks to protect per function, 0-100; 0 = no percentage (the absolute cap alone applies) |
+| `-irobf-bcf_budget` | int | 16 | Absolute site cap (0 = none); by default the smaller of this and the 20% share applies, so large functions stop at 16 sites while small ones follow the percentage |
 | `-irobf-indbr` | bool | false | Indirect branches: jump targets decrypted at runtime · [before/after](#indbr-indirect-branches) |
 | `-level-indbr` | int | 0 | Indirect-branch encryption loop layers (1 recommended, 3+ with caution) |
 | `-irobf-indbr_full` | bool | false | Route unconditional `br` through the encrypted page table too (full CFG edge indirection). Under O2, single-target `indirectbr` may be folded back; multi-target conditional edges survive |
