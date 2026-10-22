@@ -236,7 +236,9 @@ struct ObfuscationPassManager : public ModulePass {
 
     // 字符串加密必须在间接全局变量之前：否则 INDGV 先把字符串全局的
     // 使用点改写成页表对象，CSE 认不出这些常量串，导致 full 组合下明文泄露。
-    if (EnableIRStringEncryption || Options->cseOpt()->isEnabled()) {
+    // 同 BCF：pattern / 注解也可能单独开启 CSE，不能只看全局开关。
+    if (EnableIRStringEncryption ||
+        Options->mayBeEnabled(Options->cseOpt(), M)) {
       add(llvm::createStringEncryptionPass(Options.get()));
     }
 
