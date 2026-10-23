@@ -54,7 +54,7 @@ Add obfuscation flags via `target_compile_options` in your `CMakeLists.txt`:
 target_compile_options(your_target PRIVATE
     -mllvm -irobf-cse
     -mllvm -irobf-icall
-    -mllvm -irobf-indbr -mllvm -level-indbr=1
+    -mllvm -irobf-indbr -mllvm -irobf-level=1
 )
 ```
 
@@ -111,13 +111,13 @@ Suited for enabling on regular business logic across an entire project. Binary s
 target_compile_options(your_target PRIVATE
     -mllvm -irobf-cse
     -mllvm -irobf-icall
-    -mllvm -irobf-indbr -mllvm -level-indbr=1
+    -mllvm -irobf-indbr -mllvm -irobf-level=1
 )
 ```
 
 ```bash
 # Direct clang usage
-clang -O2 -mllvm -irobf-cse -mllvm -irobf-icall -mllvm -irobf-indbr -mllvm -level-indbr=1 foo.c -o foo
+clang -O2 -mllvm -irobf-cse -mllvm -irobf-icall -mllvm -irobf-indbr -mllvm -irobf-level=1 foo.c -o foo
 ```
 
 ### Tier 2: Core algorithms & crypto functions
@@ -138,7 +138,7 @@ Or enable per translation unit via compile flags:
 
 ```bash
 clang -O2 -mllvm -irobf-fla -mllvm -irobf-icall -mllvm -irobf-indbr \
-      -mllvm -irobf-cse -mllvm -irobf-bcf -mllvm -irobf-bcf_prob=80 \
+      -mllvm -irobf-cse -mllvm -irobf-bcf=80 \
       crypto.c -o crypto.o
 ```
 
@@ -150,14 +150,14 @@ Only **data-layer** obfuscation is recommended:
 
 ```bash
 # For rendering/physics and other performance-critical modules
-clang -O2 -mllvm -irobf-cse -mllvm -irobf-cie -mllvm -level-cie=1 hotpath.c -o hotpath.o
+clang -O2 -mllvm -irobf-cse -mllvm -irobf-cie -mllvm -irobf-level=1 hotpath.c -o hotpath.o
 ```
 
 > For performance-sensitive modules, encrypt *data* (strings, constants) and leave *control flow* (branches, jumps) alone — the golden rule.
 
 ### About the Level flags
 
-`-level-indbr`, `-level-icall` and `-level-indgv` control the number of XOR decryption loop layers at runtime. **The higher the level, the harder to reverse — and the cost grows exponentially.**
+`-irobf-level` sets the runtime XOR decryption loop layers for every pass that has a level (INDBR / ICALL / INDGV / CIE / CFE / rename). **The higher the level, the harder to reverse — and the cost grows exponentially.** To tune one pass alone, use its config node, e.g. `"indgv": {"level": 1}`.
 
 | Level | Extra overhead (reference) | Use case |
 |:---:|:---:|:---|
@@ -165,7 +165,7 @@ clang -O2 -mllvm -irobf-cse -mllvm -irobf-cie -mllvm -level-cie=1 hotpath.c -o h
 | `2` | `+120% ~ +250%` | Core functions, non-hot paths |
 | `3` | `+300% ~ +470%` | Maximum protection, non-loop code |
 
-**Warning**: `-level-indgv=3` triggers multi-layer decryption loops on *every* global variable access — on game-state reads or render-pipeline globals this easily causes Android ANR.
+**Warning**: `"indgv": {"level": 3}` triggers multi-layer decryption loops on *every* global variable access — on game-state reads or render-pipeline globals this easily causes Android ANR.
 
 ## License
 

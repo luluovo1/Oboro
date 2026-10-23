@@ -54,7 +54,7 @@
 target_compile_options(your_target PRIVATE
     -mllvm -irobf-cse
     -mllvm -irobf-icall
-    -mllvm -irobf-indbr -mllvm -level-indbr=1
+    -mllvm -irobf-indbr -mllvm -irobf-level=1
 )
 ```
 
@@ -111,13 +111,13 @@ clang -O2 -mllvm -irobf-cse -mllvm -irobf-icall foo.c -o foo
 target_compile_options(your_target PRIVATE
     -mllvm -irobf-cse
     -mllvm -irobf-icall
-    -mllvm -irobf-indbr -mllvm -level-indbr=1
+    -mllvm -irobf-indbr -mllvm -irobf-level=1
 )
 ```
 
 ```bash
 # clang 直接使用
-clang -O2 -mllvm -irobf-cse -mllvm -irobf-icall -mllvm -irobf-indbr -mllvm -level-indbr=1 foo.c -o foo
+clang -O2 -mllvm -irobf-cse -mllvm -irobf-icall -mllvm -irobf-indbr -mllvm -irobf-level=1 foo.c -o foo
 ```
 
 ### 第二档：核心算法和加密函数保护
@@ -138,7 +138,7 @@ int verify_license(const char* key) {
 
 ```bash
 clang -O2 -mllvm -irobf-fla -mllvm -irobf-icall -mllvm -irobf-indbr \
-      -mllvm -irobf-cse -mllvm -irobf-bcf -mllvm -irobf-bcf_prob=80 \
+      -mllvm -irobf-cse -mllvm -irobf-bcf=80 \
       crypto.c -o crypto.o
 ```
 
@@ -150,14 +150,14 @@ clang -O2 -mllvm -irobf-fla -mllvm -irobf-icall -mllvm -irobf-indbr \
 
 ```bash
 # 对渲染/物理等高性能模块
-clang -O2 -mllvm -irobf-cse -mllvm -irobf-cie -mllvm -level-cie=1 hotpath.c -o hotpath.o
+clang -O2 -mllvm -irobf-cse -mllvm -irobf-cie -mllvm -irobf-level=1 hotpath.c -o hotpath.o
 ```
 
 > 性能敏感模块只加密"数据"（字符串、常量），不干扰"控制流"（分支、跳转），是高性能场景下的黄金原则。
 
 ### Level 参数注意事项
 
-`-level-indbr`、`-level-icall`、`-level-indgv` 这三个参数控制的是运行时解密时的 XOR 循环层数。**Level 越高，逆向越难，性能损耗也呈指数级增长。**
+`-irobf-level` 统一控制所有支持档位的功能（INDBR / ICALL / INDGV / CIE / CFE / rename）的运行时解密循环层数。**Level 越高，逆向越难，性能损耗也呈指数级增长。** 需要单个功能单独调档时，用 config 的对应节点，例如 `"indgv": {"level": 1}`。
 
 | Level 值 | 性能额外开销（参考）| 适用场景 |
 |:---:|:---:|:---|
@@ -165,7 +165,7 @@ clang -O2 -mllvm -irobf-cse -mllvm -irobf-cie -mllvm -level-cie=1 hotpath.c -o h
 | `2` | `+120% ~ +250%` | 核心函数，非热路径 |
 | `3` | `+300% ~ +470%` | 极限保护，非循环代码 |
 
-**禁忌**：`-level-indgv=3` 在每次访问全局变量时都触发多层解密循环，对含游戏状态读取、渲染管线全局变量等高频访问场景，极易导致 Android ANR。
+**禁忌**：`"indgv": {"level": 3}` 会在每次访问全局变量时都触发多层解密循环，对含游戏状态读取、渲染管线全局变量等高频访问场景，极易导致 Android ANR。
 
 ## 许可
 

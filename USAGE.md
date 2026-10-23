@@ -23,39 +23,60 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 
 所有混淆参数通过 `-mllvm -<参数名>` 传递给编译器。
 
-| 参数名 | 类型 | 默认值 | 说明 |
+| 参数名 | 取值 | 默认值 | 说明 |
 |:---|:---:|:---:|:---|
-| `-irobf` | bool | false | 全局启用混淆（配合配置文件使用） |
-| `-irobf-fla` | bool | false | 控制流平坦化：打散所有基本块至 switch 分发器 · [查看混淆前后效果对比](#fla-控制流平坦化) |
-| `-irobf-bcf` | bool | false | 虚假控制流：注入永远不会到达的假分支 · [查看混淆前后效果对比](#bcf-虚假控制流) |
-| `-irobf-bcf_prob` | int | 70 | BCF 注入概率（0-100），越大执行保护越密集 |
-| `-irobf-bcf_budget_pct` | int | 20 | 每函数毒点占可插桩块的百分比（0–100）；0 = 不用百分比（此时只受 budget 绝对上限约束） |
-| `-irobf-bcf_budget` | int | 16 | 毒点绝对上限（0 = 不设）；默认与 20% 百分比取较小值，即大函数最多 16 个站点、小函数按 20% |
-| `-irobf-bcf_sources` | int | 3 | 不透明谓词熵源：1=模块全局池、2=函数栈锚点、3=两者 |
-| `-irobf-indbr` | bool | false | 间接分支：跳转目标运行时解密 · [查看混淆前后效果对比](#indbr-间接分支) |
-| `-level-indbr` | int | 0 | 间接分支加密循环层数（推荐 1，慎用 3+） |
-| `-irobf-indbr_full` | bool | false | 无条件 `br` 也走加密页表（全 CFG 边间接化）。O2 下单目标 `indirectbr` 可能被优化器还原，多目标条件边保留 |
-| `-irobf-indbr_split` | int | 0 | 间接化前把基本块拆到最多 N 条指令（0 = 不拆，每函数新增块上限 256） |
-| `-irobf-icall` | bool | false | 间接调用：函数地址运行时解密 · [查看混淆前后效果对比](#icall-间接函数调用) |
-| `-level-icall` | int | 0 | 间接调用加密循环层数（推荐 1） |
-| `-irobf-indgv` | bool | false | 间接全局变量：全局变量访问地址运行时解密 |
-| `-level-indgv` | int | 0 | 全局变量加密循环层数（推荐 1，Lv3 性能损耗极大） |
-| `-irobf-ptrauth` | bool | false | AArch64 PAC：构造器为间接页表签名、使用点认证（需函数带 `+pauth`；默认关闭，仅显式开启）。config 等价键 `"ptrauth": true`。**注意**：与 Darwin arm64e 的 `-fptrauth-init-fini` 不兼容——该选项会把已有构造器条目签名，而本选项插入的条目仍是裸指针，dyld 认证失败会在 `main` 前崩溃 |
-| `-irobf-cse` | bool | false | 字符串加密：C 字符串常量在运行时解密 · [查看混淆前后效果对比](#cse-字符串加密) |
-| `-irobf-cie` | bool | false | 整数常量加密：对如 `0xDEADBEEF` 等整数加密 · [查看混淆前后效果对比](#cie-整数常量加密) |
-| `-level-cie` | int | 0 | 整数常量加密强度 |
-| `-irobf-cfe` | bool | false | 浮点常量加密：对 double/float 字面量加密 · [查看混淆前后效果对比](#cfe-浮点常量加密) |
-| `-level-cfe` | int | 0 | 浮点常量加密强度 |
-| `-irobf-rtti` | bool | false | 擦除 C++ RTTI 类型信息（实验性） |
-| `-irobf-indbr-dual` | bool | false | 双目标间接跳转：条件分支 → `indirectbr(select(cond, blockaddress(T), blockaddress(F)))`，在末端管线执行；与页表模式二选一 |
-| `-irobf-rename` | bool | false | 内部符号随机重命名（函数/全局/别名）；导出符号与 `main` 保留 |
-| `-level-rename` | int | 0 | 重命名级别：1=函数，2=含全局，3=额外剥离调试信息 |
-| `-irobf-fwrap` | bool | false | 为直接调用插入内部转发函数，打断调用图 |
-| `-irobf-fwrap_prob` | int | 100 | 每个函数被包装的概率（0-100） |
-| `-irobf-shuffle` | bool | false | 基本块物理顺序随机化（末端执行） |
-| `-irobf-split` | bool | false | 优化后切分基本块，阻止 SimplifyCFG 合并 |
-| `-irobf-split_num` | int | 3 | 每函数最多切分次数 |
-| `-oboro-cfg` | string | "" | 指向 JSON 格式的混淆配置文件路径 |
+| **入口** | | | |
+| `-irobf` | bool | false | 总开关（配合配置文件使用） |
+| `-oboro-cfg` | string | "" | JSON 配置文件路径 |
+| `-irobf-level` | int | 0 | 所有支持 level 的功能的默认强度 0–3；config 里各功能自己的 `level` 优先 |
+| **OLLVM 原有** | | | |
+| `-irobf-indbr` | `[=table\|full\|dual]` | 关闭 | 间接分支。不带值 = `table`（页表）；`full` = 无条件 `br` 也走页表；`dual` = 双目标 `blockaddress`（末端执行） |
+| `-irobf-icall` | bool | false | 间接调用 |
+| `-irobf-indgv` | bool | false | 间接全局变量 |
+| `-irobf-fla` | bool | false | 控制流平坦化 |
+| `-irobf-cse` | bool | false | 字符串加密 |
+| `-irobf-cie` | bool | false | 整数常量加密 |
+| `-irobf-cfe` | bool | false | 浮点常量加密 |
+| `-irobf-rtti` | bool | false | 擦除 MSVC RTTI |
+| **新功能** | | | |
+| `-irobf-bcf` | `[=0..100]` | 关闭 | 虚假控制流 v2。不带值 = 强度 70 |
+| `-irobf-decoy` | `[=0..100]` | 关闭 | 运行时诱饵路径（独立功能，不依赖 BCF）。不带值 = 30% 的站点走诱饵菱形，其余为纯 poison |
+| `-irobf-rename` | bool | false | 内部符号随机重命名：函数 + 全局 + 别名。只对仍存在的 internal 符号生效（O1+ 会内联掉大部分）。调试信息不归本 pass 管，发布构建用 `-g0` 或 `strip --strip-debug` |
+| `-irobf-aux` | `[=wrap,shuffle,split]` | 关闭 | 结构性后处理。不带值 = 三项全开 |
+
+### 各功能的子配置（只走 config）
+
+每个功能只接受自己域内的字段；写了不属于该功能的字段会打印 warning 并忽略。
+
+| 功能 | 字段 | 默认 | 说明 |
+|:---|:---|:---:|:---|
+| `indbr` | `mode` | `table` | `table` / `full` / `dual` |
+| | `split` | 0 | 间接化前把块拆到最多 N 条指令（0 = 不拆） |
+| | `level` | 0 | 解密循环层数 1–3 |
+| `icall` / `indgv` / `cie` / `cfe` | `level` | 0 | 各自的强度 |
+| `cse` | `shared` | false | 全模块共用一个解密器（体积优先） |
+| `bcf` | `strength` | 70 | 站点概率 0–100 |
+| | `budget` | 16 | 每函数站点绝对上限（0 = 不限） |
+| | `budget_pct` | 20 | 占可插桩块百分比（0 = 不用） |
+| `decoy` | `ratio` | 30 | 站点中诱饵菱形的比例（0–100），其余站点为纯 poison |
+| | `pollute` | false | L3 值污染 |
+| | `probe` | `__oboro_probe` | App 提供的 probe 符号名 |
+| `aux` | `wrap` | 100 | 转发包装概率 |
+| | `shuffle` | true | 基本块乱序 |
+| | `split` | 3 | 每函数最多切几刀 |
+
+全局字段：`seed` / `randomSeed`、`ptrauth`、`deny`、`patterns`。
+
+### 附加 pass 的边界
+
+| 项 | 行为 |
+|---|---|
+| `-irobf-aux=wrap` | 默认 100% 全量包装，体积明显增加。只对 ABI 安全的函数生效（跳过 `main`、vararg、`alwaysinline`、`byval`/`sret`/`inalloca`、probe 符号） |
+| `-irobf-aux=shuffle` | 只改基本块物理顺序，不改 CFG |
+| `-irobf-aux=split` | 每函数最多切 `aux.split` 刀（默认 3，上限 7） |
+| `-irobf-indbr=dual` | 双目标 `blockaddress`，**不做块拆分**（`indbr.split` 对 dual 无效），与页表模式互斥 |
+
+隐藏的测试开关（不要用于生产）：`-irobf-bcf_pred`、`-irobf-bcf_topo`、`-irobf-force-decoy`、`-irobf-force-real`、`-irobf-debug-names`。
 
 ---
 
@@ -77,13 +98,11 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 ```
 将函数内所有基本块放入一个 switch-loop 分发器，隐藏原始控制流结构。switch 值通过 XOR 加密，对抗 IDA 值追踪。
 
+> 超过 50 个基本块的函数自动跳过：平坦化会让 switch 分发器和 PHI 数量爆炸（zlib 的 `inflate`/`deflate` 实测 90s 不收敛）。
+
 #### 虚假控制流 (BCF) v2
 ```bash
--mllvm -irobf-bcf
--mllvm -irobf-bcf_prob=70      # 可选，块注入概率 0~100，默认 70
--mllvm -irobf-bcf_budget_pct=20   # 可选，每函数 20% 的块做毒点（默认）
--mllvm -irobf-bcf_budget=16       # 可选，绝对上限；与百分比取较小值
--mllvm -irobf-bcf_sources=3    # 可选，谓词熵源：1=模块全局池 2=栈锚点 3=两者（默认）
+-mllvm -irobf-bcf=70      # 可选，块注入概率 0~100，默认 70
 -mllvm -irobf-bcf_pred=3       # 可选，强制谓词族 1~12（0=随机，测试用）
 ```
 
@@ -108,7 +127,7 @@ Hex-Rays `sp-analysis failed`）；x86_64 用随机字节序列制造 JUMPOUT（
 
 ```bash
 # 对所有块强制 100% 注入
-clang -O2 -mllvm -irobf-bcf -mllvm -irobf-bcf_prob=100 test.c -o test
+clang -O2 -mllvm -irobf-bcf=100 test.c -o test
 ```
 
 > 运行安全：谓词在数学上恒真，死块永不执行；安全性来自「不可达」，不是
@@ -138,18 +157,18 @@ extern "C" int __oboro_probe(void) {
 }
 ```
 
-**资格门**：decoy 只能由**函数注解**或 **config pattern** 显式声明，命令行
-（.mk / CMake）永远打不开——避免一行全局参数把 decoy 铺到所有函数。
+**启用方式**：`-irobf-decoy[=比例]` 全局开启（默认 30% 函数），或用**函数注解** / **config pattern** 按函数精确控制。
+decoy 是独立功能域，不依赖 `-irobf-bcf`。
 
 ```c
-__attribute__((annotate("+bcf_decoy")))          // 该函数启用 decoy（L1）
-__attribute__((annotate("^bcf_decoy=50")))       // 50% 的 BCF 站点走诱饵
-__attribute__((annotate("+bcf_decoy_pollute")))  // 升级到 L3 值污染
+__attribute__((annotate("+decoy")))          // 该函数启用 decoy（L1）
+__attribute__((annotate("^decoy=50")))       // 该函数 50% 的站点走诱饵
+__attribute__((annotate("+decoy_pollute")))  // 升级到 L3 值污染
 ```
 
 ```json
 { "patterns": [
-  { "match": "Crypto::**", "bcf": { "enable": true, "decoy": 80, "decoy_pollute": true } }
+  { "match": "Crypto::**", "decoy": { "enable": true, "ratio": 80, "pollute": true } }
 ] }
 ```
 
@@ -166,9 +185,8 @@ L3 站点。
 派生、不落盘；每次函数调用校验两份 share，不一致则置粘性 `tampered`，后续全部
 走诱饵。没有运行时采样。
 
-测试开关（hidden）：`-mllvm -irobf-force-decoy`（强制诱饵）、
-`-mllvm -irobf-force-real`（强制真实）、`-mllvm -irobf-probe-symbol=xxx`
-（自定义 probe 符号名）。
+测试开关（hidden）：`-mllvm -irobf-force-decoy`（强制诱饵）、`-mllvm -irobf-force-real`（强制真实）。
+自定义 probe 符号名走 config：`"decoy": {"probe": "my_probe"}`。
 
 > 无 probe、未初始化、probe 签名不匹配 → 默认走真实路径（fail-open），
 > 保证产物在真机 / 模拟器 / 云手机 / 任意架构上都能稳定运行。
@@ -190,7 +208,7 @@ L3 站点。
 #### 间接分支 (INDBR)
 ```bash
 -mllvm -irobf-indbr
--mllvm -level-indbr=1        # 可选，加密循环层数，越高越强
+-mllvm -irobf-level=1        # 可选，解密循环层数 1~3
 ```
 条件分支目标地址通过加密页表（PageTable）在运行时 XOR 解密后跳转，IDA 无法静态分析跳转目标。
 
@@ -198,14 +216,12 @@ L3 站点。
 #### 间接调用 (ICALL)
 ```bash
 -mllvm -irobf-icall
--mllvm -level-icall=1        # 可选
 ```
 将直接函数调用替换为经过加密页表间接化的调用，函数地址在运行时动态解密。
 
 #### 全局变量间接化 (INDGV)
 ```bash
 -mllvm -irobf-indgv
--mllvm -level-indgv=1        # 可选
 ```
 全局变量的访问地址通过加密页表间接化，防止逆向工具静态定位全局变量。
 
@@ -222,14 +238,13 @@ L3 站点。
 #### 整数常量加密 (CIE)
 ```bash
 -mllvm -irobf-cie
--mllvm -level-cie=1          # 可选
+-mllvm -irobf-level=1          # 可选
 ```
 对整数类型的常量进行运行时解密保护。
 
 #### 浮点常量加密 (CFE)
 ```bash
 -mllvm -irobf-cfe
--mllvm -level-cfe=1          # 可选
 ```
 对浮点类型的常量进行加密。
 
@@ -260,20 +275,19 @@ L3 站点。
 -mllvm -irobf-icall \
 -mllvm -irobf-indbr \
 -mllvm -irobf-cse \
--mllvm -irobf-bcf -mllvm -irobf-bcf_prob=80
+-mllvm -irobf-bcf=80
 ```
 
 ### 最强混淆（完全）
 ```bash
 -mllvm -irobf-fla \
 -mllvm -irobf-icall \
--mllvm -level-icall=1 \
 -mllvm -irobf-indbr \
--mllvm -level-indbr=1 \
+-mllvm -irobf-level=1 \
 -mllvm -irobf-indgv \
 -mllvm -irobf-cse \
 -mllvm -irobf-cie \
--mllvm -irobf-bcf -mllvm -irobf-bcf_prob=100
+-mllvm -irobf-bcf=100
 ```
 
 ---
@@ -290,7 +304,8 @@ L3 站点。
 
 ```json
 {
-  "bcf":  { "enable": true, "level": 1 },
+  "bcf":  { "enable": true, "strength": 70, "budget": 16, "budget_pct": 20 },
+  "decoy": { "enable": true, "ratio": 30 },
   "fla":  { "enable": true },
   "cse":  { "enable": true },
 
@@ -299,8 +314,8 @@ L3 站点。
   "deny": ["MyCodec::*", "vendor::**"],
 
   "patterns": [
-    { "match": "crypto::aes::**", "bcf": { "decoy": 80, "decoy_pollute": true } },
-    { "match": "License::verify", "bcf": { "decoy": 50 } },
+    { "match": "crypto::aes::**", "decoy": { "ratio": 80, "pollute": true } },
+    { "match": "License::verify", "decoy": { "ratio": 50 } },
     { "file": "*generated_*.cpp", "bcf": { "enable": false } }
   ]
 }
@@ -311,18 +326,29 @@ L3 站点。
 | 字段 | 含义 |
 |---|---|
 | `<pass>.enable` | 开关（`true`/`false`） |
-| `<pass>.level` | 加密强度 0~3（CIE/CFE/INDBR/ICALL/INDGV 有效） |
-| `bcf.budget_pct` | BCF 每函数毒点占可插桩块的百分比（0–100，默认 20） |
-| `bcf.budget` | BCF 毒点绝对上限（0 = 不设；>0 时与百分比取较小值） |
+| `indbr.mode` | `table` / `full` / `dual` |
+| `indbr.split` | 间接化前把块拆到最多 N 条指令（0 = 不拆） |
+| `indbr.level` / `icall.level` / `indgv.level` | 0 = 全模块共享页表（体积优先），1~3 = 每函数独立页表 + 解密循环层数 |
+| `cie.level` / `cfe.level` | 加密强度 0~3，默认 2（0 = 只做一次减法，最弱） |
+| `bcf.strength` | 站点概率 0–100（默认 70） |
+| `bcf.budget_pct` | 每函数毒点占可插桩块的百分比（0–100，默认 20）。与 `budget` 都为 0 时回落到 16/20%，**不是不限** |
+| `bcf.budget` | 毒点绝对上限（0 = 不设；>0 时与百分比取较小值） |
+| `decoy.ratio` | 进入诱饵路径的函数比例（0–100，默认 30） |
+| `decoy.pollute` | L3 值污染（默认 false） |
+| `decoy.probe` | App 提供的 probe 符号名（默认 `__oboro_probe`） |
+| `aux.wrap` / `aux.shuffle` / `aux.split` | 包装概率 / 块乱序 / 每函数切几刀 |
 | `cse.shared` | `true` = 全模块共用 i8/i16 各一个解密器（长度运行期传参），体积优先；默认每个字符串独立解密器（抗分析优先）。**仅 config 可用，没有对应命令行开关** |
 | `seed` / `randomSeed` | 32 位十六进制（16 字节）固定随机种子，**仅用于测试/审计/问题复现**；不填则每次构建随机（生产默认）。不要跨版本复用同一个 seed |
 | `deny` | **红区名单**：命中的函数永不混淆，注解也无法解锁 |
 | `patterns[].match` | 按 demangled 函数名匹配（类/命名空间） |
 | `patterns[].file` | 按源文件名匹配（不含路径） |
-| `patterns[].bcf.decoy` | decoy 资格 + 比例（0~100） |
-| `patterns[].bcf.decoy_pollute` | L3 值污染开关 |
+| `patterns[].decoy.ratio` | 规则内覆盖 decoy 比例 |
+| `patterns[].decoy.pollute` | 规则内覆盖 L3 开关 |
+| `patterns[].bcf.strength` | 规则内覆盖 BCF 概率 |
 | `patterns[].bcf.budget_pct` | 规则内覆盖 BCF 百分比（0 = 继承全局） |
 | `patterns[].bcf.budget` | 规则内覆盖 BCF 绝对上限（0 = 继承全局） |
+
+> 写了不属于该功能域的字段会打印 warning 并忽略（例如给 `fla` 写 `level`）。
 
 ### 匹配规则
 
@@ -390,7 +416,7 @@ CIE/CFE），命令行参数无法绕过。
 
 <img src="images/code_bcf.png" width="800px">
 
-| 原始反汇编（无混淆） | 开启 `-irobf-bcf -irobf-bcf_prob=100` 后 |
+| 原始反汇编（无混淆） | 开启 `-irobf-bcf=100` 后 |
 |:---:|:---:|
 | <img src="images/bcf_org.png" width="400px"> | <img src="images/bcf.png" width="400px"> |
 
@@ -414,7 +440,7 @@ CIE/CFE），命令行参数无法绕过。
 
 <img src="images/code_indbr.png" width="800px">
 
-| 原始反汇编（无混淆） | 开启 `-irobf-indbr -level-indbr=3` 后 |
+| 原始反汇编（无混淆） | 开启 `-irobf-indbr -irobf-level=3` 后 |
 |:---:|:---:|
 | <img src="images/indbr_org.png" width="400px"> | <img src="images/indbr.png" width="400px"> |
 
@@ -459,7 +485,7 @@ CIE/CFE），命令行参数无法绕过。
 clang -O2 test.c -o test_plain.exe
 
 # 编译混淆版本
-clang -O2 -mllvm -irobf-bcf -mllvm -irobf-bcf_prob=100 test.c -o test_bcf.exe
+clang -O2 -mllvm -irobf-bcf=100 test.c -o test_bcf.exe
 
 # 用 IDA 分别载入两个文件，对比反汇编视图（Graph View）差异
 ```
