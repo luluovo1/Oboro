@@ -5,9 +5,12 @@
 // to local symbols.  Exported symbols are deliberately left alone: renaming
 // them would change the ABI and break other translation units.
 //
+// Debug info is out of scope: whether a build carries .debug_* is a build
+// configuration decision (`-g0`, `strip --strip-debug`), not an obfuscation
+// one.  Deleting it here would silently break users who asked for `-g`.
+//
 //===----------------------------------------------------------------------===//
 
-#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/GlobalIFunc.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -69,7 +72,6 @@ struct SymbolRename : public ModulePass {
     if (!Options->renameOpt()->isEnabled())
       return false;
 
-    unsigned Level = Options->renameOpt()->level();
     bool Changed = false;
 
     // Functions first: aliases may point at them.
@@ -85,34 +87,23 @@ struct SymbolRename : public ModulePass {
       Changed = true;
     }
 
-    if (Level >= 2) {
-      for (GlobalVariable &GV : M.globals()) {
-        if (!canRename(GV))
-          continue;
-        std::string N = pickName(M);
-        if (N.empty())
-          break;
-        GV.setName(N);
-        Changed = true;
-      }
+    for (GlobalVariable &GV : M.globals()) {
+      if (!canRename(GV))
+        continue;
+      std::string N = pickName(M);
+      if (N.empty())
+        break;
+      GV.setName(N);
+      Changed = true;
     }
 
-    if (Level >= 2) {
-      for (GlobalAlias &GA : M.aliases()) {
-        if (!canRename(GA))
-          continue;
-        std::string N = pickName(M);
-        if (N.empty())
-          break;
-        GA.setName(N);
-        Changed = true;
-      }
-    }
-
-    // Debug info stores the original linkage names separately from the
-    // GlobalValue; renaming without stripping it leaks the old names.
-    if (Level >= 3 && M.getNamedMetadata("llvm.dbg.cu")) {
-      StripDebugInfo(M);
+    for (GlobalAlias &GA : M.aliases()) {
+      if (!canRename(GA))
+        continue;
+      std::string N = pickName(M);
+      if (N.empty())
+        break;
+      GA.setName(N);
       Changed = true;
     }
 
