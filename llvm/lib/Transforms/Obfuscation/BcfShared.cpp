@@ -7,8 +7,10 @@
 #include "llvm/Transforms/Obfuscation/BcfShared.h"
 #include "llvm/Transforms/Obfuscation/ObfNaming.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
@@ -59,11 +61,15 @@ using namespace llvm;
 
 namespace llvm {
 
-static cl::opt<unsigned>
-    BCFPred("irobf-bcf_pred", cl::init(0), cl::Hidden,
-            cl::desc("Force opaque predicate family (0=random, 1..11). "
-                     "Testing knob."),
-            cl::ZeroOrMore);
+static cl::opt<unsigned> BCFPred(
+    "irobf-bcf_pred", cl::init(0), cl::Hidden,
+    cl::desc("Force opaque predicate family (0=random, 1..12). Testing knob."),
+    cl::ZeroOrMore);
+
+// 谓词熵源固定为两者都用：1 = 模块级 volatile 全局池，2 = 每函数栈锚点。
+// 站点逐个独立选源，单一全局被 patch 时只影响命中它的站点。
+// 这是实现细节，不再暴露成命令行选项。
+static constexpr unsigned BCFSourcesMask = 3;
 
 static bool useDebugNames() { return obf::debugNames(); }
 
@@ -138,8 +144,12 @@ static Value *bcfTransformInput(IRBuilder<> &B, Module &M, Value *X) {
   return X;
 }
 
-GlobalVariable *bcfGetOpaqueGlobal(Module &M) {
-  std::string Name = bcfAuxGlobalName(M, "opaque");
+static constexpr unsigned OpaquePoolSize = 3;
+
+static GlobalVariable *getOpaquePoolGlobal(Module &M, unsigned Index) {
+  std::string Tag =
+      Index == 0 ? std::string("opaque") : "opaque" + std::to_string(Index);
+  std::string Name = bcfAuxGlobalName(M, Tag);
   if (GlobalVariable *G = M.getGlobalVariable(Name, true))
     return G;
   IntegerType *I64Ty = Type::getInt64Ty(M.getContext());
@@ -150,11 +160,67 @@ GlobalVariable *bcfGetOpaqueGlobal(Module &M) {
   return GV;
 }
 
-static Value *bcfDeriveY(IRBuilder<> &B, Module &M, Value *X) {
-  (void)X; // 保留签名；Y 不再从 X 派生（见上）
-  Value *Src2 = B.CreateLoad(B.getInt64Ty(), bcfGetOpaqueGlobal(M),
-                             /*isVolatile=*/true, bcfName("bcf.ctr2"));
-  return bcfTransformInput(B, M, Src2);
+// 栈锚点只在常规栈 ABI 的函数里使用：naked 没有栈帧、协程有自己的帧
+// 布局、personality/funclet 函数跨 EH 边界。这些情况回退到全局源。
+static bool canUseStackAnchor(Function &F) {
+  if (F.hasPersonalityFn() || F.hasFnAttribute(Attribute::Naked) ||
+      F.hasFnAttribute(Attribute::ReturnsTwice) || F.isPresplitCoroutine())
+    return false;
+  for (const BasicBlock &BB : F)
+    for (const Instruction &I : BB)
+      if (isa<CatchPadInst>(I) || isa<CleanupPadInst>(I) ||
+          isa<CatchSwitchInst>(I))
+        return false;
+  return true;
+}
+
+// 每函数一个栈锚点，建在 entry 块。名字与其它实体一样来自模块盐，
+// 不额外写元数据；重复调用按名字复用，不会每站点新建 alloca。
+static Value *getStackAnchor(IRBuilder<> &B, Function &F) {
+  Module &M = *F.getParent();
+  const std::string Name = bcfAuxGlobalName(M, "anchor");
+  BasicBlock &Entry = F.getEntryBlock();
+  AllocaInst *Anchor = nullptr;
+  for (Instruction &I : Entry) {
+    auto *AI = dyn_cast<AllocaInst>(&I);
+    if (AI && AI->hasName() && AI->getName() == Name) {
+      Anchor = AI;
+      break;
+    }
+  }
+  if (!Anchor) {
+    IRBuilder<> EB(&Entry, Entry.getFirstInsertionPt());
+    Anchor = EB.CreateAlloca(Type::getInt8Ty(F.getContext()), nullptr, Name);
+    Anchor->setAlignment(Align(8));
+  }
+  // 指针宽度从 DataLayout 取，统一零扩展到 64 位：32 位目标同样成立。
+  Value *Addr = B.CreatePtrToInt(
+      Anchor, B.getIntPtrTy(M.getDataLayout()), bcfName("bcf.ctr"));
+  if (Addr->getType() != B.getInt64Ty())
+    Addr = B.CreateZExt(Addr, B.getInt64Ty(), bcfName("bcf.ctr"));
+  return Addr;
+}
+
+Value *bcfGetOpaqueSource(IRBuilder<> &B, Function &F) {
+  Module &M = *F.getParent();
+  unsigned Mask = BCFSourcesMask & 3u;
+  if (Mask == 0)
+    Mask = 3;
+
+  SmallVector<unsigned, 4> Choices;
+  if (Mask & 1u)
+    for (unsigned I = 0; I < OpaquePoolSize; ++I)
+      Choices.push_back(I);
+  if ((Mask & 2u) && canUseStackAnchor(F))
+    Choices.push_back(OpaquePoolSize);
+  if (Choices.empty())
+    Choices.push_back(0);
+
+  unsigned Pick = Choices[cryptoutils->get_uint32_t() % Choices.size()];
+  if (Pick == OpaquePoolSize)
+    return getStackAnchor(B, F);
+  return B.CreateLoad(B.getInt64Ty(), getOpaquePoolGlobal(M, Pick),
+                      /*isVolatile=*/true, bcfName("bcf.ctr"));
 }
 
 static Value *bcfConsecProduct(IRBuilder<> &B, Value *X, unsigned K,
@@ -185,10 +251,15 @@ static unsigned bcfPickKind() {
   return 5;
 }
 
-static Value *bcfBuildFamily(IRBuilder<> &B, Module &M, Value *X,
+static Value *bcfBuildFamily(IRBuilder<> &B, Function &F, Value *X,
                              unsigned Kind) {
+  Module &M = *F.getParent();
   Type *I64 = B.getInt64Ty();
   auto C = [&](uint64_t V) { return ConstantInt::get(I64, V); };
+  // 双变量族的第二个操作数：独立选源 + 独立变换，与 X 不共享熵源。
+  auto DeriveY = [&]() {
+    return bcfTransformInput(B, M, bcfGetOpaqueSource(B, F));
+  };
 
   switch (Kind) {
   case 1: { // x*~x：bit0(x)·bit0(~x) = b·(1-b) = 0
@@ -205,7 +276,7 @@ static Value *bcfBuildFamily(IRBuilder<> &B, Module &M, Value *X,
     return B.CreateICmpEQ(B.CreateAnd(X4, C(14), bcfName("bcf.b")), C(0), bcfName("bcf.c"));
   }
   case 4: { // bit0(x+y) == bit0(x)^bit0(y)（bit0 无进位入）
-    Value *Y = bcfDeriveY(B, M, X);
+    Value *Y = DeriveY();
     Value *L = B.CreateAnd(B.CreateAdd(X, Y, bcfName("bcf.s")), C(1), bcfName("bcf.b"));
     Value *R = B.CreateXor(B.CreateAnd(X, C(1), bcfName("bcf.b")),
                            B.CreateAnd(Y, C(1), bcfName("bcf.b")), bcfName("bcf.bx"));
@@ -216,7 +287,7 @@ static Value *bcfBuildFamily(IRBuilder<> &B, Module &M, Value *X,
     return bcfConsecProduct(B, X, K, 7);
   }
   case 6: { // (x-y) == (x^y) - ((~x&y)<<1)（减法借位恒等式）
-    Value *Y = bcfDeriveY(B, M, X);
+    Value *Y = DeriveY();
     Value *D = B.CreateSub(X, Y, bcfName("bcf.d"));
     Value *XO = B.CreateXor(X, Y, bcfName("bcf.x"));
     Value *NAY = B.CreateAnd(B.CreateNot(X, bcfName("bcf.n")), Y, bcfName("bcf.na"));
@@ -224,7 +295,7 @@ static Value *bcfBuildFamily(IRBuilder<> &B, Module &M, Value *X,
     return B.CreateICmpEQ(D, B.CreateSub(XO, SH, bcfName("bcf.r")), bcfName("bcf.c"));
   }
   case 7: { // bit0(x*y) == bit0(x)&bit0(y)
-    Value *Y = bcfDeriveY(B, M, X);
+    Value *Y = DeriveY();
     Value *L = B.CreateAnd(B.CreateMul(X, Y, bcfName("bcf.p")), C(1), bcfName("bcf.b"));
     Value *R = B.CreateAnd(B.CreateAnd(X, C(1), bcfName("bcf.b")),
                            B.CreateAnd(Y, C(1), bcfName("bcf.b")), bcfName("bcf.ba"));
@@ -240,14 +311,14 @@ static Value *bcfBuildFamily(IRBuilder<> &B, Module &M, Value *X,
     return B.CreateICmpEQ(B.CreateAdd(P1, P2, bcfName("bcf.s")), C(64), bcfName("bcf.c"));
   }
   case 10: { // (x^y)+2*(x&y) == x+y（进位恒等式）
-    Value *Y = bcfDeriveY(B, M, X);
+    Value *Y = DeriveY();
     Value *XO = B.CreateXor(X, Y, bcfName("bcf.x"));
     Value *A2 = B.CreateShl(B.CreateAnd(X, Y, bcfName("bcf.a")), C(1), bcfName("bcf.a2"));
     Value *L = B.CreateAdd(XO, A2, bcfName("bcf.l"));
     return B.CreateICmpEQ(L, B.CreateAdd(X, Y, bcfName("bcf.r")), bcfName("bcf.c"));
   }
   case 11: { // popcount(x|y)+popcount(x&y) == popcount(x)+popcount(y)
-    Value *Y = bcfDeriveY(B, M, X);
+    Value *Y = DeriveY();
     Function *Ctpop =
         Intrinsic::getOrInsertDeclaration(&M, Intrinsic::ctpop, {I64});
     Value *PO = B.CreateCall(Ctpop, {B.CreateOr(X, Y, bcfName("bcf.o"))}, bcfName("bcf.pc"));
@@ -266,16 +337,17 @@ static Value *bcfBuildFamily(IRBuilder<> &B, Module &M, Value *X,
   }
 }
 
-Value *bcfBuildOpaqueCond(IRBuilder<> &B, Module &M, Value *Src) {
+Value *bcfBuildOpaqueCond(IRBuilder<> &B, Function &F, Value *Src) {
+  Module &M = *F.getParent();
   Value *X = bcfTransformInput(B, M, Src);
   unsigned Kind = bcfPickKind();
-  Value *Cond = bcfBuildFamily(B, M, X, Kind);
+  Value *Cond = bcfBuildFamily(B, F, X, Kind);
   // 概率 1/5：双族 AND 组合（两族都被证伪才会折叠；强制测试时不组合）
   if (!BCFPred.getValue() && (cryptoutils->get_uint32_t() % 5 == 0)) {
     unsigned Kind2 = bcfPickKind();
     if (Kind2 == Kind)
       Kind2 = (Kind % 12) + 1;
-    Value *C2 = bcfBuildFamily(B, M, bcfTransformInput(B, M, Src), Kind2);
+    Value *C2 = bcfBuildFamily(B, F, bcfTransformInput(B, M, Src), Kind2);
     Cond = B.CreateAnd(Cond, C2, bcfName("bcf.c2"));
   }
   return Cond;
@@ -294,9 +366,12 @@ static GlobalVariable *bcfGetOrCreateBogusBlob(Module &M) {
   auto *Blob = new GlobalVariable(M, Init->getType(), /*isConstant=*/true,
                                   GlobalValue::PrivateLinkage, Init, Name);
   Blob->setAlignment(MaybeAlign(4));
-  // 独立 section，链接时会被 lld 合并进最终的 .text 输出段（可执行），
-  // 但其内容并非合法函数序言 —— 反汇编器强行解码会产生垃圾指令流。
-  Blob->setSection(obf::sectionName(M));
+  // ELF/COFF 下并入 .text 输出段（可执行）：内容并非合法函数序言，
+  // 反汇编器强行解码会产生垃圾指令流。其他 object format 没有等价
+  // 的扁平代码节区，交给 LLVM 默认节区，保持 IR 可移植。
+  StringRef Section = obf::sectionName(M);
+  if (!Section.empty())
+    Blob->setSection(Section);
   return Blob;
 }
 
@@ -405,8 +480,11 @@ void bcfFillBogusBB(BasicBlock *BogBB, Function &F) {
     std::string Ops = bcfBuildX86PoisonAsm(/*Is64=*/false);
     InlineAsm *IA = InlineAsm::get(AsmFTy, Ops, "", true);
     B.CreateCall(IA, {});
-  } else if (TargetTriple.isAArch64() ||
-             TargetTriple.getArch() == Triple::aarch64) {
+  } else if ((TargetTriple.isAArch64() ||
+              TargetTriple.getArch() == Triple::aarch64) &&
+             TargetTriple.isOSBinFormatELF()) {
+    // 仅 ELF 目标（Android/Linux 等）：SP 内联汇编在 COFF/Mach-O 上的
+    // unwind/SEH 语义未验证，这些目标回退到上面的通用 sink 载荷。
     // AArch64：SP 收敛投毒 —— Hex-Rays 的杀手。
     //
     // 死块把 SP 随机加减 N（16 的倍数，方向随机）后直落 IR 终止符
@@ -457,10 +535,8 @@ static bool bcfApplyDiamond(BasicBlock *BB, Function &F) {
     Instruction *OldTerm = BB->getTerminator();
     {
       IRBuilder<> B(OldTerm);
-      Value *Opaque = B.CreateLoad(B.getInt64Ty(),
-                                   bcfGetOpaqueGlobal(*F.getParent()),
-                                   /*isVolatile=*/true, bcfName("bcf.ctr"));
-      Value *Cond = bcfBuildOpaqueCond(B, *F.getParent(), Opaque);
+      Value *Opaque = bcfGetOpaqueSource(B, F);
+      Value *Cond = bcfBuildOpaqueCond(B, F, Opaque);
       if (cryptoutils->get_uint32_t() & 1) {
         // 极性翻转：恒假谓词 + 分支方向互换（改变静态识别形态；
         // 运行时仍恒走 OrigBB）
@@ -487,10 +563,8 @@ static bool bcfApplyTriangle(BasicBlock *BB, Function &F) {
     Instruction *OldTerm = BB->getTerminator();
     {
       IRBuilder<> B(OldTerm);
-      Value *Opaque = B.CreateLoad(B.getInt64Ty(),
-                                   bcfGetOpaqueGlobal(*F.getParent()),
-                                   /*isVolatile=*/true, bcfName("bcf.ctr"));
-      Value *Cond = bcfBuildOpaqueCond(B, *F.getParent(), Opaque);
+      Value *Opaque = bcfGetOpaqueSource(B, F);
+      Value *Cond = bcfBuildOpaqueCond(B, F, Opaque);
       if (cryptoutils->get_uint32_t() & 1)
         B.CreateCondBr(B.CreateNot(Cond, bcfName("bcf.pol")), BogBB, OrigBB);
       else
@@ -519,10 +593,8 @@ static bool bcfApplySwitchFan(BasicBlock *BB, Function &F) {
     Instruction *OldTerm = BB->getTerminator();
     {
       IRBuilder<> B(OldTerm);
-      Value *Opaque = B.CreateLoad(B.getInt64Ty(),
-                                   bcfGetOpaqueGlobal(*F.getParent()),
-                                   /*isVolatile=*/true, bcfName("bcf.ctr"));
-      Value *Cond = bcfBuildOpaqueCond(B, *F.getParent(), Opaque);
+      Value *Opaque = bcfGetOpaqueSource(B, F);
+      Value *Cond = bcfBuildOpaqueCond(B, F, Opaque);
 
       // Real/Fake 都取低 30 位，NumDead <= 4，case 值不会回绕冲突。
       uint32_t Real = (cryptoutils->get_uint32_t() & 0x3FFFFFFFu) | 1u;
@@ -556,10 +628,8 @@ static bool bcfApplyFused(BasicBlock *BB, Function &F) {
     Instruction *OldTerm = BB->getTerminator();
     {
       IRBuilder<> B(OldTerm);
-      Value *Opaque = B.CreateLoad(B.getInt64Ty(),
-                                   bcfGetOpaqueGlobal(*F.getParent()),
-                                   /*isVolatile=*/true, bcfName("bcf.ctr"));
-      Value *Cond = bcfBuildOpaqueCond(B, *F.getParent(), Opaque);
+      Value *Opaque = bcfGetOpaqueSource(B, F);
+      Value *Cond = bcfBuildOpaqueCond(B, F, Opaque);
       if (cryptoutils->get_uint32_t() & 1)
         B.CreateCondBr(B.CreateNot(Cond, bcfName("bcf.pol")), BogBB, Succ);
       else

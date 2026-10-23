@@ -87,3 +87,6 @@ pythonenv*
 # 测试结果目录（本地测试用）
 /testresu/bench_*.exe
 /testresu/*.exe
+
+# 本地临时工作目录（探查克隆、构建缓存、测试产物）
+/.tmp/

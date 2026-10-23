@@ -7,7 +7,8 @@ class FunctionPass;
 class PassRegistry;
 class ObfuscationOptions;
 
-FunctionPass* createIndirectBranchPass(ObfuscationOptions *argsOptions);
+FunctionPass *createIndirectBranchPass(ObfuscationOptions *argsOptions,
+                                             bool Dual = false);
 void initializeIndirectBranchPass(PassRegistry &Registry);
 
 }

@@ -9,16 +9,29 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/CommandLine.h"
 
 #include <random>
 
 #define DEBUG_TYPE "indbr"
+
+// 模式与块拆分数量由 config 的 indbr 域提供：
+//   mode = table (0) | full (1) | dual (2)，split = 拆块指令上限（0 = 不拆）。
+// 不再有独立的命令行变体开关。
+
 
 using namespace llvm;
 namespace {
 struct IndirectBranch : public FunctionPass {
   static char ID;
   ObfuscationOptions *ArgsOptions;
+  // Dual mode replaces each conditional branch with
+  // indirectbr(select(cond, blockaddress(T), blockaddress(F))) and does
+  // not build a module page table at all.
+  bool Dual = false;
+  // 从 config 的 indbr 域读取（模块级；pattern 不覆盖这两个字段）。
+  bool     Full = false;
+  unsigned SplitN = 0;
 
   std::unordered_map<Function *, std::vector<Constant *>> FunctionBBs;
   std::unordered_map<Function *, std::vector<BranchInst *>> FunctionBrs;
@@ -31,14 +44,66 @@ struct IndirectBranch : public FunctionPass {
   std::unordered_map<Constant *, uint64_t> BBKeys;
   std::vector<GlobalVariable *> BBPageTable;
 
+  // 页表索引的运行时 key（BSS，运行时恒为 0）。静态分析看不到值，
+  // 因此无法把 索引 -> 表项地址 -> 跳转目标 求出来。
+  GlobalVariable *IndexKeyGV = nullptr;
+
   uint64_t    PtrEncKey = 0;
   bool RunOnFuncChanged = false;
+  // AArch64 PAC: signed counterpart of BBPageTable and its per-table
+  // discriminator.  Only populated when at least one rewritten function has
+  // the +pauth subtarget feature.
+  GlobalVariable *SignedObjects = nullptr;
+  uint64_t        PtrAuthDisc = 0;
+  bool            UsePtrAuth = false;
 
-  IndirectBranch(ObfuscationOptions *argsOptions) : FunctionPass(ID) {
-    this->ArgsOptions = argsOptions;
-  }
+  IndirectBranch(ObfuscationOptions *argsOptions, bool Dual)
+      : FunctionPass(ID), ArgsOptions(argsOptions), Dual(Dual) {}
 
   StringRef getPassName() const override { return {"IndirectBranch"}; }
+
+  // 把普通块拆成不超过 MaxInsts 条指令的小块。只做 target-independent
+  // 的 CFG 拆分；EH / musttail / callbr 函数整体跳过，避免破坏 ABI 与
+  // 异常展开。
+  static void splitBlocks(Function &F, unsigned MaxInsts) {
+    if (F.isDeclaration() || F.hasPersonalityFn())
+      return;
+    for (const BasicBlock &BB : F) {
+      for (const Instruction &I : BB) {
+        if (auto *CI = dyn_cast<CallInst>(&I))
+          if (CI->isMustTailCall())
+            return;
+        if (isa<CallBrInst>(I))
+          return;
+      }
+    }
+
+    SmallVector<BasicBlock *, 32> Work;
+    for (BasicBlock &BB : F)
+      Work.push_back(&BB);
+
+    // 每函数新增块预算，防止大函数被拆成失控数量。
+    unsigned Budget = 256;
+    for (BasicBlock *BB : Work) {
+      BasicBlock *Cur = BB;
+      while (Budget > 0 && Cur->size() > MaxInsts) {
+        auto It = Cur->begin();
+        unsigned N = 0;
+        while (It != Cur->end() && N < MaxInsts) {
+          ++It;
+          ++N;
+        }
+        // 拆分点不能是 PHI（必须留在块首）或终结符。
+        while (It != Cur->end() &&
+               (isa<PHINode>(&*It) || It->isTerminator()))
+          ++It;
+        if (It == Cur->end())
+          break;
+        Cur = Cur->splitBasicBlock(It, "");
+        --Budget;
+      }
+    }
+  }
 
   void NumberBasicBlock(Module &M) {
     for (auto &F : M) {
@@ -47,16 +112,32 @@ struct IndirectBranch : public FunctionPass {
           F.isIntrinsic()) {
         continue;
       }
+      // Only collect edges from functions this pass will actually rewrite.
+      // Taking BlockAddress values from skipped functions keeps their blocks
+      // alive and can block later optimizations.
+      if (!ArgsOptions->toObfuscate(ArgsOptions->indBrOpt(), &F).isEnabled())
+        continue;
+      if (SplitN > 0)
+        splitBlocks(F, SplitN);
       SplitAllCriticalEdges(F, CriticalEdgeSplittingOptions(nullptr, nullptr));
       uint64_t BBKey = cryptoutils->get_uint64_t();
       for (auto &BB : F) {
         if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator())) {
-          if (BI->isConditional()) {
+          if (BI->isConditional() || Full) {
             if (BrSeen[&F].insert(BI).second)
               FunctionBrs[&F].push_back(BI);
             unsigned N = BI->getNumSuccessors();
             for (unsigned I = 0; I < N; I++) {
               BasicBlock *Successor = BI->getSuccessor(I);
+              // A numeric label cannot be referenced by a blockaddress that
+              // escapes the function body (the page table is a global).  Real
+              // code -- JNI entry points in particular -- is full of
+              // unnamed blocks, so give the target a name before taking its
+              // address, otherwise the module fails to re-parse with
+              // "cannot take address of numeric label after the function is
+              // defined".
+              if (!Successor->hasName())
+                Successor->setName("bb");
               auto BBAddr = BlockAddress::get(Successor);
               if (BBSeen[&F].insert(BBAddr).second)
                 FunctionBBs[&F].push_back(BBAddr);
@@ -75,9 +156,14 @@ struct IndirectBranch : public FunctionPass {
     // 未启用则跳过整个模块级收集与页表构建：否则即使没开 INDBR，
     // NumberBasicBlock 的 SplitAllCriticalEdges 也会无谓修改 CFG，
     // 且页表全局会被无条件塞进产物。
+    // Dual mode builds no page table at all.
+    if (Dual)
+      return false;
     if (!ArgsOptions->mayBeEnabled(ArgsOptions->indBrOpt(), M)) {
       return false;
     }
+    Full = ArgsOptions->indBrOpt()->mode() == 1;
+    SplitN = ArgsOptions->indBrOpt()->indBrSplitCount();
 
     BBIndex.clear();
     BBPageTable.clear();
@@ -87,11 +173,23 @@ struct IndirectBranch : public FunctionPass {
     BrSeen.clear();
     BBAddrTargets.clear();
     BBKeys.clear();
+    SignedObjects = nullptr;
 
     NumberBasicBlock(M);
     if (BBAddrTargets.empty()) {
       return false;
     }
+
+    UsePtrAuth = false;
+    if (ArgsOptions->ptrAuthEnabled()) {
+      for (auto &KV : FunctionBBs) {
+        if (hasPtrAuth(*KV.first)) {
+          UsePtrAuth = true;
+          break;
+        }
+      }
+    }
+    PtrAuthDisc = cryptoutils->get_uint64_t();
 
     PtrEncKey = cryptoutils->get_uint64_t();
 
@@ -106,11 +204,20 @@ struct IndirectBranch : public FunctionPass {
     createPageTableArgs.ObjectKeys = &BBKeys;
     createPageTableArgs.OutPageTable = &BBPageTable;
     createPageTableArgs.PtrEncKey = PtrEncKey;
+    createPageTableArgs.EnablePtrAuth = UsePtrAuth;
+    createPageTableArgs.PtrAuthKey = 0; // IA: indirect branch targets
+    createPageTableArgs.PtrAuthDisc = PtrAuthDisc;
+    createPageTableArgs.OutSignedObjects = &SignedObjects;
 
     createPageTable(createPageTableArgs);
+    auto *KeyTy = getPageTableIntTy(M);
+    IndexKeyGV = new GlobalVariable(
+        M, KeyTy, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(KeyTy, 0), obf::freshName(M, "idx_key"));
+    IndexKeyGV->setAlignment(Align(8));
+
     return false;
   }
-
 
   bool runOnFunction(Function &Fn) override {
     // 弱符号等红黄区函数的跳过已统一收敛到
@@ -119,6 +226,36 @@ struct IndirectBranch : public FunctionPass {
     const auto opt = ArgsOptions->toObfuscate(ArgsOptions->indBrOpt(), &Fn);
     if (!opt.isEnabled()) {
       return false;
+    }
+
+    if (Dual) {
+      SmallVector<BranchInst *, 16> Cands;
+      for (BasicBlock &BB : Fn)
+        if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator()))
+          if (BI->isConditional())
+            Cands.push_back(BI);
+
+      bool Changed = false;
+      for (BranchInst *BI : Cands) {
+        BasicBlock *TBB = BI->getSuccessor(0);
+        BasicBlock *FBB = BI->getSuccessor(1);
+        // The blockaddress escapes into a global, so unnamed targets must get
+        // a name first (see the same constraint in NumberBasicBlock).
+        for (BasicBlock *Succ : {TBB, FBB})
+          if (!Succ->hasName())
+            Succ->setName("bb");
+        IRBuilder<> IRB(BI);
+        Value *Sel = IRB.CreateSelect(BI->getCondition(),
+                                      BlockAddress::get(TBB),
+                                      BlockAddress::get(FBB));
+        auto *IBI = IndirectBrInst::Create(Sel, 2, BI->getIterator());
+        IBI->addDestination(TBB);
+        IBI->addDestination(FBB);
+        BI->eraseFromParent();
+        Changed = true;
+      }
+      RunOnFuncChanged |= Changed;
+      return Changed;
     }
 
     LLVMContext &Ctx = Fn.getContext();
@@ -169,47 +306,63 @@ struct IndirectBranch : public FunctionPass {
     // -disable-llvm-verifier 放过了非法 IR）。
     auto *IntTy = getPageTableIntTy(M);
     for (auto &BI : FuncBrs) {
-      if (BI && BI->isConditional()) {
-        IRBuilder<> IRB(BI);
+      if (!BI)
+        continue;
+      const bool IsCond = BI->isConditional();
+      if (!IsCond && !Full)
+        continue;
 
-        auto Cond = BI->getCondition();
+      IRBuilder<> IRB(BI);
+      BasicBlock *TBB = BI->getSuccessor(0);
+      BasicBlock *FBB = IsCond ? BI->getSuccessor(1) : nullptr;
+      auto AddrTBB = BlockAddress::get(TBB);
+      auto AddrFBB = FBB ? BlockAddress::get(FBB) : nullptr;
 
-        auto TBB = BI->getSuccessor(0);
-        auto FBB = BI->getSuccessor(1);
-        auto AddrTBB = BlockAddress::get(TBB);
-        auto AddrFBB = BlockAddress::get(FBB);
+      auto IndexFor = [&](Constant *Addr) -> ConstantInt * {
+        unsigned Idx = opt.level() ? FuncBBIndex[Addr] : BBIndex[Addr];
+        return ConstantInt::get(IntTy, Idx);
+      };
 
-        auto TIndex = opt.level() ?
-                        ConstantInt::get(IntTy, FuncBBIndex[AddrTBB]) :
-                        ConstantInt::get(IntTy, BBIndex[AddrTBB]);
+      Value *NextIndex =
+          IsCond ? IRB.CreateSelect(BI->getCondition(), IndexFor(AddrTBB),
+                                    IndexFor(AddrFBB))
+                 : IndexFor(AddrTBB);
 
-        auto FIndex = opt.level() ?
-                        ConstantInt::get(IntTy, FuncBBIndex[AddrFBB]) :
-                        ConstantInt::get(IntTy, BBIndex[AddrFBB]);
+      // 索引 ^= 运行时 key：key 是 volatile load 的 BSS 全局（恒 0），
+      // 运行时索引不变，但静态分析无法把 key 当常量，页表地址与
+      // 跳转目标因此不可求值。
+      if (IndexKeyGV) {
+        Value *IdxKey =
+            IRB.CreateLoad(IntTy, IndexKeyGV, /*isVolatile=*/true);
+        NextIndex = IRB.CreateXor(NextIndex, IdxKey);
+      }
 
-        auto NextIndex = IRB.CreateSelect(Cond, TIndex, FIndex);
+      BuildDecryptArgs buildDecrypt;
+      buildDecrypt.FuncLoopCount = opt.level();
+      buildDecrypt.NextIndex = 0;
+      buildDecrypt.NextIndexValue = NextIndex;
+      buildDecrypt.Fn = &Fn;
+      buildDecrypt.InsertBefore = BI;
+      buildDecrypt.LoadTy = PointerType::getUnqual(Ctx);
+      buildDecrypt.ModulePageTable = &BBPageTable;
+      buildDecrypt.FuncPageTable = &FuncBBPageTable;
+      buildDecrypt.ModuleKey = BBKeys[AddrTBB];
+      buildDecrypt.FuncKey = FuncKeys[AddrTBB];
+      buildDecrypt.PtrEncKey = PtrEncKey;
+      buildDecrypt.SignedObjects = SignedObjects;
+      buildDecrypt.PtrAuthKey =
+          (UsePtrAuth && hasPtrAuth(Fn)) ? 0 : -1;
+      buildDecrypt.PtrAuthDisc = PtrAuthDisc;
 
-        BuildDecryptArgs buildDecrypt;
-        buildDecrypt.FuncLoopCount = opt.level();
-        buildDecrypt.NextIndex = 0;
-        buildDecrypt.NextIndexValue = NextIndex;
-        buildDecrypt.Fn = &Fn;
-        buildDecrypt.InsertBefore = BI;
-        buildDecrypt.LoadTy = PointerType::getUnqual(Ctx);
-        buildDecrypt.ModulePageTable = &BBPageTable;
-        buildDecrypt.FuncPageTable = &FuncBBPageTable;
-        buildDecrypt.ModuleKey = BBKeys[AddrTBB];
-        buildDecrypt.FuncKey = FuncKeys[AddrTBB];
-        buildDecrypt.PtrEncKey = PtrEncKey;
-
-        auto TargetPtr = buildPageTableDecryptIR(buildDecrypt);
-        IndirectBrInst *IBI = IndirectBrInst::Create(TargetPtr, 2);
-        ReplaceInstWithInst(BI, IBI);
-        IBI->addDestination(TBB);
+      auto TargetPtr = buildPageTableDecryptIR(buildDecrypt);
+      IndirectBrInst *IBI =
+          IndirectBrInst::Create(TargetPtr, IsCond ? 2 : 1);
+      ReplaceInstWithInst(BI, IBI);
+      IBI->addDestination(TBB);
+      if (FBB)
         IBI->addDestination(FBB);
 
-        RunOnFuncChanged = true;
-      }
+      RunOnFuncChanged = true;
     }
 
     return true;
@@ -229,7 +382,8 @@ struct IndirectBranch : public FunctionPass {
 } // namespace llvm
 
 char IndirectBranch::ID = 0;
-FunctionPass *llvm::createIndirectBranchPass(ObfuscationOptions *argsOptions) {
-  return new IndirectBranch(argsOptions);
+FunctionPass *llvm::createIndirectBranchPass(ObfuscationOptions *argsOptions,
+                                             bool Dual) {
+  return new IndirectBranch(argsOptions, Dual);
 }
 INITIALIZE_PASS(IndirectBranch, "indbr", "Enable IR Indirect Branch Obfuscation", false, false)

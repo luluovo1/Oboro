@@ -32,8 +32,9 @@ std::string stableName(Module &M, StringRef Tag);
 // 内部元数据名（noobf / 运行时标记等）。调试模式原样返回 Tag。
 std::string metaName(Module &M, StringRef Tag);
 
-// 毒载荷所在节区。调试模式 ".text.aux"；生产模式直接并入 ".text"，
-// 不在节区表里留下可扫描的独立条目。
+// 毒载荷所在节区。仅对 ELF/COFF 返回可寻址的节区名（调试 ".text.aux"、
+// 生产 ".text"）；Mach-O/Wasm 等格式的节区模型不同，返回空串交由 LLVM
+// 使用目标默认节区，避免生成目标不认识的节区名。
 StringRef sectionName(Module &M);
 
 // 判断函数是否为工具链自己生成的运行时函数（防递归/自污染）。

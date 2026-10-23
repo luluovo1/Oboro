@@ -83,12 +83,6 @@
 
 using namespace llvm;
 
-// 混淆概率：0-100，默认 70。用 -mllvm -irobf-bcf_prob=X 覆盖。
-static cl::opt<unsigned>
-    BCFProb("irobf-bcf_prob", cl::init(70), cl::NotHidden,
-            cl::desc("Probability (0-100) that each basic block gets BCF "
-                     "applied. Default: 70"),
-            cl::ZeroOrMore);
 
 namespace {
 
@@ -152,7 +146,10 @@ struct BogusControlFlow : public FunctionPass {
     // 让位规则：decoy 资格函数由 DecoyPass 全权处理（decoy 菱形 + 按
     // DecoyPct 混入 poison 形态），本 pass 不碰，避免双重插桩与二次
     // fixStack（同一函数只允许一个 pass 改动 CFG）。
-    if (Opt.decoy() > 0)
+    // 注意：必须查 decoy 域，不能读 BCF 自己的 ObfOpt——那个对象上的
+    // Decoy 字段属于 decoy 域，默认 30，会让 BCF 对所有函数让位。
+    auto DecoyOpt = ArgsOptions->toObfuscate(ArgsOptions->decoyOpt(), &F);
+    if (DecoyOpt.isEnabled() && DecoyOpt.decoy() > 0)
       return false;
 
     bool Changed = false;
@@ -178,14 +175,39 @@ struct BogusControlFlow : public FunctionPass {
       std::swap(Targets[I - 1], Targets[J]);
     }
 
-    unsigned Prob = BCFProb.getValue();
+    unsigned Prob = std::min(100u, Opt.strength());
     if (Prob > 100)
       Prob = 100;
 
     // 每函数 BCF 处理块数上限：iostream 等展开的巨型函数有几百个块，
-    // 全块 BCF + fixStack 全函数 demote 会让编译时间爆炸。每函数 16 个
-    // 毒点对 IDA/Hex-Rays 的破坏效果已经足够。
-    unsigned MaxBlocks = 16;
+    // 全块 BCF + fixStack 全函数 demote 会让编译时间爆炸。
+    //
+    // 优先级：
+    //   1) budget_pct > 0：按可插桩块数的百分比（向上取整，至少 1 个）；
+    //      若同时给了绝对上限 budget > 0，再取 min（双保险）。
+    //   2) budget_pct == 0 且 budget > 0：只按绝对上限。
+    //   3) 两者都为 0：等价于“未指定”，回落到默认 20% + 绝对上限 16。
+    // 默认值是 min(16, 20%)：大函数回到历史的 16 个站点（编译时间可控），
+    // 小函数按 20% 进一步收敛。显式 budget=0 才会解除绝对上限。
+    static constexpr unsigned DefaultBudget = 16;
+    static constexpr unsigned DefaultBudgetPct = 20;
+    unsigned MaxBlocks = Opt.budget();
+    unsigned Pct = Opt.budgetPct();
+    if (Pct == 0 && MaxBlocks == 0) {
+      // 0/0 表示"未指定"，必须同时恢复绝对上限；只恢复百分比会让
+      // 大函数的站点数超过默认值，比不写配置更激进。
+      Pct = DefaultBudgetPct;
+      MaxBlocks = DefaultBudget;
+    }
+    if (Pct > 0) {
+      const size_t N = Targets.size();
+      unsigned PctCap =
+          static_cast<unsigned>((N * Pct + 99) / 100);
+      if (PctCap == 0 && N > 0)
+        PctCap = 1;
+      MaxBlocks = (MaxBlocks > 0) ? std::min(MaxBlocks, PctCap) : PctCap;
+      MaxBlocks = std::min(MaxBlocks, 4096u);
+    }
 
     for (BasicBlock *BB : Targets) {
       if (MaxBlocks == 0)

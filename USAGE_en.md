@@ -23,25 +23,64 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 
 All obfuscation flags are passed to the compiler via `-mllvm -<flag>`.
 
-| Flag | Type | Default | Description |
+| Flag | Value | Default | Description |
 |:---|:---:|:---:|:---|
-| `-irobf` | bool | false | Globally enable obfuscation (used together with a config file) |
-| `-irobf-fla` | bool | false | Control-flow flattening: scatter all basic blocks into a switch dispatcher · [before/after](#fla-control-flow-flattening) |
-| `-irobf-bcf` | bool | false | Bogus control flow: inject branches that can never be taken · [before/after](#bcf-bogus-control-flow) |
-| `-irobf-bcf_prob` | int | 70 | BCF injection probability (0-100); higher = denser protection |
-| `-irobf-indbr` | bool | false | Indirect branches: jump targets decrypted at runtime, triggering IDA JUMPOUT · [before/after](#indbr-indirect-branches) |
-| `-level-indbr` | int | 0 | Indirect-branch encryption loop layers (1 recommended, 3+ with caution) |
-| `-irobf-icall` | bool | false | Indirect calls: function addresses decrypted at runtime · [before/after](#icall-indirect-calls) |
-| `-level-icall` | int | 0 | Indirect-call encryption loop layers (1 recommended) |
-| `-irobf-indgv` | bool | false | Indirect global variables: global access addresses decrypted at runtime |
-| `-level-indgv` | int | 0 | Global-variable encryption loop layers (1 recommended; Lv3 is extremely costly) |
-| `-irobf-cse` | bool | false | String encryption: C string literals decrypted at runtime · [before/after](#cse-string-encryption) |
-| `-irobf-cie` | bool | false | Integer constant encryption (e.g. `0xDEADBEEF`) · [before/after](#cie-integer-constant-encryption) |
-| `-level-cie` | int | 0 | Integer constant encryption strength |
-| `-irobf-cfe` | bool | false | Floating-point constant encryption (double/float literals) · [before/after](#cfe-floating-point-constant-encryption) |
-| `-level-cfe` | int | 0 | Floating-point constant encryption strength |
-| `-irobf-rtti` | bool | false | Erase C++ RTTI type information (experimental) |
+| **Entry** | | | |
+| `-irobf` | bool | false | Master switch (use with a config file) |
 | `-oboro-cfg` | string | "" | Path to a JSON obfuscation config file |
+| `-irobf-level` | int | 0 | Default strength 0-3 for every pass that has a level; per-pass `level` in config wins |
+| **OLLVM originals** | | | |
+| `-irobf-indbr` | `[=table\|full\|dual]` | off | Indirect branches. No value = keep the config `mode` (default `table`, page table); `full` = unconditional `br` too; `dual` = two-target `blockaddress`. All three modes run in the late pipeline |
+| `-irobf-icall` | bool | false | Indirect calls |
+| `-irobf-indgv` | bool | false | Indirect global variables |
+| `-irobf-fla` | bool | false | Control-flow flattening |
+| `-irobf-cse` | bool | false | String encryption |
+| `-irobf-cie` | bool | false | Integer constant encryption |
+| `-irobf-cfe` | bool | false | Floating-point constant encryption |
+| `-irobf-rtti` | bool | false | Randomises the class names inside MSVC RTTI type descriptors (`.?AV...` -> random string). The structures stay intact, so `dynamic_cast` still works; nothing is erased |
+| **New features** | | | |
+| `-irobf-bcf` | `[=0..100]` | off | Bogus control flow v2. No value = keep the config `strength` (default 70); `=0` turns it off and skips the pass |
+| `-irobf-decoy` | `[=0..100]` | off | Runtime decoy paths (independent of BCF). No value = keep the config `ratio` (default: 30% of sites become decoy diamonds, the rest pure poison); `=0` turns it off |
+| `-irobf-aux` | `[=wrap,shuffle,split]` | off | Structural passes. No value = keep the config sub-switches (default: `wrap` only); `shuffle` and `split` are **experimental** and must be named explicitly (see boundaries below) |
+
+### Per-feature sub-config (config only)
+
+Each feature accepts only its own fields; a field outside its domain prints a warning and is ignored.
+
+| Feature | Field | Default | Meaning |
+|:---|:---|:---:|:---|
+| `indbr` | `mode` | `table` | `table` / `full` / `dual` |
+| | `split` | 0 | Split blocks to at most N instructions before indirection |
+| | `level` | 0 | Decryption loop layers 1-3 |
+| `icall` / `indgv` / `cie` / `cfe` | `level` | 0 | Per-pass strength |
+| `cse` | `shared` | false | One shared decryptor per module (size first) |
+| `bcf` | `strength` | 70 | Site probability 0-100 |
+| | `budget` | 16 | Absolute site cap per function (0 = none) |
+| | `budget_pct` | 20 | Percentage of eligible blocks (0 = off) |
+| `decoy` | `ratio` | 30 | Share of sites that become decoy diamonds (0-100); the rest are pure poison |
+| | `pollute` | false | L3 value pollution |
+| | `probe` | `__oboro_probe` | App-provided probe symbol |
+| `aux` | `wrap` | 100 | Forwarding wrapper probability |
+| | `shuffle` | false | Basic block layout randomisation (experimental) |
+| | `split` | 0 | Maximum splits per function, max 7 (experimental) |
+
+Global fields: `seed` / `randomSeed`, `ptrauth`, `deny`, `patterns`.
+
+**A pattern can only override per-function fields**: `enable`, `level`, `ratio`, `pollute`, `strength`, `budget`, `budget_pct`. `mode` / `split` / `wrap` / `shuffle` / `shared` / `probe` are module-level build parameters; writing them in a pattern prints a warning and is ignored.
+
+**A bare switch never resets parameters**: `-irobf-bcf`, `-irobf-decoy`, `-irobf-indbr` and `-irobf-aux` without a value only enable the feature and keep the config parameters; only an explicit value (`-irobf-bcf=90`) overrides them. `-irobf-level` likewise only fills in domains whose config has no `level`.
+
+### Boundaries of the auxiliary passes
+
+| Item | Behaviour |
+|---|---|
+| `-irobf-aux=wrap` | 100% by default, size grows noticeably. Only ABI-safe functions are wrapped (`main`, varargs, `alwaysinline`, `byval`/`sret`/`inalloca` and the probe symbol are skipped) |
+| `-irobf-aux=shuffle` | **Experimental.** Reorders basic blocks in the IR only, never changes the CFG. The backend `MachineBlockPlacement` re-sorts blocks by branch probability and the linker may reorder sections or functions, so the final layout is not guaranteed to match the IR |
+| `-irobf-aux=split` | **Experimental.** At most `aux.split` cuts per function (default 0 = off, max 7). The backend `BranchFolding` / tail merging re-merges single-predecessor single-successor blocks, so the cuts may disappear |
+| `-irobf-indbr` (all modes) | Runs in the late pipeline: at PipelineStart the later SimplifyCFG folds single-target `indirectbr` back into `br` (39 branches became 13 in testing). The trade-off is that the decryption code is no longer optimized, so the binary is 10-20% larger than an early mount |
+| `-irobf-indbr=dual` | Two-target `blockaddress`, **no block splitting** (`indbr.split_insns` has no effect in dual mode), mutually exclusive with page-table mode |
+
+Hidden testing switches (never for production): `-irobf-bcf_pred`, `-irobf-bcf_topo`, `-irobf-force-decoy`, `-irobf-force-real`, `-irobf-debug-names`.
 
 ---
 
@@ -61,12 +100,19 @@ All obfuscation flags are passed to the compiler via `-mllvm -<flag>`.
 ```bash
 -mllvm -irobf-fla
 ```
-Puts all basic blocks of a function into a switch-loop dispatcher, hiding the original control-flow structure. The switch values are XOR-encrypted to defeat IDA value tracking.
+Puts all basic blocks of a function into a switch-loop dispatcher, hiding the original control-flow structure.
+
+The state key is **derived at run time**: `ptrtoint(module global) ^ ptrtoint(state alloca) ^ function seed`. Both addresses are decided by the loader and the stack, so static analysis cannot evaluate them.
+
+The key **rolls every round**: `K_{i+1} = mix(K_i)` (multiply + shift + xor + add, one of four expansions picked per function). The key lives only in a PHI / register and is **never written to memory** — a stack slot would put the key and the ciphertext side by side, and a single memory snapshot would reveal that round's transition. Blocks store only the ciphertext `NextCase ^ K_{i+1}`; no block ever sees the key.
+
+So one dynamic capture yields one round's key. Recovering the whole state chain needs per-round instrumentation, or reimplementing the randomised `mix` and its evolution.
+
+> Functions with more than 50 basic blocks are skipped: flattening makes the dispatcher and PHI count explode (zlib `inflate`/`deflate` did not converge in 90s without the cap).
 
 #### Bogus Control Flow (BCF) v2
 ```bash
--mllvm -irobf-bcf
--mllvm -irobf-bcf_prob=70      # optional, per-block injection probability 0~100, default 70
+-mllvm -irobf-bcf=70      # optional, per-block injection probability 0~100, default 70
 -mllvm -irobf-bcf_pred=3       # optional, force predicate family 1~12 (0=random, testing)
 ```
 
@@ -95,7 +141,7 @@ reverse-engineering agents.
 
 ```bash
 # Force 100% injection on all blocks
-clang -O2 -mllvm -irobf-bcf -mllvm -irobf-bcf_prob=100 test.c -o test
+clang -O2 -mllvm -irobf-bcf=100 test.c -o test
 ```
 
 > Runtime safety: the predicate is mathematically always true, so the dead block is
@@ -131,21 +177,33 @@ extern "C" int __oboro_probe(void) {
 }
 ```
 
-**Eligibility gate**: decoy can only be enabled by a **function annotation** or a
-**config pattern**. Command-line flags (.mk / CMake) can never open it — this prevents
-one global flag from spreading decoy over every function.
+**Enabling**: `-irobf-decoy[=ratio]` turns it on globally (30% of sites by default), or use a
+**function annotation** / **config pattern** for per-function control. decoy is its own
+feature domain and does not depend on `-irobf-bcf`.
 
 ```c
-__attribute__((annotate("+bcf_decoy")))          // enable decoy for this function (L1)
-__attribute__((annotate("^bcf_decoy=50")))       // 50% of BCF sites become decoys
-__attribute__((annotate("+bcf_decoy_pollute")))  // upgrade to L3 value pollution
+__attribute__((annotate("+decoy")))          // enable decoy for this function (L1)
+__attribute__((annotate("^decoy=50")))       // 50% of this function's sites become decoys
+__attribute__((annotate("+decoy_pollute")))  // upgrade to L3 value pollution
 ```
 
 ```json
 { "patterns": [
-  { "match": "Crypto::**", "bcf": { "enable": true, "decoy": 80, "decoy_pollute": true } }
+  { "match": "Crypto::**", "decoy": { "enable": true, "ratio": 80, "pollute": true } }
 ] }
 ```
+
+### Annotation syntax
+
+| Annotation | Meaning | Domains |
+|---|---|---|
+| `+<pass>` / `-<pass>` | Enable / disable a pass for this function | all |
+| `^<pass>=N` | Strength tier 0-9 | only domains with a level: `indbr` / `icall` / `indgv` / `cie` / `cfe` |
+| `^decoy=N` | Decoy ratio for this function, 0-100 | `decoy` |
+| `+decoy` / `-decoy` | Enable / disable decoy (same as `^decoy=100` / `^decoy=0`) | `decoy` |
+| `+decoy_pollute` / `-decoy_pollute` | L3 value pollution (does not qualify on its own) | `decoy` |
+
+Writing `^<pass>=N` on a domain without levels (`bcf` / `fla` / `rtti` / `aux`) prints a warning and is ignored — BCF strength is `strength` (0-100) and is config/CLI only.
 
 | Level | Behavior | Runtime result |
 |---|---|---|
@@ -162,8 +220,8 @@ function addresses (ASLR-randomized) and never stored; both shares are verified 
 every call, and a mismatch sets a sticky `tampered` flag that routes the rest of the
 process through decoys. No runtime sampling.
 
-Testing knobs (hidden): `-mllvm -irobf-force-decoy`, `-mllvm -irobf-force-real`,
-`-mllvm -irobf-probe-symbol=xxx`.
+Testing knobs (hidden): `-mllvm -irobf-force-decoy`, `-mllvm -irobf-force-real`.
+The probe symbol comes from config: `"decoy": {"probe": "my_probe"}`.
 
 > No probe, not initialized, or a probe with a wrong signature → the real path is
 > used (fail-open), so artifacts stay stable on real devices, emulators, cloud
@@ -186,21 +244,18 @@ Testing knobs (hidden): `-mllvm -irobf-force-decoy`, `-mllvm -irobf-force-real`,
 #### Indirect Branches (INDBR)
 ```bash
 -mllvm -irobf-indbr
--mllvm -level-indbr=1        # optional, encryption loop layers, higher = stronger
+-mllvm -irobf-level=1        # optional, encryption loop layers, higher = stronger
 ```
-Branch targets are XOR-decrypted at runtime through an encrypted page table, so IDA cannot statically resolve jump targets (triggers `JUMPOUT`).
 
 #### Indirect Calls (ICALL)
 ```bash
 -mllvm -irobf-icall
--mllvm -level-icall=1        # optional
 ```
 Replaces direct function calls with calls indirected through the encrypted page table; the function address is decrypted dynamically at runtime.
 
 #### Indirect Global Variables (INDGV)
 ```bash
 -mllvm -irobf-indgv
--mllvm -level-indgv=1        # optional
 ```
 Global variable accesses are indirected through the encrypted page table, preventing static localization of globals by reverse-engineering tools.
 
@@ -217,14 +272,13 @@ All string literals are only decrypted at runtime, defeating `strings` and direc
 #### Integer Constant Encryption (CIE)
 ```bash
 -mllvm -irobf-cie
--mllvm -level-cie=1          # optional
+-mllvm -irobf-level=1          # optional
 ```
 Integer constants are protected with runtime decryption.
 
 #### Floating-Point Constant Encryption (CFE)
 ```bash
 -mllvm -irobf-cfe
--mllvm -level-cfe=1          # optional
 ```
 Floating-point constants are encrypted.
 
@@ -232,11 +286,11 @@ Floating-point constants are encrypted.
 
 ### Others
 
-#### RTTI Erasure (RTTI)
+#### RTTI type-name randomisation (RTTI)
 ```bash
 -mllvm -irobf-rtti
 ```
-Erases C++ RTTI information, preventing reverse-engineering tools from recovering class structure from type info (experimental).
+Replaces the type names inside MSVC `rtti.TypeDescriptor` (`.?AV...` / `.?AU...`) with random strings, so reverse-engineering tools can no longer search by class name or read the original hierarchy. **Names only, structure kept**: `typeid` / `dynamic_cast` keep working.
 
 ---
 
@@ -255,20 +309,19 @@ Erases C++ RTTI information, preventing reverse-engineering tools from recoverin
 -mllvm -irobf-icall \
 -mllvm -irobf-indbr \
 -mllvm -irobf-cse \
--mllvm -irobf-bcf -mllvm -irobf-bcf_prob=80
+-mllvm -irobf-bcf=80
 ```
 
 ### Maximum obfuscation (full)
 ```bash
 -mllvm -irobf-fla \
 -mllvm -irobf-icall \
--mllvm -level-icall=1 \
 -mllvm -irobf-indbr \
--mllvm -level-indbr=1 \
+-mllvm -irobf-level=1 \
 -mllvm -irobf-indgv \
 -mllvm -irobf-cse \
 -mllvm -irobf-cie \
--mllvm -irobf-bcf -mllvm -irobf-bcf_prob=100
+-mllvm -irobf-bcf=100
 ```
 
 ---
@@ -286,7 +339,8 @@ script, never the source**:
 
 ```json
 {
-  "bcf":  { "enable": true, "level": 1 },
+  "bcf":  { "enable": true, "strength": 70, "budget": 16, "budget_pct": 20 },
+  "decoy": { "enable": true, "ratio": 30 },
   "fla":  { "enable": true },
   "cse":  { "enable": true },
 
@@ -295,8 +349,8 @@ script, never the source**:
   "deny": ["MyCodec::*", "vendor::**"],
 
   "patterns": [
-    { "match": "crypto::aes::**", "bcf": { "decoy": 80, "decoy_pollute": true } },
-    { "match": "License::verify", "bcf": { "decoy": 50 } },
+    { "match": "crypto::aes::**", "decoy": { "ratio": 80, "pollute": true } },
+    { "match": "License::verify", "decoy": { "ratio": 50 } },
     { "file": "*generated_*.cpp", "bcf": { "enable": false } }
   ]
 }
@@ -307,13 +361,29 @@ script, never the source**:
 | Field | Meaning |
 |---|---|
 | `<pass>.enable` | On/off switch (`true`/`false`) |
-| `<pass>.level` | Encryption strength 0~3 (CIE/CFE/INDBR/ICALL/INDGV) |
-| `seed` / `randomSeed` | Fixed 32-hex (16-byte) PRNG seed for **tests / audits / bug reproducers only**; empty means a random seed per build (production default). Never reuse one seed across releases |
+| `indbr.mode` | `table` / `full` / `dual` |
+| `indbr.split_insns` | Split blocks to at most N instructions before indirection (0 = off). Not the same unit as `aux.split` (cuts per function) |
+| `indbr.level` / `icall.level` / `indgv.level` | 0 = module-wide shared page table (size first), 1-3 = per-function table + decryption loop layers |
+| `cie.level` / `cfe.level` | Encryption strength 0-3, default 2 (0 = a single subtraction, weakest) |
+| `bcf.strength` | Site probability 0-100 (default 70) |
+| `bcf.budget_pct` | Fraction of eligible blocks to protect, 0-100 (default 20). With `budget` also 0 it falls back to 16/20%, **not unlimited** |
+| `bcf.budget` | Absolute BCF site cap (0 = none; min(pct, cap) applies) |
+| `decoy.ratio` | Fraction of functions entering decoy paths (0-100, default 30) |
+| `decoy.pollute` | L3 value pollution (default false) |
+| `decoy.probe` | App-provided probe symbol (default `__oboro_probe`) |
+| `aux.wrap` / `aux.shuffle` / `aux.split` | Wrapper probability / block layout randomisation / splits per function |
+| `cse.shared` | `true` = one shared i8/i16 decryptor per module with runtime lengths (size first); default is one decryptor per string (anti-analysis first). **Config only; there is no command-line flag** |
+| `seed` / `randomSeed` | Fixed 32-hex (16-byte) PRNG seed for **tests / audits / bug reproducers only**; unset means a fresh random seed per build (production default). Do not reuse a seed across versions |
 | `deny` | **Red-zone list**: matched functions are never obfuscated, even by annotation |
 | `patterns[].match` | Match demangled function names (class/namespace) |
 | `patterns[].file` | Match the source file name (no path) |
-| `patterns[].bcf.decoy` | decoy eligibility + ratio (0~100) |
-| `patterns[].bcf.decoy_pollute` | L3 value-pollution switch |
+| `patterns[].decoy.ratio` | Per-rule decoy ratio override |
+| `patterns[].decoy.pollute` | Per-rule L3 switch override |
+| `patterns[].bcf.strength` | Per-rule BCF probability override |
+| `patterns[].bcf.budget_pct` | Per-rule BCF percentage (0 = inherit global) |
+| `patterns[].bcf.budget` | Per-rule absolute BCF cap (0 = inherit global) |
+
+> A field outside its feature domain prints a warning and is ignored (for example `level` under `fla`).
 
 ### Matching rules
 
@@ -383,7 +453,7 @@ All comparison views below are IDA Pro disassembly views (Graph View).
 
 <img src="images/code_bcf.png" width="800px">
 
-| Original disassembly (no obfuscation) | After `-irobf-bcf -irobf-bcf_prob=100` |
+| Original disassembly (no obfuscation) | After `-irobf-bcf=100` |
 |:---:|:---:|
 | <img src="images/bcf_org.png" width="400px"> | <img src="images/bcf.png" width="400px"> |
 
@@ -407,7 +477,7 @@ All comparison views below are IDA Pro disassembly views (Graph View).
 
 <img src="images/code_indbr.png" width="800px">
 
-| Original disassembly (no obfuscation) | After `-irobf-indbr -level-indbr=3` |
+| Original disassembly (no obfuscation) | After `-irobf-indbr -irobf-level=3` |
 |:---:|:---:|
 | <img src="images/indbr_org.png" width="400px"> | <img src="images/indbr.png" width="400px"> |
 
@@ -452,7 +522,7 @@ All comparison views below are IDA Pro disassembly views (Graph View).
 clang -O2 test.c -o test_plain.exe
 
 # Compile the obfuscated version
-clang -O2 -mllvm -irobf-bcf -mllvm -irobf-bcf_prob=100 test.c -o test_bcf.exe
+clang -O2 -mllvm -irobf-bcf=100 test.c -o test_bcf.exe
 
 # Load both into IDA and compare the disassembly views (Graph View)
 ```

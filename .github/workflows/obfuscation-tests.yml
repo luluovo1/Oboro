@@ -1,0 +1,63 @@
+name: Obfuscation Tests (manual)
+
+# Manual only.  There is deliberately no push/pull_request/schedule trigger:
+# this workflow is started from the Actions tab (or `gh workflow run`).
+on:
+  workflow_dispatch:
+    inputs:
+      test_path:
+        description: "lit directory to run, relative to the repo root"
+        required: false
+        default: "llvm/test/Transforms/Obfuscation"
+      build_type:
+        description: "CMAKE_BUILD_TYPE"
+        required: false
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - RelWithDebInfo
+          - Debug
+
+permissions:
+  contents: read
+
+concurrency:
+  group: obfuscation-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lit:
+    name: Obfuscation lit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ccache clang lld python3
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: obfuscation-${{ inputs.build_type }}
+          max-size: 2G
+
+      - name: Build and run Obfuscation lit
+        env:
+          TEST_PATH: ${{ inputs.test_path }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+          CC: clang
+          CXX: clang++
+        run: .ci/obfuscation-tests.sh
+
+      - name: Upload lit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: obfuscation-lit-results
+          path: build-obfuscation/obfuscation-results.xml
+          if-no-files-found: ignore
