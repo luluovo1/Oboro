@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .codebuddy/hooks/check-done.sh",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}
