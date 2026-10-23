@@ -283,20 +283,25 @@ struct ObfuscationPassManager : public ModulePass {
           Options->auxOpt()->isEnabled() && Options->auxOpt()->shuffle();
       const bool WantSplit = Options->auxOpt()->isEnabled() &&
                              Options->auxOpt()->splitCount() > 0;
-      const bool WantDual =
-          Options->indBrOpt()->isEnabled() && Options->indBrOpt()->mode() == 2;
-      if (!WantShuffle && !WantSplit && !WantDual)
+      // INDBR 的三种模式都必须在这里跑：在 PipelineStart 跑，O1+ 的
+      // SimplifyCFG 会把单目标 indirectbr 折回 br、合并块（实测 39 个
+      // 分支只剩 13 个），full 模式等于白开。
+      const bool WantIndBr =
+          Options->mayBeEnabled(Options->indBrOpt(), M);
+      const bool WantDual = WantIndBr && Options->indBrOpt()->mode() == 2;
+      if (!WantShuffle && !WantSplit && !WantIndBr)
         return false;
       if (!Options->randomSeed().empty())
         cryptoutils->prng_seed(std::string(Options->randomSeed()));
-      // 先切块再乱序：反过来新插入的块会破坏已随机化的布局。
+      // 先切块，再做间接化（SplitAllCriticalEdges 也会新增块），最后乱序：
+      // 顺序反过来会让新插入的块破坏已随机化的布局。
       if (WantSplit)
         add(llvm::createSplitBlocksPass(Options.get(),
                                         Options->auxOpt()->splitCount()));
+      if (WantIndBr)
+        add(llvm::createIndirectBranchPass(Options.get(), /*Dual=*/WantDual));
       if (WantShuffle)
         add(llvm::createShuffleBlocksPass(Options.get()));
-      if (WantDual)
-        add(llvm::createIndirectBranchPass(Options.get(), /*Dual=*/true));
       return run(M);
     }
 
@@ -375,9 +380,8 @@ struct ObfuscationPassManager : public ModulePass {
       add(llvm::createDecoyPass(Options.get()));
     }
 
-    // dual 模式走末端管线，其余模式在这里做。
-    if (Options->indBrOpt()->mode() != 2)
-      add(llvm::createIndirectBranchPass(Options.get(), /*Dual=*/false));
+    // INDBR 全部模式都在末端管线跑（见 Late 分支）：在 PipelineStart 跑
+    // 会被后续 SimplifyCFG 折回。这里只保留 RTTI / rename 这类模块级收尾。
 
     if (Options->rttiOpt()->isEnabled() ||
         Options->mayBeEnabled(Options->rttiOpt(), M)) {

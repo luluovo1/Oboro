@@ -30,7 +30,7 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 | `-oboro-cfg` | string | "" | JSON 配置文件路径 |
 | `-irobf-level` | int | 0 | 所有支持 level 的功能的默认强度 0–3；config 里各功能自己的 `level` 优先 |
 | **OLLVM 原有** | | | |
-| `-irobf-indbr` | `[=table\|full\|dual]` | 关闭 | 间接分支。不带值 = `table`（页表）；`full` = 无条件 `br` 也走页表；`dual` = 双目标 `blockaddress`（末端执行） |
+| `-irobf-indbr` | `[=table\|full\|dual]` | 关闭 | 间接分支。不带值 = `table`（页表）；`full` = 无条件 `br` 也走页表；`dual` = 双目标 `blockaddress`。三种模式都在末端管线执行 |
 | `-irobf-icall` | bool | false | 间接调用 |
 | `-irobf-indgv` | bool | false | 间接全局变量 |
 | `-irobf-fla` | bool | false | 控制流平坦化 |
@@ -74,6 +74,7 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 | `-irobf-aux=wrap` | 默认 100% 全量包装，体积明显增加。只对 ABI 安全的函数生效（跳过 `main`、vararg、`alwaysinline`、`byval`/`sret`/`inalloca`、probe 符号） |
 | `-irobf-aux=shuffle` | 只改基本块物理顺序，不改 CFG |
 | `-irobf-aux=split` | 每函数最多切 `aux.split` 刀（默认 3，上限 7） |
+| `-irobf-indbr`（全部模式） | 在末端管线执行：在 PipelineStart 跑会被后续 SimplifyCFG 折回（实测 39 个分支只剩 13 个）。代价是解密代码不参与优化，体积比早期挂载高约 10–20% |
 | `-irobf-indbr=dual` | 双目标 `blockaddress`，**不做块拆分**（`indbr.split` 对 dual 无效），与页表模式互斥 |
 
 隐藏的测试开关（不要用于生产）：`-irobf-bcf_pred`、`-irobf-bcf_topo`、`-irobf-force-decoy`、`-irobf-force-real`、`-irobf-debug-names`。

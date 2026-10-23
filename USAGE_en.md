@@ -30,7 +30,7 @@ All obfuscation flags are passed to the compiler via `-mllvm -<flag>`.
 | `-oboro-cfg` | string | "" | Path to a JSON obfuscation config file |
 | `-irobf-level` | int | 0 | Default strength 0-3 for every pass that has a level; per-pass `level` in config wins |
 | **OLLVM originals** | | | |
-| `-irobf-indbr` | `[=table\|full\|dual]` | off | Indirect branches. No value = `table` (page table); `full` = unconditional `br` too; `dual` = two-target `blockaddress` (late pipeline) |
+| `-irobf-indbr` | `[=table\|full\|dual]` | off | Indirect branches. No value = `table` (page table); `full` = unconditional `br` too; `dual` = two-target `blockaddress`. All three modes run in the late pipeline |
 | `-irobf-icall` | bool | false | Indirect calls |
 | `-irobf-indgv` | bool | false | Indirect global variables |
 | `-irobf-fla` | bool | false | Control-flow flattening |
@@ -74,6 +74,7 @@ Global fields: `seed` / `randomSeed`, `ptrauth`, `deny`, `patterns`.
 | `-irobf-aux=wrap` | 100% by default, size grows noticeably. Only ABI-safe functions are wrapped (`main`, varargs, `alwaysinline`, `byval`/`sret`/`inalloca` and the probe symbol are skipped) |
 | `-irobf-aux=shuffle` | Reorders basic blocks only, never changes the CFG |
 | `-irobf-aux=split` | At most `aux.split` cuts per function (default 3, max 7) |
+| `-irobf-indbr` (all modes) | Runs in the late pipeline: at PipelineStart the later SimplifyCFG folds single-target `indirectbr` back into `br` (39 branches became 13 in testing). The trade-off is that the decryption code is no longer optimized, so the binary is 10-20% larger than an early mount |
 | `-irobf-indbr=dual` | Two-target `blockaddress`, **no block splitting** (`indbr.split` has no effect in dual mode), mutually exclusive with page-table mode |
 
 Hidden testing switches (never for production): `-irobf-bcf_pred`, `-irobf-bcf_topo`, `-irobf-force-decoy`, `-irobf-force-real`, `-irobf-debug-names`.
