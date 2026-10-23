@@ -52,8 +52,17 @@ echo "--- ninja (opt + lit helpers)"
 ninja -C "${BUILD_DIR}" -j "${JOBS}" opt llvm-config FileCheck count not
 
 echo "--- lit: ${TEST_PATH}"
+# --timeout needs psutil.  Keep it when available (CI installs python3-psutil)
+# and degrade gracefully elsewhere instead of aborting the whole run.
+TIMEOUT_ARGS=()
+if python3 -c "import psutil" >/dev/null 2>&1; then
+  TIMEOUT_ARGS=(--timeout=1200)
+else
+  echo "note: python3 psutil not found; running lit without --timeout"
+fi
+
 "${BUILD_DIR}/bin/llvm-lit" -v \
   --xunit-xml-output "${BUILD_DIR}/obfuscation-results.xml" \
-  --timeout=1200 \
+  ${TIMEOUT_ARGS[@]+"${TIMEOUT_ARGS[@]}"} \
   --time-tests \
   "${TEST_DIR}"
