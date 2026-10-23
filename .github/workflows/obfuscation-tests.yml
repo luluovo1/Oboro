@@ -52,7 +52,9 @@ jobs:
           BUILD_TYPE: ${{ inputs.build_type }}
           CC: clang
           CXX: clang++
-        run: .ci/obfuscation-tests.sh
+        # 用 bash 显式调用：仓库在 Windows 上准备时录不到可执行位，
+        # 直接执行会得到 126 (Permission denied)。
+        run: bash .ci/obfuscation-tests.sh
 
       - name: Upload lit results
         if: always()
