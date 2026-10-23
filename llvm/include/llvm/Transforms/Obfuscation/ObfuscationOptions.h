@@ -6,6 +6,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringMap.h"
+#include <algorithm>
 #include <optional>
 #include <vector>
 
@@ -14,11 +15,11 @@ namespace llvm {
 
 SmallVector<std::string> readAnnotate(Function *f);
 
-// 读取函数上的 decoy 注解（+bcf_decoy / -bcf_decoy / ^bcf_decoy=N）。
+// 读取函数上的 decoy 注解（+decoy / -decoy / ^decoy=N；旧名 bcf_decoy 仍接受）。
 // 返回 std::nullopt 表示没有 decoy 注解（该函数不进入 decoy 资格门）。
 // 多条 decoy 注解时后写覆盖先写。
 std::optional<uint32_t> readDecoyAnnotation(Function *f);
-// 读取 L3 值污染注解（+bcf_decoy_pollute / -bcf_decoy_pollute）。
+// 读取 L3 值污染注解（+decoy_pollute / -decoy_pollute；旧名 bcf_decoy_pollute 仍接受）。
 // 只有 decoy>0 的函数才可能真正生效；pollute 本身不构成 decoy 资格。
 std::optional<bool> readDecoyPolluteAnnotation(Function *f);
 
@@ -37,84 +38,144 @@ struct ConfigPatternRule {
   struct OptOverride {
     std::optional<bool>     Enable;
     std::optional<uint32_t> Level;
-    // decoy 比例（0-100）。只有显式写 "decoy" 的函数才进入 decoy 资格门；
-    // 该字段与 Level 一样按字段级级联（未写的层不覆盖上层）。
+    // decoy 域：进入诱饵路径的比例（0-100）与 L3 值污染。
     std::optional<uint32_t> Decoy;
-    // L3 值污染开关（仅对 decoy>0 的函数有效）。缺省 false = 只做 L1。
     std::optional<bool>     DecoyPollute;
-    // BCF 每函数毒点上限（0 = 不设绝对上限）。仅 BCF 读取。
+    // bcf 域：站点概率与每函数上限。
+    std::optional<uint32_t> Strength;
     std::optional<uint32_t> Budget;
-    // BCF 毒点占可插桩块数的百分比（0-100，0 = 禁用百分比）。
     std::optional<uint32_t> BudgetPct;
   };
   llvm::StringMap<OptOverride> Overrides;
 };
 
+// 每个功能域只接受自己的 config 字段。解析时若写了不属于该域的字段，
+// 打印 warning 并忽略——避免 "level" 这种名字在八个 pass 上静默无效。
+enum OptField : uint32_t {
+  F_Level      = 1u << 0,
+  F_Mode       = 1u << 1,
+  F_Split      = 1u << 2,
+  F_Strength   = 1u << 3,
+  F_Budget     = 1u << 4,
+  F_BudgetPct  = 1u << 5,
+  F_Ratio      = 1u << 6,
+  F_Pollute    = 1u << 7,
+  F_Probe      = 1u << 8,
+  F_Shared     = 1u << 9,
+  F_Wrap       = 1u << 10,
+  F_Shuffle    = 1u << 11,
+};
+
 class ObfOpt {
 protected:
   uint32_t    Enabled : 1;
+  // 强度档位 0..3。只有声明了 F_Level 的 pass 才读它。
   uint32_t    Level   : 2;
-  // decoy 比例（0-100）：仅 BCF 使用；0 表示该函数不进入 decoy 资格门。
-  // 资格只能由函数注解或 config pattern 显式设置，CLI 不能全局打开。
+  // indbr 专用：0 = table（默认）, 1 = full（全边）, 2 = dual（双目标）。
+  uint32_t    Mode    : 2;
+  // bcf 专用：站点命中概率 0..100。
+  uint32_t    Strength : 7;
+  // decoy 专用：站点中"诱饵菱形"的比例 0..100，其余站点是纯 poison。
   uint32_t    Decoy   : 7;
-  // L3 值污染：仅 decoy>0 时生效；默认关（只做 L1 重汇聚）。
+  // decoy 专用：L3 值污染（仅 Decoy>0 时生效）。
   uint32_t    DecoyPollute : 1;
-  // CSE 专用：true = 全模块共用 i8/i16 各一个解密器（体积优先）。
-  // 只能由 config 的 "cse": {"shared": true} 打开；没有对应命令行参数，
-  // 该取舍属于项目级策略，不应该被散落的编译指令左右。
+  // cse 专用：全模块共用一个解密器（体积优先）。
   uint32_t    SharedDecrypt : 1;
-  // BCF 每函数毒点上限（绝对数）：默认 16，与历史行为一致；显式设 0 表示
-  // 解除绝对上限（此时只受 BudgetPct 约束）。其他 pass 不读取该字段。
+  // aux 专用：包装概率 0..100 / 是否乱序 / 每函数最多切几刀。
+  uint32_t    Wrap : 7;
+  uint32_t    DoShuffle : 1;
+  uint32_t    SplitCount : 3;
+  // bcf 专用：每函数站点上限与占可插桩块数的百分比。
   uint32_t    Budget = 16;
-  // BCF 毒点占可插桩块数的百分比（0-100）：0 = 不用百分比，退回 Budget
-  // 绝对上限；若 Budget 也为 0，按默认 20% 处理（0 只表示自动，不放大）。
-  // 默认 20% 随函数规模线性增长，避免大函数只保护前几个块。
   uint32_t    BudgetPct = 20;
+  // indbr 专用：进入页表前把基本块拆到最多 N 条指令。
+  uint32_t    IndBrSplitCount = 0;
+  // decoy 专用：App 提供的 probe 符号名。
+  std::string Probe;
   std::string AttributeName;
 
 public:
   ObfOpt(bool enable, uint32_t level, const std::string &attributeName) {
-    this->Enabled = enable;
-    this->Level = std::min<uint32_t>(level, 3);
-    this->Decoy = 0;
-    this->DecoyPollute = 0;
-    this->SharedDecrypt = 0;
-    this->AttributeName = attributeName;
+    init(enable, level, attributeName);
   }
 
   ObfOpt(const std::string &attributeName) {
-    this->Enabled = false;
-    this->Level = 0;
-    this->Decoy = 0;
-    this->DecoyPollute = 0;
-    this->SharedDecrypt = 0;
-    this->AttributeName = attributeName;
+    init(false, 0, attributeName);
   }
 
-  void readOpt(const cl::opt<bool> &enableOpt) {
-    if (enableOpt.getNumOccurrences()) {
-      Enabled = enableOpt.getValue();
-    }
+  // 该功能域接受哪些 config 字段。未列出的字段写了会被拒绝并告警。
+  uint32_t supportedFields() const {
+    const std::string &N = AttributeName;
+    if (N == "indbr")  return F_Level | F_Mode | F_Split;
+    if (N == "icall")  return F_Level;
+    if (N == "indgv")  return F_Level;
+    if (N == "fla")    return 0;
+    if (N == "cse")    return F_Shared;
+    if (N == "cie")    return F_Level;
+    if (N == "cfe")    return F_Level;
+    if (N == "rtti")   return 0;
+    if (N == "bcf")    return F_Strength | F_Budget | F_BudgetPct;
+    if (N == "decoy")  return F_Ratio | F_Pollute | F_Probe;
+    // rename 没有档位：改名就是改名，做一半等于没做（调试信息会泄露原名）。
+    if (N == "rename") return 0;
+    if (N == "aux")    return F_Wrap | F_Shuffle | F_Split;
+    return 0;
   }
 
-  void readOpt(const cl::opt<bool> &    enableOpt,
-               const cl::opt<uint32_t> &levelOpt) {
-    readOpt(enableOpt);
-    if (levelOpt.getNumOccurrences()) {
-      Level = levelOpt.getValue();
-    }
+  void setMode(uint32_t mode) {
+    this->Mode = std::min<uint32_t>(mode, 2);
   }
 
-  // BCF 专用：每函数毒点上限（绝对数）；0 = 不设绝对上限。
-  void readBudgetOpt(const cl::opt<uint32_t> &budgetOpt) {
-    if (budgetOpt.getNumOccurrences())
-      setBudget(budgetOpt.getValue());
+  uint32_t mode() const {
+    return this->Mode;
   }
 
-  // BCF 专用：毒点占可插桩块数的百分比；0 = 禁用百分比。
-  void readBudgetPctOpt(const cl::opt<uint32_t> &budgetPctOpt) {
-    if (budgetPctOpt.getNumOccurrences())
-      setBudgetPct(budgetPctOpt.getValue());
+  void setStrength(uint32_t strength) {
+    this->Strength = std::min<uint32_t>(strength, 100);
+  }
+
+  uint32_t strength() const {
+    return this->Strength;
+  }
+
+  void setWrap(uint32_t wrap) {
+    this->Wrap = std::min<uint32_t>(wrap, 100);
+  }
+
+  uint32_t wrap() const {
+    return this->Wrap;
+  }
+
+  void setShuffle(bool shuffle) {
+    this->DoShuffle = shuffle ? 1 : 0;
+  }
+
+  bool shuffle() const {
+    return this->DoShuffle != 0;
+  }
+
+  void setSplitCount(uint32_t count) {
+    this->SplitCount = std::min<uint32_t>(count, 7);
+  }
+
+  uint32_t splitCount() const {
+    return this->SplitCount;
+  }
+
+  void setIndBrSplitCount(uint32_t count) {
+    this->IndBrSplitCount = std::min<uint32_t>(count, 4096);
+  }
+
+  uint32_t indBrSplitCount() const {
+    return this->IndBrSplitCount;
+  }
+
+  void setProbe(const std::string &probe) {
+    this->Probe = probe;
+  }
+
+  const std::string &probe() const {
+    return this->Probe;
   }
 
   void setEnable(bool enabled) {
@@ -179,9 +240,34 @@ public:
   }
 
   ObfOpt none() const {
-    return ObfOpt{false, 0, this->attributeName()};
+    ObfOpt R{false, 0, this->attributeName()};
+    // probe 是模块级策略（App 提供的符号名），不随函数级 enable 级联丢失。
+    R.Probe = this->Probe;
+    return R;
   }
 
+private:
+  void init(bool enable, uint32_t level, const std::string &attributeName) {
+    this->Enabled = enable;
+    this->Level = std::min<uint32_t>(level, 3);
+    // CIE/CFE 的 level 只是加密强度（0 = 一次 sub，2 = 三层混合），
+    // 运行时成本几乎相同，默认给 2；显式写 0 仍然尊重。
+    // INDBR/ICALL/INDGV 的 level 0 表示"全模块共享页表"，是体积取舍，
+    // 所以那几个域保持 0。
+    if ((attributeName == "cie" || attributeName == "cfe") && level == 0)
+      this->Level = 2;
+    this->Mode = 0;
+    this->Strength = 70;
+    // decoy 域默认 30%：只写 "enable": true 时也应有保护，而不是静默 0。
+    this->Decoy = 30;
+    this->DecoyPollute = 0;
+    this->SharedDecrypt = 0;
+    this->Wrap = 100;
+    // aux 域默认三项全开，与 `-irobf-aux` 不带值的行为一致。
+    this->DoShuffle = 1;
+    this->SplitCount = 3;
+    this->AttributeName = attributeName;
+  }
 };
 
 class ObfuscationOptions {
@@ -194,12 +280,12 @@ protected:
   std::shared_ptr<ObfOpt> CieOpt = nullptr;
   std::shared_ptr<ObfOpt> CfeOpt = nullptr;
   std::shared_ptr<ObfOpt> RttiOpt = nullptr;
-  std::shared_ptr<ObfOpt> PsoOpt  = nullptr;
   std::shared_ptr<ObfOpt> BcfOpt  = nullptr;
+  // decoy（运行时诱饵）是独立功能域：不再挂在 BCF 上。
+  std::shared_ptr<ObfOpt> DecoyOpt = nullptr;
   std::shared_ptr<ObfOpt> RenameOpt = nullptr;
-  std::shared_ptr<ObfOpt> FwrapOpt = nullptr;
-  std::shared_ptr<ObfOpt> SplitOpt = nullptr;
-  std::shared_ptr<ObfOpt> ShuffleOpt = nullptr;
+  // 结构性后处理（转发包装 / 块乱序 / 块拆分）合成一个域。
+  std::shared_ptr<ObfOpt> AuxOpt = nullptr;
 
   SmallString<32> RandomSeed;
   // AArch64 PAC pointer-table signing is opt-in: it needs a module
@@ -225,12 +311,10 @@ public:
     allOpt.push_back(CieOpt);
     allOpt.push_back(CfeOpt);
     allOpt.push_back(RttiOpt);
-    allOpt.push_back(PsoOpt);
     allOpt.push_back(BcfOpt);
+    allOpt.push_back(DecoyOpt);
     allOpt.push_back(RenameOpt);
-    allOpt.push_back(FwrapOpt);
-    allOpt.push_back(SplitOpt);
-    allOpt.push_back(ShuffleOpt);
+    allOpt.push_back(AuxOpt);
     return allOpt;
   }
 
@@ -242,12 +326,10 @@ public:
                      const std::shared_ptr<ObfOpt> &cieOpt,
                      const std::shared_ptr<ObfOpt> &cfeOpt,
                      const std::shared_ptr<ObfOpt> &rttiOpt,
-                     const std::shared_ptr<ObfOpt> &psoOpt,
                      const std::shared_ptr<ObfOpt> &bcfOpt,
+                     const std::shared_ptr<ObfOpt> &decoyOpt,
                      const std::shared_ptr<ObfOpt> &renameOpt,
-                     const std::shared_ptr<ObfOpt> &fwrapOpt,
-                     const std::shared_ptr<ObfOpt> &splitOpt,
-                     const std::shared_ptr<ObfOpt> &shuffleOpt) {
+                     const std::shared_ptr<ObfOpt> &auxOpt) {
     this->IndBrOpt = indBrOpt;
     this->ICallOpt = iCallOpt;
     this->IndGvOpt = indGvOpt;
@@ -256,12 +338,10 @@ public:
     this->CieOpt = cieOpt;
     this->CfeOpt = cfeOpt;
     this->RttiOpt = rttiOpt;
-    this->PsoOpt  = psoOpt;
     this->BcfOpt  = bcfOpt;
+    this->DecoyOpt = decoyOpt;
     this->RenameOpt = renameOpt;
-    this->FwrapOpt = fwrapOpt;
-    this->SplitOpt = splitOpt;
-    this->ShuffleOpt = shuffleOpt;
+    this->AuxOpt = auxOpt;
   }
 
   ObfuscationOptions() : ObfuscationOptions{
@@ -273,12 +353,10 @@ public:
                            std::make_shared<ObfOpt>("cie"),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "cfe")),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "rtti")),
-                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "pso")),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "bcf")),
+                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "decoy")),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "rename")),
-                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "fwrap")),
-                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "split")),
-                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "shuffle"))
+                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "aux"))
                        } {}
 
   auto indBrOpt() const {
@@ -313,13 +391,10 @@ public:
     return RttiOpt;
   }
 
-  auto psoOpt() const { return PsoOpt; }
-
   auto bcfOpt() const { return BcfOpt; }
+  auto decoyOpt() const { return DecoyOpt; }
   auto renameOpt() const { return RenameOpt; }
-  auto fwrapOpt() const { return FwrapOpt; }
-  auto splitOpt() const { return SplitOpt; }
-  auto shuffleOpt() const { return ShuffleOpt; }
+  auto auxOpt() const { return AuxOpt; }
 
   auto &randomSeed() {
     return RandomSeed;

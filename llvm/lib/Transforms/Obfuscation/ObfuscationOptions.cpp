@@ -294,25 +294,32 @@ static bool startsWithToken(StringRef Annotation, StringRef Token) {
   return Annotation.empty() || !isIdentChar(Annotation.front());
 }
 
-// 解析 decoy 注解：
-//   +bcf_decoy        -> 100
-//   -bcf_decoy        -> 0
-//   ^bcf_decoy = N    -> N (0-100)
-// 注意：+bcf_decoy_pollute 不会被这里匹配（'_' 是标识符字符，token 边界不成立）。
+// 解析 decoy 注解（decoy 是独立功能域，不再借用 bcf 前缀）：
+//   +decoy        -> 100
+//   -decoy        -> 0
+//   ^decoy = N    -> N (0-100)
+// 旧名 +bcf_decoy / -bcf_decoy / ^bcf_decoy 仍然接受。
+// 注意：+decoy_pollute 不会被这里匹配（'_' 是标识符字符，token 边界不成立）。
 static bool parseDecoyAnnotation(StringRef Annotation, uint32_t &Out) {
   Annotation = Annotation.ltrim();
-  if (startsWithToken(Annotation, "+bcf_decoy")) {
+  std::string Buf;
+  if (Annotation.contains("bcf_decoy")) {
+    Buf = Annotation.str();
+    Buf.replace(Buf.find("bcf_decoy"), 9, "decoy");
+    Annotation = Buf;
+  }
+  if (startsWithToken(Annotation, "+decoy")) {
     Out = 100;
     return true;
   }
-  if (startsWithToken(Annotation, "-bcf_decoy")) {
+  if (startsWithToken(Annotation, "-decoy")) {
     Out = 0;
     return true;
   }
-  if (!startsWithToken(Annotation, "^bcf_decoy"))
+  if (!startsWithToken(Annotation, "^decoy"))
     return false;
 
-  StringRef Rest = Annotation.drop_front(StringRef("^bcf_decoy").size());
+  StringRef Rest = Annotation.drop_front(StringRef("^decoy").size());
   Rest = Rest.ltrim();
   if (!Rest.consume_front("="))
     return false;
@@ -354,19 +361,37 @@ std::optional<uint32_t> readDecoyAnnotation(Function *F) {
 }
 
 // 解析 L3 值污染注解：
-//   +bcf_decoy_pollute -> true
-//   -bcf_decoy_pollute -> false
+//   +decoy_pollute -> true
+//   -decoy_pollute -> false
+// 旧名 +bcf_decoy_pollute / -bcf_decoy_pollute 仍然接受。
 // 只有 decoy>0 的函数才可能真正生效（pollute 不单独构成 decoy 资格）。
 std::optional<bool> readDecoyPolluteAnnotation(Function *F) {
   std::optional<bool> Result;
   for (const std::string &Ann : readAnnotate(F)) {
     StringRef A = StringRef(Ann).ltrim();
-    if (startsWithToken(A, "+bcf_decoy_pollute"))
+    std::string Buf;
+    if (A.contains("bcf_decoy_pollute")) {
+      Buf = A.str();
+      Buf.replace(Buf.find("bcf_decoy_pollute"), 17, "decoy_pollute");
+      A = Buf;
+    }
+    if (startsWithToken(A, "+decoy_pollute"))
       Result = true;
-    else if (startsWithToken(A, "-bcf_decoy_pollute"))
+    else if (startsWithToken(A, "-decoy_pollute"))
       Result = false;
   }
   return Result;
+}
+
+// 字段白名单：每个功能域只接受自己的 config 字段。写错字段时告警并忽略，
+// 而不是静默生效失败（旧版 "level" 在 8 个 pass 上就是这样）。
+static bool acceptsField(const std::shared_ptr<ObfOpt> &O, uint32_t Field,
+                         StringRef Name) {
+  if (O->supportedFields() & Field)
+    return true;
+  llvm::errs() << "warning: \"" << O->attributeName()
+               << "\" does not accept \"" << Name << "\"; ignored\n";
+  return false;
 }
 
 std::shared_ptr<ObfuscationOptions> ObfuscationOptions::readConfigFile(
@@ -404,6 +429,7 @@ std::shared_ptr<ObfuscationOptions> ObfuscationOptions::readConfigFile(
                              json::ObjectKey, json::Value> &
                            obj) ->bool {
 
+    // 字段白名单见 acceptsField()：不属于该功能域的字段告警后忽略。
     static auto procOptValue = [](const std::shared_ptr<ObfOpt> &obfOpt,
                                   const json::Value &            value) {
       if (auto optObj = value.getAsObject()) {
@@ -411,25 +437,78 @@ std::shared_ptr<ObfuscationOptions> ObfuscationOptions::readConfigFile(
           obfOpt->setEnable(enable.value());
         }
         if (auto level = optObj->getInteger("level")) {
-          obfOpt->setLevel(static_cast<uint32_t>(level.value()));
+          if (acceptsField(obfOpt, F_Level, "level"))
+            obfOpt->setLevel(static_cast<uint32_t>(level.value()));
         }
-        // BCF 专用；其他 pass 忽略这些字段。
-        // budget = 绝对上限（0 = 不设上限）；budget_pct = 百分比（0 = 禁用）。
-        if (auto budget = optObj->getInteger("budget"))
-          obfOpt->setBudget(static_cast<uint32_t>(std::min<int64_t>(
-              4096, std::max<int64_t>(0, budget.value()))));
-        if (auto pct = optObj->getInteger("budget_pct"))
-          obfOpt->setBudgetPct(static_cast<uint32_t>(
-              std::min<int64_t>(100, std::max<int64_t>(0, pct.value()))));
-        // CSE 专用；其他 pass 忽略 "shared"。全模块共用一个解密器以换体积，
-        // 只能经 config 打开——命令行不提供对应开关。
-        if (auto shared = optObj->getBoolean("shared"))
-          obfOpt->setSharedDecrypt(shared.value());
-        // 全局 pass 配置里的 decoy 一律忽略：decoy 资格只能由函数注解或
-        // pattern 规则显式声明，防止一个全局 config 把所有函数卷进 decoy。
-        if (optObj->getInteger("decoy")) {
-          llvm::errs() << "warning: global \"decoy\" is ignored; declare it "
-                          "in a pattern rule or function annotation\n";
+        // indbr 专用：table | full | dual。split 是独立的块拆分数量。
+        if (auto mode = optObj->getString("mode")) {
+          if (acceptsField(obfOpt, F_Mode, "mode")) {
+            StringRef M = mode.value();
+            if (M == "table")
+              obfOpt->setMode(0);
+            else if (M == "full")
+              obfOpt->setMode(1);
+            else if (M == "dual")
+              obfOpt->setMode(2);
+            else
+              llvm::errs() << "warning: unknown indbr mode \"" << M
+                           << "\" (expected table|full|dual); ignored\n";
+          }
+        }
+        if (auto split = optObj->getInteger("split")) {
+          if (acceptsField(obfOpt, F_Split, "split")) {
+            uint32_t N = static_cast<uint32_t>(
+                std::min<int64_t>(4096, std::max<int64_t>(0, split.value())));
+            if (obfOpt->attributeName() == "indbr")
+              obfOpt->setIndBrSplitCount(N);
+            else
+              obfOpt->setSplitCount(N);
+          }
+        }
+        // bcf 专用：站点概率与每函数上限。
+        if (auto s = optObj->getInteger("strength")) {
+          if (acceptsField(obfOpt, F_Strength, "strength"))
+            obfOpt->setStrength(static_cast<uint32_t>(
+                std::min<int64_t>(100, std::max<int64_t>(0, s.value()))));
+        }
+        if (auto budget = optObj->getInteger("budget")) {
+          if (acceptsField(obfOpt, F_Budget, "budget"))
+            obfOpt->setBudget(static_cast<uint32_t>(std::min<int64_t>(
+                4096, std::max<int64_t>(0, budget.value()))));
+        }
+        if (auto pct = optObj->getInteger("budget_pct")) {
+          if (acceptsField(obfOpt, F_BudgetPct, "budget_pct"))
+            obfOpt->setBudgetPct(static_cast<uint32_t>(
+                std::min<int64_t>(100, std::max<int64_t>(0, pct.value()))));
+        }
+        // decoy 专用：比例 / 值污染 / probe 符号名。
+        if (auto ratio = optObj->getInteger("ratio")) {
+          if (acceptsField(obfOpt, F_Ratio, "ratio"))
+            obfOpt->setDecoy(static_cast<uint32_t>(
+                std::min<int64_t>(100, std::max<int64_t>(0, ratio.value()))));
+        }
+        if (auto pollute = optObj->getBoolean("pollute")) {
+          if (acceptsField(obfOpt, F_Pollute, "pollute"))
+            obfOpt->setDecoyPollute(pollute.value());
+        }
+        if (auto probe = optObj->getString("probe")) {
+          if (acceptsField(obfOpt, F_Probe, "probe"))
+            obfOpt->setProbe(probe.value().str());
+        }
+        // cse 专用：全模块共用一个解密器（体积优先）。
+        if (auto shared = optObj->getBoolean("shared")) {
+          if (acceptsField(obfOpt, F_Shared, "shared"))
+            obfOpt->setSharedDecrypt(shared.value());
+        }
+        // aux 专用：包装概率 / 块乱序 / 块拆分数量。
+        if (auto wrap = optObj->getInteger("wrap")) {
+          if (acceptsField(obfOpt, F_Wrap, "wrap"))
+            obfOpt->setWrap(static_cast<uint32_t>(
+                std::min<int64_t>(100, std::max<int64_t>(0, wrap.value()))));
+        }
+        if (auto shuf = optObj->getBoolean("shuffle")) {
+          if (acceptsField(obfOpt, F_Shuffle, "shuffle"))
+            obfOpt->setShuffle(shuf.value());
         }
       }
     };
@@ -548,11 +627,16 @@ std::shared_ptr<ObfuscationOptions> ObfuscationOptions::readConfigFile(
               if (auto lv = vo->getInteger("level"))
                 ov.Level = static_cast<uint32_t>(
                     std::min<int64_t>(3, std::max<int64_t>(0, lv.value())));
-              if (auto dv = vo->getInteger("decoy"))
+              // decoy 域：ratio / pollute。
+              if (auto dv = vo->getInteger("ratio"))
                 ov.Decoy = static_cast<uint32_t>(
                     std::min<int64_t>(100, std::max<int64_t>(0, dv.value())));
-              if (auto pv = vo->getBoolean("decoy_pollute"))
+              if (auto pv = vo->getBoolean("pollute"))
                 ov.DecoyPollute = pv.value();
+              // bcf 域：strength / budget / budget_pct。
+              if (auto sv = vo->getInteger("strength"))
+                ov.Strength = static_cast<uint32_t>(
+                    std::min<int64_t>(100, std::max<int64_t>(0, sv.value())));
               if (auto bv = vo->getInteger("budget"))
                 ov.Budget = static_cast<uint32_t>(std::min<int64_t>(
                     4096, std::max<int64_t>(0, bv.value())));
@@ -649,9 +733,10 @@ ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
   bool     patternEnable = option->isEnabled();
   bool     patternEnableExact = false;
   uint32_t patternLevel = option->level();
-  // decoy 资格只能由 pattern / 注解显式设置；全局 config 与 CLI 一律不参与。
-  uint32_t patternDecoy = 0;
-  bool     patternPollute = false;
+  // decoy 域的比例/污染随功能域独立级联；bcf 域的 strength 同理。
+  uint32_t patternDecoy = option->decoy();
+  bool     patternPollute = option->decoyPollute();
+  uint32_t patternStrength = option->strength();
   uint32_t patternBudget = option->budget();
   uint32_t patternBudgetPct = option->budgetPct();
   if (!PatternRules.empty()) {
@@ -677,6 +762,8 @@ ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
         patternDecoy = *It->second.Decoy;
       if (It->second.DecoyPollute)
         patternPollute = *It->second.DecoyPollute;
+      if (It->second.Strength)
+        patternStrength = *It->second.Strength;
       if (It->second.Budget)
         patternBudget = *It->second.Budget;
       if (It->second.BudgetPct)
@@ -711,20 +798,23 @@ ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
 
   auto annotations = readAnnotate(f);
   int  levelSet = 0;
+  // decoy 注解只对 decoy 域生效：其他 pass 不该因为函数带 +decoy 而改变。
+  const bool IsDecoyOpt = option->attributeName() == "decoy";
   if (!annotations.empty()) {
-    // 先解析 decoy 注解（独立通道，避免 "+bcf_decoy" 被 "+bcf" 前缀误匹配）。
-    if (auto Decoy = readDecoyAnnotation(f)) {
-      result.setDecoy(*Decoy);
-      decoySet = true;
-    }
-    if (auto Pollute = readDecoyPolluteAnnotation(f)) {
-      result.setDecoyPollute(*Pollute);
-      polluteSet = true;
+    if (IsDecoyOpt) {
+      if (auto Decoy = readDecoyAnnotation(f)) {
+        result.setDecoy(*Decoy);
+        decoySet = true;
+      }
+      if (auto Pollute = readDecoyPolluteAnnotation(f)) {
+        result.setDecoyPollute(*Pollute);
+        polluteSet = true;
+      }
     }
     for (const auto &annotation : annotations) {
-      // decoy 注解已单独处理，通用 BCF 逻辑必须跳过，否则
-      // "+bcf_decoy" 会被当成 "+bcf"，"^bcf_decoy=N" 会被当成 level。
-      if (annotation.find("bcf_decoy") != std::string::npos)
+      // decoy 注解已单独处理，通用逻辑必须跳过，否则 "+decoy" 会被当成
+      // 普通 enable、"^decoy=N" 会被当成 level。
+      if (annotation.find("decoy") != std::string::npos)
         continue;
       if (startsWithToken(annotation, attrDisable)) {
         result.setEnable(false);
@@ -826,10 +916,14 @@ ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
   }
   if (!decoySet) {
     result.setDecoy(patternDecoy);
+  } else {
+    // "+decoy" / "^decoy=N" 本身即构成启用；"-decoy" / "^decoy=0" 关闭。
+    result.setEnable(result.decoy() > 0);
   }
   if (!polluteSet) {
     result.setDecoyPollute(patternPollute);
   }
+  result.setStrength(patternStrength);
   // BCF 预算没有函数注解通道，只按 CLI / config / pattern 级联。
   result.setBudget(patternBudget);
   result.setBudgetPct(patternBudgetPct);

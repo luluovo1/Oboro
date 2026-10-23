@@ -75,12 +75,9 @@
 
 using namespace llvm;
 
-static cl::opt<std::string>
-    BCFProbeSymbol("irobf-probe-symbol", cl::init("__oboro_probe"),
-                   cl::NotHidden,
-                   cl::desc("Symbol name of the project-provided decoy probe "
-                            "(default: __oboro_probe)."),
-                   cl::ZeroOrMore);
+// probe 符号名属于 decoy 功能域的策略，只能经 config 的
+// "decoy": {"probe": "..."} 设置；不再暴露成命令行选项。
+static std::string ActiveProbeName = "__oboro_probe";
 
 static cl::opt<bool>
     BCFForceDecoy("irobf-force-decoy", cl::init(false), cl::Hidden,
@@ -107,7 +104,7 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
   FunctionType *ProbeTy = FunctionType::get(I32, /*isVarArg=*/false);
 
   // ---- probe：弱定义（App 强定义覆盖）----
-  const std::string ProbeName = BCFProbeSymbol.getValue();
+  const std::string ProbeName = ActiveProbeName;
   Function *Probe = M.getFunction(ProbeName);
   if (Probe && Probe->getFunctionType() != ProbeTy) {
     llvm::errs() << "oboro: probe symbol '" << ProbeName
@@ -567,11 +564,12 @@ static BasicBlock *buildPollutedClone(BasicBlock *OrigBB, Function &F) {
 // DecoyPass：运行时误导机制（独立于 BCF 的静态虚假控制流）。
 //
 // 判据来源：App 提供的 probe 符号（非 0 = 真实路径，0 = 诱饵路径）。
-// 工具链不做任何环境检测。资格门：只有函数注解 +bcf_decoy / ^bcf_decoy=N
+// 工具链不做任何环境检测。资格门：只有函数注解 +decoy / ^decoy=N
 // 或 config pattern 的 "decoy":N 能启用；CLI 无法开启。
 //
 // 与 BCF 的让位规则：decoy>0 的函数由本 pass 全权处理（BCF 跳过），
-// 内部按 DecoyPct 概率混入纯 poison 菱形（复用共享拓扑），保持形态混合。
+// 所有满足条件的函数都插桩；每个站点按 DecoyPct 概率成为诱饵菱形，
+// 其余站点是纯 poison 菱形（复用共享拓扑），保持形态混合。
 // ===========================================================================
 
 namespace {
@@ -590,15 +588,23 @@ struct DecoyPass : public FunctionPass {
   // 模块级初始化：只有确实存在 decoy 资格（pattern 或注解）时才创建
   // decoy runtime，保证默认构建（decoy=0）零额外符号/全局。
   bool doInitialization(Module &M) override {
-    bool NeedDecoy = false;
-    for (const ConfigPatternRule &Rule : ArgsOptions->patternRules()) {
-      auto It = Rule.Overrides.find("bcf");
-      if (It != Rule.Overrides.end() && It->second.Decoy &&
-          *It->second.Decoy > 0) {
-        NeedDecoy = true;
-        break;
+    // probe 符号名由 decoy 域自己的 config 决定，不再是全局命令行选项。
+    const std::string &ConfiguredProbe = ArgsOptions->decoyOpt()->probe();
+    if (!ConfiguredProbe.empty())
+      ActiveProbeName = ConfiguredProbe;
+
+    bool NeedDecoy = ArgsOptions->decoyOpt()->isEnabled();
+    if (!NeedDecoy)
+      for (const ConfigPatternRule &Rule : ArgsOptions->patternRules()) {
+        auto It = Rule.Overrides.find("decoy");
+        if (It == Rule.Overrides.end())
+          continue;
+        if ((It->second.Enable && *It->second.Enable) ||
+            (It->second.Decoy && *It->second.Decoy > 0)) {
+          NeedDecoy = true;
+          break;
+        }
       }
-    }
     if (!NeedDecoy) {
       for (Function &F : M) {
         if (F.isDeclaration())
@@ -667,7 +673,7 @@ struct DecoyPass : public FunctionPass {
       return false;
     // 项目提供的 probe 是策略入口，绝不能反过来被插桩
     // （否则 probe -> getenv -> probe 递归）。
-    if (F.getName() == BCFProbeSymbol.getValue())
+    if (F.getName() == ActiveProbeName)
       return false;
 
     // 特殊函数：改动它们会破坏 ABI/异常/协程/尾调用语义。
@@ -689,7 +695,7 @@ struct DecoyPass : public FunctionPass {
       return false;
 
     // 资格：只有 decoy>0 的函数由本 pass 处理（BCF 已让位）。
-    auto Opt = ArgsOptions->toObfuscate(ArgsOptions->bcfOpt(), &F);
+    auto Opt = ArgsOptions->toObfuscate(ArgsOptions->decoyOpt(), &F);
     if (!Opt.isEnabled())
       return false;
     unsigned DecoyPct = std::min(100u, Opt.decoy());
@@ -774,4 +780,9 @@ FunctionPass *llvm::createDecoyPass(ObfuscationOptions *argsOptions) {
   return new DecoyPass(argsOptions);
 }
 
-StringRef llvm::getDecoyProbeSymbol() { return BCFProbeSymbol.getValue(); }
+StringRef llvm::getDecoyProbeSymbol() { return ActiveProbeName; }
+
+void llvm::setDecoyProbeSymbol(StringRef Name) {
+  if (!Name.empty())
+    ActiveProbeName = Name.str();
+}

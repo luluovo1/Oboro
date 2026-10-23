@@ -66,13 +66,10 @@ static cl::opt<unsigned> BCFPred(
     cl::desc("Force opaque predicate family (0=random, 1..12). Testing knob."),
     cl::ZeroOrMore);
 
-// 谓词熵源集合（位掩码）：1 = 模块级 volatile 全局池，2 = 每函数栈锚点。
+// 谓词熵源固定为两者都用：1 = 模块级 volatile 全局池，2 = 每函数栈锚点。
 // 站点逐个独立选源，单一全局被 patch 时只影响命中它的站点。
-static cl::opt<unsigned> BCFSources(
-    "irobf-bcf_sources", cl::init(3), cl::NotHidden,
-    cl::desc("Opaque-predicate entropy sources: 1=module globals, "
-             "2=stack anchor, 3=both (default)."),
-    cl::ZeroOrMore);
+// 这是实现细节，不再暴露成命令行选项。
+static constexpr unsigned BCFSourcesMask = 3;
 
 static bool useDebugNames() { return obf::debugNames(); }
 
@@ -206,7 +203,7 @@ static Value *getStackAnchor(IRBuilder<> &B, Function &F) {
 
 Value *bcfGetOpaqueSource(IRBuilder<> &B, Function &F) {
   Module &M = *F.getParent();
-  unsigned Mask = BCFSources.getValue() & 3u;
+  unsigned Mask = BCFSourcesMask & 3u;
   if (Mask == 0)
     Mask = 3;
 

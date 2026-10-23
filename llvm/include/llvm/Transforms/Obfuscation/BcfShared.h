@@ -25,7 +25,7 @@ std::string bcfAuxGlobalName(Module &M, StringRef Tag);
 //   模块级 volatile 全局池（多个，各自随机初值）
 //   函数栈锚点（entry 块内 alloca 的地址，经 DataLayout 宽度转换）
 // 栈锚点在 naked / 协程 / 带 personality 或 funclet 的函数上不可用，
-// 自动回退到全局池。-irobf-bcf_sources 控制允许的来源集合。
+// 自动回退到全局池。来源集合固定为"两者都用"，不暴露成选项。
 Value *bcfGetOpaqueSource(IRBuilder<> &B, Function &F);
 
 // 垃圾写回槽（volatile 读-改-写 sink，DCE 无法删除）。

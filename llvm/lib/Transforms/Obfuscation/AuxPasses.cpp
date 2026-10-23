@@ -10,6 +10,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
 #include "llvm/Transforms/Obfuscation/AuxPasses.h"
+#include "llvm/Transforms/Obfuscation/DecoyPass.h"
 #include "llvm/Transforms/Obfuscation/ObfNaming.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -29,6 +30,10 @@ static bool unsafeWrapperABI(const Function &F) {
     return true;
   if (F.getName() == "main")
     return true; // entry point must keep its exact body/ABI
+  // probe 是 App 提供的策略入口：包装它会在 probe 和混淆代码之间插一层，
+  // 破坏 decoy 的"probe -> 混淆函数 -> probe"递归保护。
+  if (F.getName() == getDecoyProbeSymbol())
+    return true;
   if (F.hasFnAttribute(Attribute::AlwaysInline))
     return true;
   if (F.hasFnAttribute("oboro.wrapper"))
@@ -65,7 +70,7 @@ struct FunctionWrapperPass : public ModulePass {
     for (Function &F : M) {
       if (unsafeWrapperABI(F))
         continue;
-      if (Options->toObfuscate(Options->fwrapOpt(), &F).isEnabled())
+      if (Options->toObfuscate(Options->auxOpt(), &F).isEnabled())
         Work.push_back(&F);
     }
 
@@ -134,7 +139,7 @@ struct ShuffleBlocksPass : public FunctionPass {
   StringRef getPassName() const override { return "ShuffleBlocks"; }
 
   bool runOnFunction(Function &F) override {
-    if (!Options->toObfuscate(Options->shuffleOpt(), &F).isEnabled())
+    if (!Options->toObfuscate(Options->auxOpt(), &F).isEnabled())
       return false;
     if (F.size() < 3)
       return false;
@@ -175,7 +180,7 @@ struct SplitBlocksPass : public FunctionPass {
   StringRef getPassName() const override { return "SplitBlocks"; }
 
   bool runOnFunction(Function &F) override {
-    if (!Options->toObfuscate(Options->splitOpt(), &F).isEnabled())
+    if (!Options->toObfuscate(Options->auxOpt(), &F).isEnabled())
       return false;
     if (F.size() < 1)
       return false;

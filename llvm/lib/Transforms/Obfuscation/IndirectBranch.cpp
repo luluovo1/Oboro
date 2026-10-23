@@ -15,19 +15,9 @@
 
 #define DEBUG_TYPE "indbr"
 
-// 全边间接化：除条件分支外，无条件 br 也走加密页表。默认关。
-static cl::opt<bool> IndBrFull(
-    "irobf-indbr_full", cl::init(false), cl::NotHidden,
-    cl::desc("Indirect unconditional branches as well (full CFG edge "
-             "indirection). Off by default."),
-    cl::ZeroOrMore);
-
-// 间接化之前把基本块拆到最多 N 条指令（0 = 不拆）。默认关。
-static cl::opt<unsigned> IndBrSplit(
-    "irobf-indbr_split", cl::init(0), cl::NotHidden,
-    cl::desc("Split basic blocks to at most N instructions before "
-             "indirection (0 = no splitting). Default: 0"),
-    cl::ZeroOrMore);
+// 模式与块拆分数量由 config 的 indbr 域提供：
+//   mode = table (0) | full (1) | dual (2)，split = 拆块指令上限（0 = 不拆）。
+// 不再有独立的命令行变体开关。
 
 
 using namespace llvm;
@@ -39,6 +29,9 @@ struct IndirectBranch : public FunctionPass {
   // indirectbr(select(cond, blockaddress(T), blockaddress(F))) and does
   // not build a module page table at all.
   bool Dual = false;
+  // 从 config 的 indbr 域读取（模块级；pattern 不覆盖这两个字段）。
+  bool     Full = false;
+  unsigned SplitN = 0;
 
   std::unordered_map<Function *, std::vector<Constant *>> FunctionBBs;
   std::unordered_map<Function *, std::vector<BranchInst *>> FunctionBrs;
@@ -124,13 +117,13 @@ struct IndirectBranch : public FunctionPass {
       // alive and can block later optimizations.
       if (!ArgsOptions->toObfuscate(ArgsOptions->indBrOpt(), &F).isEnabled())
         continue;
-      if (IndBrSplit > 0)
-        splitBlocks(F, IndBrSplit);
+      if (SplitN > 0)
+        splitBlocks(F, SplitN);
       SplitAllCriticalEdges(F, CriticalEdgeSplittingOptions(nullptr, nullptr));
       uint64_t BBKey = cryptoutils->get_uint64_t();
       for (auto &BB : F) {
         if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator())) {
-          if (BI->isConditional() || IndBrFull) {
+          if (BI->isConditional() || Full) {
             if (BrSeen[&F].insert(BI).second)
               FunctionBrs[&F].push_back(BI);
             unsigned N = BI->getNumSuccessors();
@@ -169,6 +162,8 @@ struct IndirectBranch : public FunctionPass {
     if (!ArgsOptions->mayBeEnabled(ArgsOptions->indBrOpt(), M)) {
       return false;
     }
+    Full = ArgsOptions->indBrOpt()->mode() == 1;
+    SplitN = ArgsOptions->indBrOpt()->indBrSplitCount();
 
     BBIndex.clear();
     BBPageTable.clear();
@@ -314,7 +309,7 @@ struct IndirectBranch : public FunctionPass {
       if (!BI)
         continue;
       const bool IsCond = BI->isConditional();
-      if (!IsCond && !IndBrFull)
+      if (!IsCond && !Full)
         continue;
 
       IRBuilder<> IRB(BI);
