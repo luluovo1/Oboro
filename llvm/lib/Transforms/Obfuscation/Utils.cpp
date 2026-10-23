@@ -60,6 +60,11 @@ void fixStack(Function *f) {
 
         if (isa<PHINode>(j)) {
           PHINode *phi = cast<PHINode>(j);
+          // 打了 oboro.keep 的值必须留在寄存器里（平坦化的滚动密钥）。
+          // 降到栈上会让密钥和密文同时出现在内存中，单次内存快照就能
+          // 还原当轮的状态转移。
+          if (phi->hasMetadata("oboro.keep"))
+            continue;
           tmpPhi.push_back(phi);
           continue;
         }
@@ -73,6 +78,9 @@ void fixStack(Function *f) {
         // normal edge.  DemoteRegToStack clones an invoke per call, whose
         // clone again "escapes" its block -> infinite demotion loop.
         if (j->isTerminator())
+          continue;
+        // 同 PHI：滚动密钥的演化指令也不许落栈。
+        if (j->hasMetadata("oboro.keep"))
           continue;
         // Never rewrite instructions that live in an EH pad block: the pad
         // instruction must stay the first non-PHI instruction.

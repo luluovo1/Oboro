@@ -157,7 +157,7 @@ clang -O2 -mllvm -irobf-cse -mllvm -irobf-cie -mllvm -irobf-level=1 hotpath.c -o
 
 ### Level 参数注意事项
 
-`-irobf-level` 统一控制所有支持档位的功能（INDBR / ICALL / INDGV / CIE / CFE / rename）的运行时解密循环层数。**Level 越高，逆向越难，性能损耗也呈指数级增长。** 需要单个功能单独调档时，用 config 的对应节点，例如 `"indgv": {"level": 1}`。
+`-irobf-level` 统一控制所有支持档位的功能（INDBR / ICALL / INDGV / CIE / CFE）的运行时解密循环层数。**Level 越高，逆向越难，性能损耗也呈指数级增长。** 需要单个功能单独调档时，用 config 的对应节点，例如 `"indgv": {"level": 1}`。
 
 | Level 值 | 性能额外开销（参考）| 适用场景 |
 |:---:|:---:|:---|

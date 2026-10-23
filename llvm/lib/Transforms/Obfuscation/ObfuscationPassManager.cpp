@@ -8,7 +8,6 @@
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationPassManager.h"
 #include "llvm/Transforms/Obfuscation/AuxPasses.h"
-#include "llvm/Transforms/Obfuscation/SymbolRename.h"
 // CryptoUtils.h defines a function-like macro `R`, which collides with
 // std::function template parameters in CommandLine.h if included earlier.
 #include "llvm/CryptoUtils.h"
@@ -81,7 +80,7 @@ EnableIRConstantFPEncryption("irobf-cfe", cl::init(false), cl::NotHidden,
 
 static cl::opt<bool>
 EnableRttiEraser("irobf-rtti", cl::init(false), cl::NotHidden,
-  cl::desc("Enable RTTI Eraser."),
+  cl::desc("Randomise MSVC RTTI type-descriptor names (structure kept)."),
   cl::ZeroOrMore);
 
 // ---- 新功能域 --------------------------------------------------------------
@@ -100,22 +99,22 @@ static cl::opt<std::string> EnableDecoy(
              "(default 30)."),
     cl::ZeroOrMore);
 
-static cl::opt<bool>
-EnableSymbolRename("irobf-rename", cl::init(false), cl::NotHidden,
-                   cl::desc("Rename internal symbols to opaque names."),
-                   cl::ZeroOrMore);
-
-// 结构性后处理：wrap / shuffle / split。不带值 = 三项全开。
+// 结构性后处理：wrap / shuffle / split。裸开关沿用 config（默认只开 wrap）。
+// shuffle 与 split 是实验性的：IR 里的块顺序和块切分都不等于最终布局，
+// 后端 MachineBlockPlacement / BranchFolding 会重新排块、把单前驱单后继
+// 的块合回去，所以这两项的效果无法从 IR 层保证。必须显式写出来才开。
 static cl::opt<std::string> EnableAux(
     "irobf-aux", cl::init(""), cl::ValueOptional, cl::NotHidden,
-    cl::desc("Structural passes. Optional comma list: wrap,shuffle,split "
-             "(default: all)."),
+    cl::desc("Structural passes. Optional comma list: wrap,shuffle,split. "
+             "No value = wrap only; shuffle and split are experimental and "
+             "must be named explicitly."),
     cl::ZeroOrMore);
 
-// 逗号列表里是否含某项；空列表（不带值）视为全开。
-static bool auxWants(StringRef List, StringRef Name) {
+// 逗号列表里是否含某项。空列表（不带值）不含任何项：wrap 由调用方单独
+// 兜底，shuffle/split 必须显式列出。
+static bool auxHas(StringRef List, StringRef Name) {
   if (List.empty())
-    return true;
+    return false;
   SmallVector<StringRef, 4> Parts;
   List.split(Parts, ',');
   for (StringRef P : Parts)
@@ -140,7 +139,12 @@ static uint32_t parseStrength(StringRef S, uint32_t Default) {
                  << Default << "\n";
     return Default;
   }
-  return std::min<uint32_t>(V, 100);
+  if (V > 100) {
+    llvm::errs() << "warning: \"" << S << "\" exceeds 100; clamping to 100"
+                 << "\n";
+    return 100;
+  }
+  return V;
 }
 
 namespace llvm {
@@ -212,25 +216,31 @@ struct ObfuscationPassManager : public ModulePass {
 
     auto Opt = ObfuscationOptions::readConfigFile(OboroConfigPath);
 
-    // 全局强度：只有用户显式给了 -irobf-level 才覆盖各域自己的 level。
+    // 全局强度只是"默认值"：config / 注解里写死的 level 优先。
+    // 之前这里无条件覆盖，导致 `-irobf-level=1` 把 config 的 level 3
+    // 重置成 1，与 --help 和 USAGE 的说明相反。
     if (isSet(ObfuscationLevel))
       for (auto &O : Opt->getAllOpt())
-        if (O->supportedFields() & F_Level)
+        if ((O->supportedFields() & F_Level) && !O->levelSet())
           O->setLevel(ObfuscationLevel);
 
-    // indbr：不带值 = table；带值 = table|full|dual。
+    // indbr：裸开关只启用，保留 config 里的 mode；写了值才改。
+    // 否则 `-irobf-indbr` 会把 config 的 mode=full 悄悄降回 table。
     if (isSet(EnableIndirectBr)) {
       Opt->indBrOpt()->setEnable(true);
       StringRef M = EnableIndirectBr.getValue();
-      if (M.empty() || M == "table")
-        Opt->indBrOpt()->setMode(0);
-      else if (M == "full")
-        Opt->indBrOpt()->setMode(1);
-      else if (M == "dual")
-        Opt->indBrOpt()->setMode(2);
-      else
-        llvm::errs() << "warning: unknown -irobf-indbr value \"" << M
-                     << "\" (expected table|full|dual); using table\n";
+      if (!M.empty()) {
+        if (M == "table")
+          Opt->indBrOpt()->setMode(0);
+        else if (M == "full")
+          Opt->indBrOpt()->setMode(1);
+        else if (M == "dual")
+          Opt->indBrOpt()->setMode(2);
+        else
+          llvm::errs() << "warning: unknown -irobf-indbr value " << M
+                       << " (expected table|full|dual); keeping the "
+                          "configured mode\n";
+      }
     }
 
     if (isSet(EnableIndirectCall))
@@ -248,27 +258,67 @@ struct ObfuscationPassManager : public ModulePass {
     if (isSet(EnableRttiEraser))
       Opt->rttiOpt()->setEnable(EnableRttiEraser);
 
-    // bcf / decoy：带值开关，空值走默认强度。
+    // bcf / decoy：带值开关。裸开关只启用，参数沿用 config / 默认值；
+    // 只有真的写了值才覆盖——否则 `-irobf-bcf` 会把 config 的 90 重置成 70。
     if (isSet(EnableBogusControlFlow)) {
-      Opt->bcfOpt()->setEnable(true);
-      Opt->bcfOpt()->setStrength(
-          parseStrength(EnableBogusControlFlow.getValue(), 70));
+      StringRef V = EnableBogusControlFlow.getValue();
+      if (V.empty()) {
+        Opt->bcfOpt()->setEnable(true);
+      } else {
+        uint32_t S = parseStrength(V, 70);
+        Opt->bcfOpt()->setStrength(S);
+        // 0 是明确的"关闭"，不能被当成"启用但强度 0"再挂一次 pass。
+        Opt->bcfOpt()->setEnable(S > 0);
+      }
     }
     if (isSet(EnableDecoy)) {
-      Opt->decoyOpt()->setEnable(true);
-      Opt->decoyOpt()->setDecoy(parseStrength(EnableDecoy.getValue(), 30));
+      StringRef V = EnableDecoy.getValue();
+      if (V.empty()) {
+        Opt->decoyOpt()->setEnable(true);
+      } else {
+        uint32_t R = parseStrength(V, 30);
+        Opt->decoyOpt()->setDecoy(R);
+        Opt->decoyOpt()->setEnable(R > 0);
+      }
     }
 
-    if (isSet(EnableSymbolRename))
-      Opt->renameOpt()->setEnable(true);
-
-    // aux：逗号列表控制三项子功能；不带值 = 全开。
+    // aux：逗号列表控制三项子功能。裸开关只启用，子项沿用 config /
+    // 默认值（默认只有 wrap）；写了列表才按列表重设。
     if (isSet(EnableAux)) {
       Opt->auxOpt()->setEnable(true);
       StringRef AuxList = EnableAux.getValue();
-      Opt->auxOpt()->setWrap(auxWants(AuxList, "wrap") ? 100 : 0);
-      Opt->auxOpt()->setShuffle(auxWants(AuxList, "shuffle"));
-      Opt->auxOpt()->setSplitCount(auxWants(AuxList, "split") ? 3 : 0);
+      if (!AuxList.empty()) {
+        Opt->auxOpt()->setWrap(auxHas(AuxList, "wrap") ? 100 : 0);
+        Opt->auxOpt()->setShuffle(auxHas(AuxList, "shuffle"));
+        Opt->auxOpt()->setSplitCount(auxHas(AuxList, "split") ? 3 : 0);
+      }
+    }
+
+    // 显式打开但参数为 0：不会保护任何站点，报出来而不是静默空转。
+    if (Opt->bcfOpt()->isEnabled() && Opt->bcfOpt()->strength() == 0)
+      llvm::errs() << "warning: \"bcf\" is enabled but strength is 0; "
+                      "no site will be protected\n";
+    if (Opt->decoyOpt()->isEnabled() && Opt->decoyOpt()->decoy() == 0)
+      llvm::errs() << "warning: \"decoy\" is enabled but ratio is 0; "
+                      "no site will be protected\n";
+
+    // aux 开了却三项全关：不报会变成静默空转。
+    if (Opt->auxOpt()->isEnabled() && Opt->auxOpt()->wrap() == 0 &&
+        !Opt->auxOpt()->shuffle() && Opt->auxOpt()->splitCount() == 0) {
+      llvm::errs()
+          << "warning: \"aux\" is enabled but wrap/shuffle/split are all "
+             "off; nothing to do\n";
+    }
+
+    // 实验性提示：这两项在 IR 层做了改动，但最终布局由后端和链接器决定，
+    // 无法从产物保证效果。用一次告警代替文档里的脚注。
+    if (Opt->auxOpt()->isEnabled() &&
+        (Opt->auxOpt()->shuffle() || Opt->auxOpt()->splitCount() > 0)) {
+      llvm::errs()
+          << "warning: aux.shuffle / aux.split are experimental: basic block "
+             "order and splits are not preserved by the backend "
+             "(MachineBlockPlacement / BranchFolding) or the linker, so the "
+             "final binary may not reflect them\n";
     }
     Cached = Opt;
     return Cached;
@@ -311,7 +361,7 @@ struct ObfuscationPassManager : public ModulePass {
         isSet(EnableIRConstantIntEncryption) ||
         isSet(EnableIRConstantFPEncryption) || isSet(EnableRttiEraser) ||
         isSet(EnableBogusControlFlow) || isSet(EnableDecoy) ||
-        isSet(EnableSymbolRename) || isSet(EnableAux) ||
+        isSet(EnableAux) ||
         !OboroConfigPath.empty()) {
       EnableIRObfuscation = true;
     }
@@ -381,16 +431,11 @@ struct ObfuscationPassManager : public ModulePass {
     }
 
     // INDBR 全部模式都在末端管线跑（见 Late 分支）：在 PipelineStart 跑
-    // 会被后续 SimplifyCFG 折回。这里只保留 RTTI / rename 这类模块级收尾。
+    // 会被后续 SimplifyCFG 折回。这里只保留 RTTI 这类模块级收尾。
 
     if (Options->rttiOpt()->isEnabled() ||
         Options->mayBeEnabled(Options->rttiOpt(), M)) {
       add(llvm::createMsRttiEraserPass(Options.get()));
-    }
-
-    if (Options->renameOpt()->isEnabled() ||
-        Options->mayBeEnabled(Options->renameOpt(), M)) {
-      add(llvm::createSymbolRenamePass(Options.get()));
     }
 
     bool Changed = run(M);

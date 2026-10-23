@@ -30,19 +30,18 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 | `-oboro-cfg` | string | "" | JSON 配置文件路径 |
 | `-irobf-level` | int | 0 | 所有支持 level 的功能的默认强度 0–3；config 里各功能自己的 `level` 优先 |
 | **OLLVM 原有** | | | |
-| `-irobf-indbr` | `[=table\|full\|dual]` | 关闭 | 间接分支。不带值 = `table`（页表）；`full` = 无条件 `br` 也走页表；`dual` = 双目标 `blockaddress`。三种模式都在末端管线执行 |
+| `-irobf-indbr` | `[=table\|full\|dual]` | 关闭 | 间接分支。不带值 = 沿用 config 的 `mode`（默认 `table` 页表）；`full` = 无条件 `br` 也走页表；`dual` = 双目标 `blockaddress`。三种模式都在末端管线执行 |
 | `-irobf-icall` | bool | false | 间接调用 |
 | `-irobf-indgv` | bool | false | 间接全局变量 |
 | `-irobf-fla` | bool | false | 控制流平坦化 |
 | `-irobf-cse` | bool | false | 字符串加密 |
 | `-irobf-cie` | bool | false | 整数常量加密 |
 | `-irobf-cfe` | bool | false | 浮点常量加密 |
-| `-irobf-rtti` | bool | false | 擦除 MSVC RTTI |
+| `-irobf-rtti` | bool | false | 随机化 MSVC RTTI 类型描述符里的类名（`.?AV...` → 随机串）。结构保留，`dynamic_cast` 不受影响；不是删除 RTTI |
 | **新功能** | | | |
-| `-irobf-bcf` | `[=0..100]` | 关闭 | 虚假控制流 v2。不带值 = 强度 70 |
-| `-irobf-decoy` | `[=0..100]` | 关闭 | 运行时诱饵路径（独立功能，不依赖 BCF）。不带值 = 30% 的站点走诱饵菱形，其余为纯 poison |
-| `-irobf-rename` | bool | false | 内部符号随机重命名：函数 + 全局 + 别名。只对仍存在的 internal 符号生效（O1+ 会内联掉大部分）。调试信息不归本 pass 管，发布构建用 `-g0` 或 `strip --strip-debug` |
-| `-irobf-aux` | `[=wrap,shuffle,split]` | 关闭 | 结构性后处理。不带值 = 三项全开 |
+| `-irobf-bcf` | `[=0..100]` | 关闭 | 虚假控制流 v2。不带值 = 沿用 config 的 `strength`（默认 70）；`=0` 表示关闭，不挂 pass |
+| `-irobf-decoy` | `[=0..100]` | 关闭 | 运行时诱饵路径（独立功能，不依赖 BCF）。不带值 = 沿用 config 的 `ratio`（默认 30% 的站点走诱饵菱形，其余为纯 poison）；`=0` 表示关闭 |
+| `-irobf-aux` | `[=wrap,shuffle,split]` | 关闭 | 结构性后处理。不带值 = 沿用 config 的子项（默认只开 `wrap`）；`shuffle` / `split` 为**实验性**，必须显式列出（见下文边界） |
 
 ### 各功能的子配置（只走 config）
 
@@ -62,20 +61,24 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 | | `pollute` | false | L3 值污染 |
 | | `probe` | `__oboro_probe` | App 提供的 probe 符号名 |
 | `aux` | `wrap` | 100 | 转发包装概率 |
-| | `shuffle` | true | 基本块乱序 |
-| | `split` | 3 | 每函数最多切几刀 |
+| | `shuffle` | false | 基本块乱序（实验性） |
+| | `split` | 0 | 每函数最多切几刀，上限 7（实验性） |
 
 全局字段：`seed` / `randomSeed`、`ptrauth`、`deny`、`patterns`。
+
+**pattern 只能覆盖按函数生效的字段**：`enable`、`level`、`ratio`、`pollute`、`strength`、`budget`、`budget_pct`。`mode` / `split` / `wrap` / `shuffle` / `shared` / `probe` 是模块级构建参数，写在 pattern 里会告警并忽略。
+
+**裸开关不重置参数**：`-irobf-bcf`、`-irobf-decoy`、`-irobf-indbr`、`-irobf-aux` 不带值时只负责启用，参数沿用 config；只有写了值（`-irobf-bcf=90`）才覆盖。`-irobf-level` 同理，只填补 config 里没写 `level` 的域。
 
 ### 附加 pass 的边界
 
 | 项 | 行为 |
 |---|---|
 | `-irobf-aux=wrap` | 默认 100% 全量包装，体积明显增加。只对 ABI 安全的函数生效（跳过 `main`、vararg、`alwaysinline`、`byval`/`sret`/`inalloca`、probe 符号） |
-| `-irobf-aux=shuffle` | 只改基本块物理顺序，不改 CFG |
-| `-irobf-aux=split` | 每函数最多切 `aux.split` 刀（默认 3，上限 7） |
+| `-irobf-aux=shuffle` | **实验性**。只改 IR 的基本块物理顺序，不改 CFG。后端 `MachineBlockPlacement` 会按分支概率重新排块，链接器还可能做节/函数重排，所以最终二进制布局不保证与 IR 一致 |
+| `-irobf-aux=split` | **实验性**。每函数最多切 `aux.split` 刀（默认 0 = 关，上限 7）。后端的 `BranchFolding` / tail merging 会把单前驱单后继的块重新合并，切出来的块可能被合回去 |
 | `-irobf-indbr`（全部模式） | 在末端管线执行：在 PipelineStart 跑会被后续 SimplifyCFG 折回（实测 39 个分支只剩 13 个）。代价是解密代码不参与优化，体积比早期挂载高约 10–20% |
-| `-irobf-indbr=dual` | 双目标 `blockaddress`，**不做块拆分**（`indbr.split` 对 dual 无效），与页表模式互斥 |
+| `-irobf-indbr=dual` | 双目标 `blockaddress`，**不做块拆分**（`indbr.split_insns` 对 dual 无效），与页表模式互斥 |
 
 隐藏的测试开关（不要用于生产）：`-irobf-bcf_pred`、`-irobf-bcf_topo`、`-irobf-force-decoy`、`-irobf-force-real`、`-irobf-debug-names`。
 
@@ -97,7 +100,13 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 ```bash
 -mllvm -irobf-fla
 ```
-将函数内所有基本块放入一个 switch-loop 分发器，隐藏原始控制流结构。switch 值通过 XOR 加密，对抗 IDA 值追踪。
+将函数内所有基本块放入一个 switch-loop 分发器，隐藏原始控制流结构。
+
+状态变量的密钥**在运行时派生**：`ptrtoint(模块内全局) ^ ptrtoint(状态 alloca) ^ 函数种子`。两个地址都由加载器/栈决定，静态分析拿不到。
+
+密钥**每轮滚动**：`K_{i+1} = mix(K_i)`（乘 + 移位 + 异或 + 加，四种展开按函数随机选一种）。密钥全程只走 PHI / 寄存器，**不写内存**——一旦落进栈槽，它就会和密文同时出现在内存里，单次内存快照就能解出当轮转移。块里只写密文 `NextCase ^ K_{i+1}`，任何一块都看不到密钥。
+
+因此：单次动态抓取只能得到一轮的密钥，要还原整条状态链必须逐轮插桩，或者把 `mix` 的随机常数和演化关系重新实现一遍。
 
 > 超过 50 个基本块的函数自动跳过：平坦化会让 switch 分发器和 PHI 数量爆炸（zlib 的 `inflate`/`deflate` 实测 90s 不收敛）。
 
@@ -172,6 +181,18 @@ __attribute__((annotate("+decoy_pollute")))  // 升级到 L3 值污染
   { "match": "Crypto::**", "decoy": { "enable": true, "ratio": 80, "pollute": true } }
 ] }
 ```
+
+### 注解语法
+
+| 注解 | 含义 | 适用域 |
+|---|---|---|
+| `+<pass>` / `-<pass>` | 为该函数启用 / 禁用某个 pass | 全部 |
+| `^<pass>=N` | 强度档位 0–9 | 只有带 level 的域：`indbr` / `icall` / `indgv` / `cie` / `cfe` |
+| `^decoy=N` | 该函数的诱饵比例 0–100 | `decoy` |
+| `+decoy` / `-decoy` | 启用 / 禁用诱饵（等价 `^decoy=100` / `^decoy=0`） | `decoy` |
+| `+decoy_pollute` / `-decoy_pollute` | L3 值污染开关（不单独构成资格） | `decoy` |
+
+`^<pass>=N` 写到没有档位的域（`bcf` / `fla` / `rtti` / `aux`）会打印 warning 并忽略——BCF 的强度是 `strength`（0–100），只能走 config 或命令行。
 
 | 级别 | 行为 | 运行时结果 |
 |---|---|---|
@@ -253,11 +274,11 @@ L3 站点。
 
 ### 其他
 
-#### RTTI 擦除 (RTTI)
+#### RTTI 类型名随机化 (RTTI)
 ```bash
 -mllvm -irobf-rtti
 ```
-擦除 C++ RTTI 信息，防止逆向工具通过类型信息还原类结构（实验性）。
+把 MSVC `rtti.TypeDescriptor` 里的类型名（`.?AV...` / `.?AU...`）替换成随机字符串，逆向工具无法再按类名检索，也读不出原始类型层次。**只改名字，不删结构**：`typeid` / `dynamic_cast` 仍然正常工作。
 
 ---
 
@@ -328,7 +349,7 @@ L3 站点。
 |---|---|
 | `<pass>.enable` | 开关（`true`/`false`） |
 | `indbr.mode` | `table` / `full` / `dual` |
-| `indbr.split` | 间接化前把块拆到最多 N 条指令（0 = 不拆） |
+| `indbr.split_insns` | 间接化前把块拆到最多 N 条指令（0 = 不拆）。注意与 `aux.split`（每函数切几刀）不是同一个单位 |
 | `indbr.level` / `icall.level` / `indgv.level` | 0 = 全模块共享页表（体积优先），1~3 = 每函数独立页表 + 解密循环层数 |
 | `cie.level` / `cfe.level` | 加密强度 0~3，默认 2（0 = 只做一次减法，最弱） |
 | `bcf.strength` | 站点概率 0–100（默认 70） |

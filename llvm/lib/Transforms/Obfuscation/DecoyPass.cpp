@@ -593,7 +593,11 @@ struct DecoyPass : public FunctionPass {
     if (!ConfiguredProbe.empty())
       ActiveProbeName = ConfiguredProbe;
 
-    bool NeedDecoy = ArgsOptions->decoyOpt()->isEnabled();
+    // 模块级 ratio 为 0 时没有任何站点会走诱饵，不必生成 runtime 脚手架
+    // （4 个私有全局 + 一个模块 ctor）。pattern / 注解仍可单独打开。
+    bool NeedDecoy =
+        ArgsOptions->decoyOpt()->isEnabled() &&
+        ArgsOptions->decoyOpt()->decoy() > 0;
     if (!NeedDecoy)
       for (const ConfigPatternRule &Rule : ArgsOptions->patternRules()) {
         auto It = Rule.Overrides.find("decoy");

@@ -30,19 +30,18 @@ All obfuscation flags are passed to the compiler via `-mllvm -<flag>`.
 | `-oboro-cfg` | string | "" | Path to a JSON obfuscation config file |
 | `-irobf-level` | int | 0 | Default strength 0-3 for every pass that has a level; per-pass `level` in config wins |
 | **OLLVM originals** | | | |
-| `-irobf-indbr` | `[=table\|full\|dual]` | off | Indirect branches. No value = `table` (page table); `full` = unconditional `br` too; `dual` = two-target `blockaddress`. All three modes run in the late pipeline |
+| `-irobf-indbr` | `[=table\|full\|dual]` | off | Indirect branches. No value = keep the config `mode` (default `table`, page table); `full` = unconditional `br` too; `dual` = two-target `blockaddress`. All three modes run in the late pipeline |
 | `-irobf-icall` | bool | false | Indirect calls |
 | `-irobf-indgv` | bool | false | Indirect global variables |
 | `-irobf-fla` | bool | false | Control-flow flattening |
 | `-irobf-cse` | bool | false | String encryption |
 | `-irobf-cie` | bool | false | Integer constant encryption |
 | `-irobf-cfe` | bool | false | Floating-point constant encryption |
-| `-irobf-rtti` | bool | false | Erase MSVC RTTI |
+| `-irobf-rtti` | bool | false | Randomises the class names inside MSVC RTTI type descriptors (`.?AV...` -> random string). The structures stay intact, so `dynamic_cast` still works; nothing is erased |
 | **New features** | | | |
-| `-irobf-bcf` | `[=0..100]` | off | Bogus control flow v2. No value = strength 70 |
-| `-irobf-decoy` | `[=0..100]` | off | Runtime decoy paths (independent of BCF). No value = 30% of sites become decoy diamonds, the rest pure poison |
-| `-irobf-rename` | bool | false | Rename internal functions, globals and aliases. Only symbols that still exist are renamed (O1+ inlines most of them). Debug info is out of scope; use `-g0` or `strip --strip-debug` for release builds |
-| `-irobf-aux` | `[=wrap,shuffle,split]` | off | Structural passes. No value = all three |
+| `-irobf-bcf` | `[=0..100]` | off | Bogus control flow v2. No value = keep the config `strength` (default 70); `=0` turns it off and skips the pass |
+| `-irobf-decoy` | `[=0..100]` | off | Runtime decoy paths (independent of BCF). No value = keep the config `ratio` (default: 30% of sites become decoy diamonds, the rest pure poison); `=0` turns it off |
+| `-irobf-aux` | `[=wrap,shuffle,split]` | off | Structural passes. No value = keep the config sub-switches (default: `wrap` only); `shuffle` and `split` are **experimental** and must be named explicitly (see boundaries below) |
 
 ### Per-feature sub-config (config only)
 
@@ -62,20 +61,24 @@ Each feature accepts only its own fields; a field outside its domain prints a wa
 | | `pollute` | false | L3 value pollution |
 | | `probe` | `__oboro_probe` | App-provided probe symbol |
 | `aux` | `wrap` | 100 | Forwarding wrapper probability |
-| | `shuffle` | true | Basic block layout randomisation |
-| | `split` | 3 | Maximum splits per function |
+| | `shuffle` | false | Basic block layout randomisation (experimental) |
+| | `split` | 0 | Maximum splits per function, max 7 (experimental) |
 
 Global fields: `seed` / `randomSeed`, `ptrauth`, `deny`, `patterns`.
+
+**A pattern can only override per-function fields**: `enable`, `level`, `ratio`, `pollute`, `strength`, `budget`, `budget_pct`. `mode` / `split` / `wrap` / `shuffle` / `shared` / `probe` are module-level build parameters; writing them in a pattern prints a warning and is ignored.
+
+**A bare switch never resets parameters**: `-irobf-bcf`, `-irobf-decoy`, `-irobf-indbr` and `-irobf-aux` without a value only enable the feature and keep the config parameters; only an explicit value (`-irobf-bcf=90`) overrides them. `-irobf-level` likewise only fills in domains whose config has no `level`.
 
 ### Boundaries of the auxiliary passes
 
 | Item | Behaviour |
 |---|---|
 | `-irobf-aux=wrap` | 100% by default, size grows noticeably. Only ABI-safe functions are wrapped (`main`, varargs, `alwaysinline`, `byval`/`sret`/`inalloca` and the probe symbol are skipped) |
-| `-irobf-aux=shuffle` | Reorders basic blocks only, never changes the CFG |
-| `-irobf-aux=split` | At most `aux.split` cuts per function (default 3, max 7) |
+| `-irobf-aux=shuffle` | **Experimental.** Reorders basic blocks in the IR only, never changes the CFG. The backend `MachineBlockPlacement` re-sorts blocks by branch probability and the linker may reorder sections or functions, so the final layout is not guaranteed to match the IR |
+| `-irobf-aux=split` | **Experimental.** At most `aux.split` cuts per function (default 0 = off, max 7). The backend `BranchFolding` / tail merging re-merges single-predecessor single-successor blocks, so the cuts may disappear |
 | `-irobf-indbr` (all modes) | Runs in the late pipeline: at PipelineStart the later SimplifyCFG folds single-target `indirectbr` back into `br` (39 branches became 13 in testing). The trade-off is that the decryption code is no longer optimized, so the binary is 10-20% larger than an early mount |
-| `-irobf-indbr=dual` | Two-target `blockaddress`, **no block splitting** (`indbr.split` has no effect in dual mode), mutually exclusive with page-table mode |
+| `-irobf-indbr=dual` | Two-target `blockaddress`, **no block splitting** (`indbr.split_insns` has no effect in dual mode), mutually exclusive with page-table mode |
 
 Hidden testing switches (never for production): `-irobf-bcf_pred`, `-irobf-bcf_topo`, `-irobf-force-decoy`, `-irobf-force-real`, `-irobf-debug-names`.
 
@@ -97,7 +100,13 @@ Hidden testing switches (never for production): `-irobf-bcf_pred`, `-irobf-bcf_t
 ```bash
 -mllvm -irobf-fla
 ```
-Puts all basic blocks of a function into a switch-loop dispatcher, hiding the original control-flow structure. The switch values are XOR-encrypted to defeat IDA value tracking.
+Puts all basic blocks of a function into a switch-loop dispatcher, hiding the original control-flow structure.
+
+The state key is **derived at run time**: `ptrtoint(module global) ^ ptrtoint(state alloca) ^ function seed`. Both addresses are decided by the loader and the stack, so static analysis cannot evaluate them.
+
+The key **rolls every round**: `K_{i+1} = mix(K_i)` (multiply + shift + xor + add, one of four expansions picked per function). The key lives only in a PHI / register and is **never written to memory** — a stack slot would put the key and the ciphertext side by side, and a single memory snapshot would reveal that round's transition. Blocks store only the ciphertext `NextCase ^ K_{i+1}`; no block ever sees the key.
+
+So one dynamic capture yields one round's key. Recovering the whole state chain needs per-round instrumentation, or reimplementing the randomised `mix` and its evolution.
 
 > Functions with more than 50 basic blocks are skipped: flattening makes the dispatcher and PHI count explode (zlib `inflate`/`deflate` did not converge in 90s without the cap).
 
@@ -168,7 +177,7 @@ extern "C" int __oboro_probe(void) {
 }
 ```
 
-**Enabling**: `-irobf-decoy[=ratio]` turns it on globally (30% of functions by default), or use a
+**Enabling**: `-irobf-decoy[=ratio]` turns it on globally (30% of sites by default), or use a
 **function annotation** / **config pattern** for per-function control. decoy is its own
 feature domain and does not depend on `-irobf-bcf`.
 
@@ -180,9 +189,21 @@ __attribute__((annotate("+decoy_pollute")))  // upgrade to L3 value pollution
 
 ```json
 { "patterns": [
-  { "match": "Crypto::**", "bcf": { "enable": true, "decoy": 80, "decoy_pollute": true } }
+  { "match": "Crypto::**", "decoy": { "enable": true, "ratio": 80, "pollute": true } }
 ] }
 ```
+
+### Annotation syntax
+
+| Annotation | Meaning | Domains |
+|---|---|---|
+| `+<pass>` / `-<pass>` | Enable / disable a pass for this function | all |
+| `^<pass>=N` | Strength tier 0-9 | only domains with a level: `indbr` / `icall` / `indgv` / `cie` / `cfe` |
+| `^decoy=N` | Decoy ratio for this function, 0-100 | `decoy` |
+| `+decoy` / `-decoy` | Enable / disable decoy (same as `^decoy=100` / `^decoy=0`) | `decoy` |
+| `+decoy_pollute` / `-decoy_pollute` | L3 value pollution (does not qualify on its own) | `decoy` |
+
+Writing `^<pass>=N` on a domain without levels (`bcf` / `fla` / `rtti` / `aux`) prints a warning and is ignored — BCF strength is `strength` (0-100) and is config/CLI only.
 
 | Level | Behavior | Runtime result |
 |---|---|---|
@@ -265,11 +286,11 @@ Floating-point constants are encrypted.
 
 ### Others
 
-#### RTTI Erasure (RTTI)
+#### RTTI type-name randomisation (RTTI)
 ```bash
 -mllvm -irobf-rtti
 ```
-Erases C++ RTTI information, preventing reverse-engineering tools from recovering class structure from type info (experimental).
+Replaces the type names inside MSVC `rtti.TypeDescriptor` (`.?AV...` / `.?AU...`) with random strings, so reverse-engineering tools can no longer search by class name or read the original hierarchy. **Names only, structure kept**: `typeid` / `dynamic_cast` keep working.
 
 ---
 
@@ -341,7 +362,7 @@ script, never the source**:
 |---|---|
 | `<pass>.enable` | On/off switch (`true`/`false`) |
 | `indbr.mode` | `table` / `full` / `dual` |
-| `indbr.split` | Split blocks to at most N instructions before indirection (0 = off) |
+| `indbr.split_insns` | Split blocks to at most N instructions before indirection (0 = off). Not the same unit as `aux.split` (cuts per function) |
 | `indbr.level` / `icall.level` / `indgv.level` | 0 = module-wide shared page table (size first), 1-3 = per-function table + decryption loop layers |
 | `cie.level` / `cfe.level` | Encryption strength 0-3, default 2 (0 = a single subtraction, weakest) |
 | `bcf.strength` | Site probability 0-100 (default 70) |

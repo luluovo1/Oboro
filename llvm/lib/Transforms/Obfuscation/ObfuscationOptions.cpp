@@ -19,6 +19,30 @@ using namespace llvm;
 
 namespace llvm {
 
+// config 字段名 -> 字段标志；0 表示不认识这个字段名。
+static uint32_t fieldFlagOf(StringRef N) {
+  if (N == "level")      return F_Level;
+  if (N == "mode")       return F_Mode;
+  if (N == "split")      return F_Split;
+  if (N == "split_insns") return F_SplitInsns;
+  if (N == "strength")   return F_Strength;
+  if (N == "budget")     return F_Budget;
+  if (N == "budget_pct") return F_BudgetPct;
+  if (N == "ratio")      return F_Ratio;
+  if (N == "pollute")    return F_Pollute;
+  if (N == "probe")      return F_Probe;
+  if (N == "shared")     return F_Shared;
+  if (N == "wrap")       return F_Wrap;
+  if (N == "shuffle")    return F_Shuffle;
+  return 0;
+}
+
+// 哪些字段能按 pattern 覆盖：只有真正按函数生效的参数。mode / split /
+// wrap / shuffle / shared / probe 都是模块级构建参数，pattern 里写了必须
+// 告警——以前这些字段会被静默丢弃，和"配置写错要报错"的约定相悖。
+static constexpr uint32_t PatternOverridable =
+    F_Level | F_Ratio | F_Pollute | F_Strength | F_Budget | F_BudgetPct;
+
 // IR features whose semantics cannot survive CFG rewriting or call-site
 // rewriting.  These are not "hardening" choices but correctness gates:
 //   - convergence tokens: control flow must stay inside the convergence region
@@ -455,15 +479,19 @@ std::shared_ptr<ObfuscationOptions> ObfuscationOptions::readConfigFile(
                            << "\" (expected table|full|dual); ignored\n";
           }
         }
+        // indbr：进入页表前把块拆到最多 N 条指令。字段名是 split_insns，
+        // 与 aux.split（每函数切几刀）区分——两者单位不同，曾经共用一个
+        // "split" 名字，很容易配错。
+        if (auto split = optObj->getInteger("split_insns")) {
+          if (acceptsField(obfOpt, F_SplitInsns, "split_insns"))
+            obfOpt->setIndBrSplitCount(static_cast<uint32_t>(
+                std::min<int64_t>(4096, std::max<int64_t>(0, split.value()))));
+        }
+        // aux：每函数最多切几刀。
         if (auto split = optObj->getInteger("split")) {
-          if (acceptsField(obfOpt, F_Split, "split")) {
-            uint32_t N = static_cast<uint32_t>(
-                std::min<int64_t>(4096, std::max<int64_t>(0, split.value())));
-            if (obfOpt->attributeName() == "indbr")
-              obfOpt->setIndBrSplitCount(N);
-            else
-              obfOpt->setSplitCount(N);
-          }
+          if (acceptsField(obfOpt, F_Split, "split"))
+            obfOpt->setSplitCount(static_cast<uint32_t>(
+                std::min<int64_t>(4096, std::max<int64_t>(0, split.value()))));
         }
         // bcf 专用：站点概率与每函数上限。
         if (auto s = optObj->getInteger("strength")) {
@@ -558,6 +586,13 @@ std::shared_ptr<ObfuscationOptions> ObfuscationOptions::readConfigFile(
       }
       continue;
     }
+    if (obj.getFirst().str() == "rename") {
+      // 该功能已删除：IR 层改名只能覆盖当前 TU 里还活着的 internal 符号，
+      // 最终符号表由链接器写，清理它是 strip 的职责，不是一个 pass 能保证的。
+      llvm::errs() << "warning: \"rename\" was removed; use `strip --strip-all` "
+                      "(or `objcopy --strip-symbol`) on the linked binary\n";
+      continue;
+    }
     if (obj.getFirst().str() == "ptrauth") {
       // Opt-in AArch64 pointer authentication.  Accept both
       // "ptrauth": true and "ptrauth": {"enable": true}.
@@ -643,6 +678,26 @@ std::shared_ptr<ObfuscationOptions> ObfuscationOptions::readConfigFile(
               if (auto pv = vo->getInteger("budget_pct"))
                 ov.BudgetPct = static_cast<uint32_t>(std::min<int64_t>(
                     100, std::max<int64_t>(0, pv.value())));
+              // 逐字段校验：不属于该域的字段，或属于该域但只能模块级
+              // 设置的字段，都在这里告警。
+              for (auto &fk : *vo) {
+                StringRef FName = fk.getFirst().str();
+                if (FName == "enable")
+                  continue;
+                uint32_t Flag = fieldFlagOf(FName);
+                if (Flag == 0) {
+                  llvm::errs() << "warning: unknown field " << FName
+                               << " in pattern pass " << key
+                               << "; ignored\n";
+                } else if (!(opt->supportedFields() & Flag)) {
+                  llvm::errs() << "warning: " << key << " does not accept "
+                               << FName << "; ignored\n";
+                } else if (!(Flag & PatternOverridable)) {
+                  llvm::errs() << "warning: " << key << "." << FName
+                               << " is module-level and cannot be overridden "
+                                  "per pattern; ignored\n";
+                }
+              }
               rule.Overrides[key] = ov;
             } else {
               llvm::errs() << "warning: pattern value for \"" << key
@@ -878,8 +933,19 @@ ObfOpt ObfuscationOptions::toObfuscate(const std::shared_ptr<ObfOpt> &option,
           return result.none();
         }
 
-        ++levelSet;
-        result.setLevel(level);
+        // `^<pass>=N` 的语义取决于功能域：只有声明了 F_Level 的域才把它
+        // 当强度。bcf 用的是 strength（0-100），aux/fla/rtti 没有强度概念，
+        // 写在这里以前会静默设置一个没人读的 Level —— 必须报出来。
+        if (result.supportedFields() & F_Level) {
+          ++levelSet;
+          result.setLevel(level);
+        } else {
+          f->getContext().diagnose(DiagnosticInfoUnsupported{
+              *f, f->getName() + ": \"" + attrLevel +
+                     "\" has no meaning for \"" + result.attributeName() +
+                     "\" (that domain has no level); annotation ignored",
+              DiagnosticLocation(), DS_Warning});
+        }
       }
     }
   }

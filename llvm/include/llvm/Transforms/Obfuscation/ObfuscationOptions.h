@@ -64,6 +64,9 @@ enum OptField : uint32_t {
   F_Shared     = 1u << 9,
   F_Wrap       = 1u << 10,
   F_Shuffle    = 1u << 11,
+  // indbr 专用：进入页表前把块拆到最多 N 条指令（和 aux.split 的
+  // "每函数切几刀" 不是一个单位，所以不复用 F_Split）。
+  F_SplitInsns = 1u << 12,
 };
 
 class ObfOpt {
@@ -71,6 +74,9 @@ protected:
   uint32_t    Enabled : 1;
   // 强度档位 0..3。只有声明了 F_Level 的 pass 才读它。
   uint32_t    Level   : 2;
+  // 该域是否被显式配置过 level（config / 注解）。用于让全局
+  // -irobf-level 只做"默认值"，不覆盖用户在 config 里写死的档位。
+  uint32_t    LevelSet : 1;
   // indbr 专用：0 = table（默认）, 1 = full（全边）, 2 = dual（双目标）。
   uint32_t    Mode    : 2;
   // bcf 专用：站点命中概率 0..100。
@@ -106,7 +112,7 @@ public:
   // 该功能域接受哪些 config 字段。未列出的字段写了会被拒绝并告警。
   uint32_t supportedFields() const {
     const std::string &N = AttributeName;
-    if (N == "indbr")  return F_Level | F_Mode | F_Split;
+    if (N == "indbr")  return F_Level | F_Mode | F_SplitInsns;
     if (N == "icall")  return F_Level;
     if (N == "indgv")  return F_Level;
     if (N == "fla")    return 0;
@@ -116,8 +122,6 @@ public:
     if (N == "rtti")   return 0;
     if (N == "bcf")    return F_Strength | F_Budget | F_BudgetPct;
     if (N == "decoy")  return F_Ratio | F_Pollute | F_Probe;
-    // rename 没有档位：改名就是改名，做一半等于没做（调试信息会泄露原名）。
-    if (N == "rename") return 0;
     if (N == "aux")    return F_Wrap | F_Shuffle | F_Split;
     return 0;
   }
@@ -184,6 +188,13 @@ public:
 
   void setLevel(uint32_t level) {
     this->Level = std::min<uint32_t>(level, 3);
+    this->LevelSet = 1;
+  }
+
+  // 是否被 config / 注解显式指定过 level。全局 -irobf-level 只填补未指定
+  // 的域，避免把 config 里调好的档位重置回命令行默认值。
+  bool levelSet() const {
+    return this->LevelSet != 0;
   }
 
   void setDecoy(uint32_t decoy) {
@@ -250,6 +261,7 @@ private:
   void init(bool enable, uint32_t level, const std::string &attributeName) {
     this->Enabled = enable;
     this->Level = std::min<uint32_t>(level, 3);
+    this->LevelSet = 0;
     // CIE/CFE 的 level 只是加密强度（0 = 一次 sub，2 = 三层混合），
     // 运行时成本几乎相同，默认给 2；显式写 0 仍然尊重。
     // INDBR/ICALL/INDGV 的 level 0 表示"全模块共享页表"，是体积取舍，
@@ -263,9 +275,10 @@ private:
     this->DecoyPollute = 0;
     this->SharedDecrypt = 0;
     this->Wrap = 100;
-    // aux 域默认三项全开，与 `-irobf-aux` 不带值的行为一致。
-    this->DoShuffle = 1;
-    this->SplitCount = 3;
+    // aux 域默认只开 wrap：shuffle / split 是实验性的（最终布局由后端和
+    // 链接器决定），必须显式写进 config 或命令行才生效。
+    this->DoShuffle = 0;
+    this->SplitCount = 0;
     this->AttributeName = attributeName;
   }
 };
@@ -283,7 +296,6 @@ protected:
   std::shared_ptr<ObfOpt> BcfOpt  = nullptr;
   // decoy（运行时诱饵）是独立功能域：不再挂在 BCF 上。
   std::shared_ptr<ObfOpt> DecoyOpt = nullptr;
-  std::shared_ptr<ObfOpt> RenameOpt = nullptr;
   // 结构性后处理（转发包装 / 块乱序 / 块拆分）合成一个域。
   std::shared_ptr<ObfOpt> AuxOpt = nullptr;
 
@@ -302,7 +314,7 @@ protected:
 
 public:
   SmallVector<std::shared_ptr<ObfOpt>> getAllOpt() const {
-    SmallVector<std::shared_ptr<ObfOpt>, 13> allOpt;
+    SmallVector<std::shared_ptr<ObfOpt>, 11> allOpt;
     allOpt.push_back(IndBrOpt);
     allOpt.push_back(ICallOpt);
     allOpt.push_back(IndGvOpt);
@@ -313,7 +325,6 @@ public:
     allOpt.push_back(RttiOpt);
     allOpt.push_back(BcfOpt);
     allOpt.push_back(DecoyOpt);
-    allOpt.push_back(RenameOpt);
     allOpt.push_back(AuxOpt);
     return allOpt;
   }
@@ -328,7 +339,6 @@ public:
                      const std::shared_ptr<ObfOpt> &rttiOpt,
                      const std::shared_ptr<ObfOpt> &bcfOpt,
                      const std::shared_ptr<ObfOpt> &decoyOpt,
-                     const std::shared_ptr<ObfOpt> &renameOpt,
                      const std::shared_ptr<ObfOpt> &auxOpt) {
     this->IndBrOpt = indBrOpt;
     this->ICallOpt = iCallOpt;
@@ -340,7 +350,6 @@ public:
     this->RttiOpt = rttiOpt;
     this->BcfOpt  = bcfOpt;
     this->DecoyOpt = decoyOpt;
-    this->RenameOpt = renameOpt;
     this->AuxOpt = auxOpt;
   }
 
@@ -355,7 +364,6 @@ public:
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "rtti")),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "bcf")),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "decoy")),
-                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "rename")),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "aux"))
                        } {}
 
@@ -393,7 +401,6 @@ public:
 
   auto bcfOpt() const { return BcfOpt; }
   auto decoyOpt() const { return DecoyOpt; }
-  auto renameOpt() const { return RenameOpt; }
   auto auxOpt() const { return AuxOpt; }
 
   auto &randomSeed() {

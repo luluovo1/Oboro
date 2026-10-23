@@ -16,7 +16,6 @@ add_llvm_library(LLVMObfuscation
   ConstantIntEncryption.cpp
   ConstantFPEncryption.cpp
   MicrosoftRTTIEraser.cpp
-  SymbolRename.cpp
   AuxPasses.cpp
   
   ADDITIONAL_HEADER_DIRS

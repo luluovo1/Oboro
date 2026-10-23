@@ -157,7 +157,7 @@ clang -O2 -mllvm -irobf-cse -mllvm -irobf-cie -mllvm -irobf-level=1 hotpath.c -o
 
 ### About the Level flags
 
-`-irobf-level` sets the runtime XOR decryption loop layers for every pass that has a level (INDBR / ICALL / INDGV / CIE / CFE / rename). **The higher the level, the harder to reverse — and the cost grows exponentially.** To tune one pass alone, use its config node, e.g. `"indgv": {"level": 1}`.
+`-irobf-level` sets the runtime XOR decryption loop layers for every pass that has a level (INDBR / ICALL / INDGV / CIE / CFE). **The higher the level, the harder to reverse — and the cost grows exponentially.** To tune one pass alone, use its config node, e.g. `"indgv": {"level": 1}`.
 
 | Level | Extra overhead (reference) | Use case |
 |:---:|:---:|:---|
