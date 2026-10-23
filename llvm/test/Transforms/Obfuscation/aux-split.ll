@@ -1,4 +1,4 @@
-; RUN: opt -S -passes='default<O0>' -irobf-split -irobf-split_num=2 < %s -o - | FileCheck %s
+; RUN: opt -S -passes='default<O0>' -irobf-aux=split < %s -o - | FileCheck %s
 ;
 ; The late split pass must add control-flow edges to a straight-line body.
 

@@ -1,4 +1,4 @@
-; RUN: opt -S -passes='default<O0>' -irobf-rename -level-rename=2 < %s -o - | FileCheck %s
+; RUN: opt -S -passes='default<O0>' -irobf-rename < %s -o - | FileCheck %s
 ;
 ; Internal symbols get opaque names; exported symbols and main keep theirs.
 

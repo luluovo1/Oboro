@@ -1,4 +1,4 @@
-; RUN: opt -S -passes='default<O0>' -irobf-fwrap < %s -o - | FileCheck %s
+; RUN: opt -S -passes='default<O0>' -irobf-aux=wrap < %s -o - | FileCheck %s
 ;
 ; Direct calls are retargeted to an internal forwarding wrapper.
 

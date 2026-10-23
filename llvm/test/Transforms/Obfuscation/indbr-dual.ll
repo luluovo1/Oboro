@@ -1,4 +1,4 @@
-; RUN: opt -S -passes='default<O1>' -irobf-indbr-dual < %s -o - | FileCheck %s
+; RUN: opt -S -passes='default<O1>' -irobf-indbr=dual < %s -o - | FileCheck %s
 ;
 ; Dual mode replaces a conditional branch with a two-target indirectbr whose
 ; destination is a select of two block addresses, and runs late so SimplifyCFG
