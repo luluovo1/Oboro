@@ -74,6 +74,14 @@ bool Flattening::runOnFunction(Function &F) {
 bool Flattening::flatten(Function *f, const ObfOpt &opt) {
   vector<BasicBlock *> origBB;
 
+  // 平坦化后的代码会让 SLPVectorizer 的组合搜索爆炸：zlib 的 inflate_table
+  // 只有 53 块，平坦化后 180 块，O2 下 SLP 卡 40s 以上。
+  // 阈值取 50 块：超过这个规模的函数本身就属于"膨胀函数"，平坦化收益低、
+  // 编译代价高，直接跳过。
+  static constexpr unsigned MaxFlattenBlocks = 50;
+  if (f->size() > MaxFlattenBlocks)
+    return false;
+
   // 在 LowerSwitch 之前验证 CFG：lower 会改写函数，即使后续 flatten
   // 失败也不可逆；EH / invoke / callbr / indirectbr 一律拒绝。
   for (BasicBlock &BB : *f) {
