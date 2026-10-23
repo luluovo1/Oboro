@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .codebuddy/hooks/check-done.sh",
+            "command": "bash \"$CODEBUDDY_PROJECT_DIR/.codebuddy/hooks/check-done.sh\"",
             "timeout": 20
           }
         ]
