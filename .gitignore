@@ -79,6 +79,7 @@ pythonenv*
 #==============================================================================#
 # 本地构建目录 - 不要提交（重新编译太慢，本地保留）
 /llvm/buildtest/
+/llvm/buildassert/
 /llvm/build/
 /llvm/build-*/
 /build-debug/
