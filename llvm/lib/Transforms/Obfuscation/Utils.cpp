@@ -802,8 +802,16 @@ static Value *buildMBAXor(IRBuilder<NoFolder> &IRB, Value *A, Value *B, unsigned
 // halving the effective key space.
 static APInt getRandomAPInt(CryptoUtils &RE, unsigned BitWidth) {
   APInt Result = APInt::getZero(BitWidth);
-  for (unsigned Offset = 0; Offset < BitWidth; Offset += 64)
-    Result |= APInt(BitWidth, RE.get_uint64_t()) << Offset;
+  for (unsigned Offset = 0; Offset < BitWidth; Offset += 64) {
+    // APInt(BitWidth, uint64_t) asserts when the value does not fit the
+    // width, and a 64-bit random never fits i8/i16/i32.  Build each chunk at
+    // width 64, mask the tail chunk, then widen/truncate to the target width.
+    const unsigned ChunkBits = std::min(64u, BitWidth - Offset);
+    uint64_t Word = RE.get_uint64_t();
+    if (ChunkBits < 64)
+      Word &= (uint64_t(1) << ChunkBits) - 1;
+    Result |= APInt(64, Word).zextOrTrunc(BitWidth).shl(Offset);
+  }
   return Result;
 }
 
@@ -818,22 +826,31 @@ Value * encryptConstant(Constant *plainConstant, Instruction *insertBefore, Cryp
     return plainConstant;
   }
   
-  const auto Key = ConstantInt::get(
+  auto *Key = cast<ConstantInt>(ConstantInt::get(
       IntegerType::get(Ctx, BitWidth),
-      getRandomAPInt(*randomEngine, BitWidth));
+      getRandomAPInt(*randomEngine, BitWidth)));
 
   const auto ConstantIntVal = ConstantExpr::getBitCast(plainConstant, Key->getType());
   auto Enc = ConstantExpr::getSub(ConstantIntVal, Key);
-  Constant *XorKey = nullptr;
+  ConstantInt *XorKey = nullptr;
   if (level) {
-    XorKey = ConstantInt::get(Key->getType(),
-                              getRandomAPInt(*randomEngine, BitWidth));
+    XorKey = cast<ConstantInt>(ConstantInt::get(
+        Key->getType(), getRandomAPInt(*randomEngine, BitWidth)));
     Enc = ConstantExpr::getXor(Enc, XorKey);
     if (level > 1) {
-      Enc = ConstantExpr::getXor(Enc, ConstantExpr::get(Instruction::Mul, XorKey, Key));
+      // Both operands are compile-time constants, so fold the product here.
+      // LLVM 21 only allows Add/Sub/Xor as constant expressions
+      // (ConstantExpr::isSupportedBinOp), so get(Mul, ...) trips an assert.
+      Constant *Product = ConstantInt::get(
+          Key->getType(), XorKey->getValue() * Key->getValue());
+      Enc = ConstantExpr::getXor(Enc, Product);
     }
     if (level > 2) {
-      Enc = ConstantExpr::getXor(Enc, ConstantExpr::getNeg(XorKey));
+      // Neg is Sub(0, X), which is supported, but folding keeps the stored
+      // initializer to plain integers.
+      Constant *Neg =
+          ConstantInt::get(Key->getType(), -XorKey->getValue());
+      Enc = ConstantExpr::getXor(Enc, Neg);
     }
   }
   // Encrypted constants are never written after emission.  Marking the
