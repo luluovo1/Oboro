@@ -78,6 +78,12 @@ bool Flattening::runOnFunction(Function &F) {
   if (F.isIntrinsic()) {
     return false;
   }
+  // setjmp/longjmp 会把寄存器和栈恢复到 setjmp 点。FLA 的 state 变量
+  // 在 longjmp 之后回退到旧值，分发器会跳到错误的 case，轻则语义错误，
+  // 重则死循环。含 returns_twice 调用的函数必须原样保留。
+  if (F.callsFunctionThatReturnsTwice()) {
+    return false;
+  }
   Function *tmp = &F;
   bool      result = false;
   // Do we obfuscate

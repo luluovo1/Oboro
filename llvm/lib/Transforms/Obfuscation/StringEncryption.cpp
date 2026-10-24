@@ -103,6 +103,16 @@ struct StringEncryption : public ModulePass {
 } // namespace llvm
 
 char StringEncryption::ID = 0;
+
+/// RTTI 类型名字符串在运行时由 dynamic_cast / 异常匹配直接比较，而数据
+/// 引用没有可以插入解密代码的“使用点”。加密它们会让 Itanium ABI 下的
+/// dynamic_cast 一律返回 null（_ZTS* 是 type_info 的 name 字段），因此
+/// 这类全局必须原样保留。MSVC 的 RTTI 描述符（??_R*）同理跳过。
+static bool isRTTINameString(const GlobalVariable &GV) {
+  StringRef Name = GV.getName();
+  return Name.starts_with("_ZTS") || Name.starts_with("??_R");
+}
+
 bool StringEncryption::runOnModule(Module &M) {
   std::set<GlobalVariable *> ConstantStringUsers;
 
@@ -120,6 +130,8 @@ bool StringEncryption::runOnModule(Module &M) {
       GV.hasDLLExportStorageClass() || GV.isDLLImportDependent()) {
       continue;
     }
+    if (isRTTINameString(GV))
+      continue;
     Constant *Init = GV.getInitializer();
     if (Init == nullptr)
       continue;

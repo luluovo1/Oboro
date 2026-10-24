@@ -50,7 +50,7 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 | 功能 | 字段 | 默认 | 说明 |
 |:---|:---|:---:|:---|
 | `indbr` | `mode` | `table` | `table` / `full` / `dual` |
-| | `split` | 0 | 间接化前把块拆到最多 N 条指令（0 = 不拆） |
+| | `split_insns` | 0 | 间接化前把块拆到最多 N 条指令（0 = 不拆）。`split` 只属于 `aux` 域，写在 `indbr` 里会告警并忽略 |
 | | `level` | 0 | 解密循环层数 1–3 |
 | `icall` / `indgv` / `cie` / `cfe` | `level` | 0 | 各自的强度 |
 | `cse` | `shared` | false | 全模块共用一个解密器（体积优先） |
@@ -109,6 +109,8 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 因此：单次动态抓取只能得到一轮的密钥，要还原整条状态链必须逐轮插桩，或者把 `mix` 的随机常数和演化关系重新实现一遍。
 
 > 超过 50 个基本块的函数自动跳过：平坦化会让 switch 分发器和 PHI 数量爆炸（zlib 的 `inflate`/`deflate` 实测 90s 不收敛）。
+
+> 含 `returns_twice` 调用（`setjmp` / `_setjmp`）的函数自动跳过：`longjmp` 会把寄存器和栈恢复到 `setjmp` 点，平坦化的状态变量会一起回退，分发器可能跳错分支或死循环。
 
 #### 虚假控制流 (BCF) v2
 ```bash
@@ -355,7 +357,7 @@ L3 站点。
 | `bcf.strength` | 站点概率 0–100（默认 70） |
 | `bcf.budget_pct` | 每函数毒点占可插桩块的百分比（0–100，默认 20）。与 `budget` 都为 0 时回落到 16/20%，**不是不限** |
 | `bcf.budget` | 毒点绝对上限（0 = 不设；>0 时与百分比取较小值） |
-| `decoy.ratio` | 进入诱饵路径的函数比例（0–100，默认 30） |
+| `decoy.ratio` | 站点中走诱饵菱形的比例（0–100，默认 30），其余站点是纯 poison 菱形 |
 | `decoy.pollute` | L3 值污染（默认 false） |
 | `decoy.probe` | App 提供的 probe 符号名（默认 `__oboro_probe`） |
 | `aux.wrap` / `aux.shuffle` / `aux.split` | 包装概率 / 块乱序 / 每函数切几刀 |

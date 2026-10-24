@@ -50,7 +50,7 @@ Each feature accepts only its own fields; a field outside its domain prints a wa
 | Feature | Field | Default | Meaning |
 |:---|:---|:---:|:---|
 | `indbr` | `mode` | `table` | `table` / `full` / `dual` |
-| | `split` | 0 | Split blocks to at most N instructions before indirection |
+| | `split_insns` | 0 | Split blocks to at most N instructions before indirection. `split` belongs to the `aux` domain; writing it under `indbr` warns and is ignored |
 | | `level` | 0 | Decryption loop layers 1-3 |
 | `icall` / `indgv` / `cie` / `cfe` | `level` | 0 | Per-pass strength |
 | `cse` | `shared` | false | One shared decryptor per module (size first) |
@@ -109,6 +109,8 @@ The key **rolls every round**: `K_{i+1} = mix(K_i)` (multiply + shift + xor + ad
 So one dynamic capture yields one round's key. Recovering the whole state chain needs per-round instrumentation, or reimplementing the randomised `mix` and its evolution.
 
 > Functions with more than 50 basic blocks are skipped: flattening makes the dispatcher and PHI count explode (zlib `inflate`/`deflate` did not converge in 90s without the cap).
+
+> Functions that call a `returns_twice` function (`setjmp` / `_setjmp`) are skipped: `longjmp` restores registers and stack to the `setjmp` point, which rolls the flattened state variable back and can send the dispatcher to the wrong case or into an infinite loop.
 
 #### Bogus Control Flow (BCF) v2
 ```bash
@@ -368,7 +370,7 @@ script, never the source**:
 | `bcf.strength` | Site probability 0-100 (default 70) |
 | `bcf.budget_pct` | Fraction of eligible blocks to protect, 0-100 (default 20). With `budget` also 0 it falls back to 16/20%, **not unlimited** |
 | `bcf.budget` | Absolute BCF site cap (0 = none; min(pct, cap) applies) |
-| `decoy.ratio` | Fraction of functions entering decoy paths (0-100, default 30) |
+| `decoy.ratio` | Fraction of sites that become decoy diamonds (0-100, default 30); the rest are pure poison diamonds |
 | `decoy.pollute` | L3 value pollution (default false) |
 | `decoy.probe` | App-provided probe symbol (default `__oboro_probe`) |
 | `aux.wrap` / `aux.shuffle` / `aux.split` | Wrapper probability / block layout randomisation / splits per function |
