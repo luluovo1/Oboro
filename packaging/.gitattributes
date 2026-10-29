@@ -1,0 +1,8 @@
+# Release scripts run on Linux/macOS hosts as well, so the line endings in the
+# archive must not depend on the checking-out platform.
+* text=auto
+*.sh    text eol=lf
+*.bat   text eol=crlf
+*.mk    text eol=lf
+*.cmake text eol=lf
+VERSION text eol=lf

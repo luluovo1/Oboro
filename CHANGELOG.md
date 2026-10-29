@@ -13,6 +13,7 @@ Entries are tracked from the current documentation overhaul onward; earlier hist
 - Bilingual documentation with English as the default: `README.zh-CN.md`, `USAGE_en.md`, `CONTRIBUTING.zh-CN.md`
 - `CONTRIBUTING.md` (contributing guide), `CHANGELOG.md`, security reporting policy in `SECURITY.md`
 - Star history chart in the README
+- Release packaging (`packaging/`): versioned `oboro-<version>-<host>.tar.xz` archives with a per-file `MANIFEST.txt`, a standalone installer, an NDK drop-in installer with backup/restore, and CMake / ndk-build integration files
 
 ### Changed
 
