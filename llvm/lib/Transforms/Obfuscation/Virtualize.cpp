@@ -34,7 +34,9 @@ constexpr const char *kGeneratedAttr = "oboro.vmp.generated";
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -51,14 +53,17 @@ constexpr const char *kGeneratedAttr = "oboro.vmp.generated";
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <memory>
 #include <set>
 #include <cstdlib>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace llvm;
@@ -89,6 +94,20 @@ enum VMOp : uint8_t {
   OP_SHL,
   OP_LSHR,
   OP_ASHR,
+  // Immediate superinstructions: A = B <op> constant.  The constant would
+  // otherwise cost a prologue OP_IMM plus a register read on every use; here
+  // it is folded into the dispatch that already has to happen.  Shift amounts
+  // live in the instruction word, the other operators index the constant pool
+  // (a 64-bit immediate does not fit in Imm).
+  OP_ADD_IMM,
+  OP_SUB_IMM,
+  OP_MUL_IMM,
+  OP_AND_IMM,
+  OP_OR_IMM,
+  OP_XOR_IMM,
+  OP_SHL_IMM,
+  OP_LSHR_IMM,
+  OP_ASHR_IMM,
   OP_ICMP_EQ,
   OP_ICMP_NE,
   OP_ICMP_UGT,
@@ -108,6 +127,10 @@ enum VMOp : uint8_t {
   OP_CTTZ,
   OP_BSWAP,
   OP_BITREVERSE,
+  // Funnel shifts cover the rotate idioms that -O2 turns into llvm.fshl/fshr;
+  // without them a single rotate anywhere in a function skips the whole body.
+  OP_FSHL,
+  OP_FSHR,
   OP_FADD,
   OP_FSUB,
   OP_FMUL,
@@ -143,15 +166,27 @@ enum VMOp : uint8_t {
   OP_RET,
   OP_CALL,
   OP_TRAP,
+  // Frame traffic for values that do not fit the register file.  Both carry
+  // the frame offset in Imm, so a program can address far more than the 236
+  // registers an 8-bit operand can name.
+  OP_SPILL,
+  OP_FILL,
   OP_COUNT
 };
 
-constexpr unsigned kMaxRegs = 235;
-constexpr unsigned kArgBase = 240;
-constexpr unsigned kRetReg = 239;
-constexpr unsigned kTmpReg = 238;
-constexpr unsigned kFrameReg = 236; // VM stack frame base (ptrtoint)
+// A register operand is one byte, so slot 255 is the last one that can be
+// named.  The scratch regions live at the bottom of the file (see
+// VMProgram::ArgBase) and the value registers fill whatever is left.
+constexpr unsigned kRegLimit = 255;
 constexpr unsigned kMaxCallArgs = 16;
+// Upper bound on the wrapper's frame.  It is a stack allocation, so an
+// unbounded spill area turns a big function into a stack overflow.
+constexpr uint64_t kMaxFrameBytes = 64 * 1024;
+// Per-activation VM state (register file plus spill frame) allowed for a
+// function that calls itself.  The interpreter's own frame is a multiple of
+// this, so a recursive function with a large state would run out of stack far
+// earlier than the original.  Functions above the limit are left alone.
+constexpr uint64_t kMaxRecursiveVmBytes = 1024;
 
 constexpr uint8_t W_I1 = 0, W_I8 = 1, W_I16 = 2, W_I32 = 3, W_I64 = 4,
                   W_PTR = 5;
@@ -165,6 +200,39 @@ static bool widthCodeForBits(unsigned Bits, uint8_t &Out) {
   case 64: Out = W_I64; return true;
   default: return false;
   }
+}
+
+// Immediate form of a binary operator, or OP_COUNT when there is none.
+static uint8_t immOpcodeFor(unsigned Opcode) {
+  switch (Opcode) {
+  case Instruction::Add:  return OP_ADD_IMM;
+  case Instruction::Sub:  return OP_SUB_IMM;
+  case Instruction::Mul:  return OP_MUL_IMM;
+  case Instruction::And:  return OP_AND_IMM;
+  case Instruction::Or:   return OP_OR_IMM;
+  case Instruction::Xor:  return OP_XOR_IMM;
+  case Instruction::Shl:  return OP_SHL_IMM;
+  case Instruction::LShr: return OP_LSHR_IMM;
+  case Instruction::AShr: return OP_ASHR_IMM;
+  default:                return OP_COUNT;
+  }
+}
+
+// True when the opcode reads its immediate as a shift amount rather than as an
+// index into the constant pool.
+static bool isShiftImm(uint8_t Op) {
+  return Op == OP_SHL_IMM || Op == OP_LSHR_IMM || Op == OP_ASHR_IMM;
+}
+
+// Signed operators must sign-extend both sides before the operation.
+static bool isSignedImm(uint8_t Op) { return Op == OP_ASHR_IMM; }
+
+// A few four-operand instructions carry their last source register in the Imm
+// field instead of allocating a fifth encoding slot.  Anything that renumbers
+// virtual registers has to remap those fields too, otherwise the instruction
+// reads a slot that was never written.
+static bool immHoldsReg(uint8_t Op) {
+  return Op == OP_SELECT || Op == OP_FMA || Op == OP_FSHL || Op == OP_FSHR;
 }
 
 static uint64_t constMask(uint64_t Key, unsigned Index) {
@@ -215,6 +283,11 @@ struct VMThunk {
   // Kept so an indirect call through __stdcall / __fastcall / a target
   // specific convention keeps working: the thunk used to issue a plain C call.
   CallingConv::ID CC = CallingConv::C;
+  // Attributes of the original call site.  `sret` in particular is not
+  // cosmetic: the backend has to know that the pointer argument is the
+  // structure return slot, or the callee's prologue and the caller's stack
+  // cleanup disagree.
+  AttributeList Attrs;
 };
 
 struct VMProgram {
@@ -232,7 +305,25 @@ struct VMProgram {
   uint64_t Key = 0;
   unsigned Level = 1;
   unsigned ArgCount = 0;
+  // Register file layout.  Arguments occupy 0..ArgCount-1 because the
+  // interpreter prologue stores them there; the three scratch regions sit
+  // directly above them and the ordinary value registers start after that.
+  // Keeping the scratch slots low lets the interpreter size its register file
+  // from the actual register count: a small recursive function then costs a
+  // few hundred bytes of stack per activation instead of a fixed two
+  // kilobytes, which is what used to turn deep recursion into a stack
+  // overflow.
+  uint8_t ArgBase = 0;   // kMaxCallArgs slots for outgoing call arguments
+  uint8_t TmpReg = 0;    // scratch for fused compare/branch
+  uint8_t FrameReg = 0;  // pointer to the wrapper's spill frame
+  uint8_t RegBase = 0;   // first ordinary value register
+  // Total slots in the interpreter's register array.  Rounded up and slightly
+  // padded so the size is not a recognisable constant.
+  unsigned RegSlots = 0;
   uint64_t FrameSize = 0;
+  // Number of frame slots reserved for values that did not fit the register
+  // file.  Zero for every function that translates without spilling.
+  unsigned SpillSlots = 0;
   uint64_t BodyHash = 0;
 };
 
@@ -275,6 +366,17 @@ static bool storageWidthCode(Type *T, const DataLayout &DL, uint8_t &Out) {
 
 static bool functionShapeOK(Function &F, const DataLayout &DL,
                             std::string &Reason) {
+  // The runtime keeps the register file, the spill frame and the constant
+  // pools in the default address space and addresses all of them with i64
+  // arithmetic.  A datalayout that puts allocas or globals somewhere else
+  // (CHERI-style 128-bit spaces, GPU private spaces) cannot be served: the
+  // frame handed to the interpreter would have a different pointer type than
+  // the one it declares, which is a hard type error, and the pools would live
+  // in a space the VM cannot index.  Refuse such a module outright.
+  if (DL.getAllocaAddrSpace() != 0 || DL.getDefaultGlobalsAddressSpace() != 0) {
+    Reason = "non-default alloca/global address space";
+    return false;
+  }
   if (F.isDeclaration() || F.isIntrinsic()) {
     Reason = "declaration/intrinsic";
     return false;
@@ -311,8 +413,10 @@ static bool functionShapeOK(Function &F, const DataLayout &DL,
       Reason = "unsupported argument type";
       return false;
     }
+    // `sret` is only a pointer argument on the callee side: the wrapper keeps
+    // the signature, so the caller still passes the return slot and the VM
+    // writes through it.  The attributes below change the ABI itself.
     if (A.hasAttribute(Attribute::ByVal) ||
-        A.hasAttribute(Attribute::StructRet) ||
         A.hasAttribute(Attribute::InAlloca) ||
         A.hasAttribute(Attribute::Preallocated) ||
         A.hasAttribute(Attribute::SwiftSelf) ||
@@ -322,7 +426,7 @@ static bool functionShapeOK(Function &F, const DataLayout &DL,
       return false;
     }
   }
-  if (F.arg_size() > kMaxRegs) {
+  if (F.arg_size() >= kRegLimit) {
     Reason = "too many arguments";
     return false;
   }
@@ -341,9 +445,11 @@ static bool functionShapeOK(Function &F, const DataLayout &DL,
 
 class VMTranslator {
 public:
-  VMTranslator(Function &F, uint64_t Seed, unsigned Level, std::string &Reason)
+  VMTranslator(Function &F, uint64_t Seed, unsigned Level, std::string &Reason,
+               bool SpillPinned = false, unsigned RecursionCycle = 0)
       : F(F), M(*F.getParent()), DL(M.getDataLayout()), Seed(Seed),
-        Level(Level), Reason(Reason) {}
+        Level(Level), Reason(Reason), SpillPinned(SpillPinned),
+        RecursionCycle(RecursionCycle) {}
 
   bool run();
 
@@ -356,8 +462,23 @@ private:
   const DataLayout &DL;
   uint64_t Seed;
   unsigned Level;
+  // Call-graph cycle size reported by the driver; 0 when the driver could not
+  // tell, in which case only a direct self-call is detected here.
+  unsigned RecursionCycle = 0;
 
   DenseMap<Value *, uint8_t> Regs;
+  // Frame residency.  With `SpillPinned` set, every value whose live range
+  // crosses a block boundary lives in the wrapper frame instead of a register:
+  // the defining block keeps it in a register until its terminator, then the
+  // register is recycled and later blocks read it back with OP_FILL.  This is
+  // what lets a function with thousands of cross-block values translate at
+  // all; without it the 236-slot register file runs out.
+  bool SpillPinned = false;
+  DenseMap<Value *, uint32_t> SpillSlot;
+  // Registers holding a value read out of the frame for the instruction that
+  // is currently being translated; recycled once that instruction is emitted.
+  SmallVector<uint8_t, 8> FillRegs;
+  uint32_t SpillBase = 0;
   // Register reuse, modelled on amice's block-local reuse plan
   // (crates/amice/src/aotu/vm_virtualize/translator.rs, Apache-2.0).
   // A value may only be recycled when it is defined and consumed inside the
@@ -384,12 +505,20 @@ private:
   SmallVector<Value *, 4> DeferredOps;
   DenseSet<Constant *> ConstSeen;
   std::vector<Constant *> ConstOrder;
+  // Integer constants that appear exactly once in this function and feed a
+  // binary operator that has an immediate form.  They are folded into that
+  // instruction instead of being hoisted into a register, which removes both
+  // the prologue OP_IMM and a register read per use.
+  DenseSet<ConstantInt *> ImmOnly;
+  DenseMap<ConstantInt *, unsigned> IntUseCount;
+  DenseMap<ConstantInt *, Instruction *> IntSoleUser;
   DenseMap<BasicBlock *, uint32_t> BlockPC;
   DenseMap<AllocaInst *, uint64_t> AllocaOff;
   std::vector<AllocaInst *> Allocas;
   uint64_t FrameSize = 0;
   std::vector<std::pair<uint32_t, BasicBlock *>> Fixups;
   uint8_t NextReg = 0;
+  const Instruction *CurI = nullptr;
   uint64_t RngState = 0;
   unsigned PtrBits = 0;
   bool Failed = false;
@@ -406,17 +535,47 @@ private:
   uint8_t allocReg() {
     if (!FreeRegs.empty())
       return FreeRegs.pop_back_val();
-    if (NextReg > kMaxRegs) {
-      fail("too many SSA values (register file exhausted)");
+    if (NextReg >= kRegLimit) {
+      fail(Twine("too many SSA values: ") + Twine((unsigned)NextReg) +
+           " registers for " + Twine(kRegLimit) + " slots, " +
+           Twine((unsigned)PinnedSet.size()) + " pinned, " +
+           Twine((unsigned)Regs.size()) + " live, " +
+           (SpillPinned ? "spill" : "no spill") + " at " +
+           (CurI ? CurI->getOpcodeName() : "?"));
       return 0;
     }
     return NextReg++;
+  }
+
+  // A value is frame-resident when it outlives its block.  Only instructions
+  // qualify: arguments arrive in registers at entry and are never written to a
+  // slot, and constants are materialised on use instead of being hoisted.
+  bool isSpilled(Value *V) const {
+    return SpillPinned && isa<Instruction>(V) && PinnedSet.count(V) != 0;
+  }
+
+  uint32_t slotOf(Value *V) {
+    auto It = SpillSlot.find(V);
+    if (It != SpillSlot.end())
+      return It->second;
+    uint32_t S = (uint32_t)SpillSlot.size();
+    SpillSlot[V] = S;
+    return S;
+  }
+
+  uint32_t spillOff(Value *V) { return SpillBase + slotOf(V) * 8; }
+
+  void releaseFills(size_t Mark) {
+    for (size_t I = Mark; I < FillRegs.size(); ++I)
+      FreeRegs.push_back(FillRegs[I]);
+    FillRegs.resize(Mark);
   }
 
   uint8_t regOf(Value *V);
   bool materialize(Value *V, uint8_t Dst, Type *Ty);
   bool cmpJumpsTo(ICmpInst &CI, uint8_t &Op, uint8_t &W, uint8_t &A, uint8_t &B);
   void buildReuseInfo();
+  void buildImmCandidates();
   void releaseDeadOperands(Instruction &I, unsigned Idx);
   void releaseValue(Value *V);
   void collectConstant(Value *V);
@@ -445,20 +604,41 @@ private:
     return !BB->empty() && isa<PHINode>(BB->front());
   }
 
+  // Constant pools.  Both are indexed by value, and a large generated function
+  // can carry tens of thousands of distinct immediates; a linear scan per use
+  // made translation quadratic in that case.  The integer pool cannot use a
+  // DenseMap: its sentinel keys are all-ones and all-ones-minus-one, which are
+  // ordinary constants here (adler32 alone uses 0xFFFFFFFF).
+  std::unordered_map<uint64_t, uint32_t> IntConstIdx;
+  DenseMap<Constant *, uint32_t> PtrConstIdx;
+
   uint32_t addIntConst(uint64_t V) {
-    for (uint32_t I = 0; I < Program.Ints.size(); ++I)
-      if (Program.Ints[I] == V)
-        return I;
+    auto It = IntConstIdx.find(V);
+    if (It != IntConstIdx.end())
+      return It->second;
+    uint32_t Idx = (uint32_t)Program.Ints.size();
     Program.Ints.push_back(V);
-    return (uint32_t)Program.Ints.size() - 1;
+    IntConstIdx[V] = Idx;
+    return Idx;
   }
 
   uint32_t addPtrConst(Constant *C) {
-    for (uint32_t I = 0; I < Program.Ptrs.size(); ++I)
-      if (Program.Ptrs[I] == C)
-        return I;
+    auto It = PtrConstIdx.find(C);
+    if (It != PtrConstIdx.end())
+      return It->second;
+    // The pool is a [N x ptr] array, so every entry must be a default address
+    // space pointer.  A constant in another address space trips the element
+    // type assertion in ConstantArray::get, and reading it back as `ptr` would
+    // reinterpret it on targets where the spaces differ.  Refuse the function.
+    if (!C->getType()->isPointerTy() ||
+        C->getType()->getPointerAddressSpace() != 0) {
+      fail("pointer constant in a non-default address space");
+      return 0;
+    }
+    uint32_t Idx = (uint32_t)Program.Ptrs.size();
     Program.Ptrs.push_back(C);
-    return (uint32_t)Program.Ptrs.size() - 1;
+    PtrConstIdx[C] = Idx;
+    return Idx;
   }
 
   unsigned thunkForCall(CallInst &CI) {
@@ -473,7 +653,7 @@ private:
     for (unsigned I = 0; I < Program.Thunks.size(); ++I) {
       const VMThunk &T = Program.Thunks[I];
       if (T.Direct != Direct || T.RetTy != RetTy || T.CC != CC ||
-          T.ArgTys.size() != ArgTys.size())
+          T.ArgTys.size() != ArgTys.size() || T.Attrs != CI.getAttributes())
         continue;
       if (!Direct && T.SiteFT != SiteFT)
         continue;
@@ -492,6 +672,7 @@ private:
     T.SiteFT = SiteFT;
     T.RetTy = RetTy;
     T.CC = CC;
+    T.Attrs = CI.getAttributes();
     T.ArgTys.assign(ArgTys.begin(), ArgTys.end());
     Program.Thunks.push_back(T);
     return (unsigned)Program.Thunks.size() - 1;
@@ -551,6 +732,60 @@ bool VMTranslator::cmpJumpsTo(ICmpInst &CI, uint8_t &Op, uint8_t &W, uint8_t &A,
   return !Failed;
 }
 
+// A constant that appears exactly once inside this function can be folded into
+// its consumer when that consumer is a binary operator with an immediate form.
+// The count must include constants hidden inside ConstantExpr operands: those
+// are materialised by collectConstant() as well, so missing them would mark a
+// value foldable while another expression still needs its register.
+void VMTranslator::buildImmCandidates() {
+  SmallVector<std::pair<Value *, Instruction *>, 16> Work;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      for (Use &U : I.operands())
+        Work.push_back({U.get(), &I});
+
+  while (!Work.empty()) {
+    auto [V, User] = Work.pop_back_val();
+    if (auto *CI = dyn_cast<ConstantInt>(V)) {
+      IntUseCount[CI]++;
+      IntSoleUser[CI] = User;
+      continue;
+    }
+    if (auto *CE = dyn_cast<ConstantExpr>(V))
+      for (Value *Op : CE->operands())
+        Work.push_back({Op, User});
+  }
+
+  for (auto &Entry : IntUseCount) {
+    if (Entry.second != 1)
+      continue;
+    ConstantInt *CI = Entry.first;
+    auto *BO = dyn_cast<BinaryOperator>(IntSoleUser[CI]);
+    if (!BO || !BO->getType()->isIntegerTy() || CI->getBitWidth() > 64)
+      continue;
+    uint8_t Op = immOpcodeFor(BO->getOpcode());
+    if (Op == OP_COUNT)
+      continue;
+    bool IsRhs = BO->getOperand(1) == CI;
+    bool IsLhs = BO->getOperand(0) == CI;
+    // A commutative operator may carry the constant on either side; anything
+    // else only folds when the constant is on the right.
+    if (!IsRhs && !(IsLhs && BO->isCommutative()))
+      continue;
+    // Two constants would have been folded by the IR already; refusing here
+    // keeps the immediate path from needing a register for the other side.
+    if (isa<Constant>(BO->getOperand(IsRhs ? 0 : 1)))
+      continue;
+    uint8_t W;
+    if (!storageWidthCode(BO->getType(), DL, W))
+      continue;
+    // Shift amounts are stored in the instruction word, so they must fit.
+    if (isShiftImm(Op) && CI->getZExtValue() > 0xFFFFFFFFull)
+      continue;
+    ImmOnly.insert(CI);
+  }
+}
+
 // Build the block-local liveness table.  The rule is deliberately
 // conservative: only values defined and used in one block are eligible, so a
 // register can never be recycled while a path might still read it.  PHIs and
@@ -582,8 +817,15 @@ void VMTranslator::buildReuseInfo() {
     auto &LU = LastUse[&BB];
     unsigned Idx = 0;
     for (Instruction &I : BB) {
+      bool IsPhi = isa<PHINode>(I);
       for (Value *Op : I.operands()) {
-        if (isa<Constant>(Op) || PinnedSet.count(Op))
+        if (isa<Constant>(Op))
+          continue;
+        // A frame-resident value already has its slot, so only its in-block
+        // *register* uses keep the defining register alive.  A PHI operand is
+        // read from the slot on the edge, never through that register, so it
+        // does not count either.
+        if (PinnedSet.count(Op) && !(isSpilled(Op) && !IsPhi))
           continue;
         auto It = DefBlock.find(Op);
         if (It == DefBlock.end() || It->second != &BB)
@@ -625,6 +867,10 @@ void VMTranslator::collectConstant(Value *V) {
   auto *C = dyn_cast<Constant>(V);
   if (!C || ConstSeen.count(C))
     return;
+  // Folded into an immediate superinstruction: no register is needed.
+  if (auto *CI = dyn_cast<ConstantInt>(C))
+    if (ImmOnly.count(CI))
+      return;
   ConstSeen.insert(C);
   // Operands first: a ConstantExpr may need its base materialised.
   if (isa<ConstantExpr>(C))
@@ -637,7 +883,31 @@ uint8_t VMTranslator::regOf(Value *V) {
   auto It = Regs.find(V);
   if (It != Regs.end())
     return It->second;
-  fail("value has no register (constant was not hoisted)");
+  // Frame-resident value: read it into a scratch register that stays live
+  // until the instruction being translated has been emitted.  Every caller
+  // consumes the register within that one instruction, so the scratch never
+  // has to survive a release point.
+  if (isSpilled(V)) {
+    uint8_t R = allocReg();
+    if (Failed)
+      return 0;
+    emit(OP_FILL, W_I64, R, 0, 0, 0, spillOff(V));
+    FillRegs.push_back(R);
+    return R;
+  }
+  // A constant that was not hoisted (spill mode materialises on use).
+  if (SpillPinned) {
+    if (auto *C = dyn_cast<Constant>(V)) {
+      uint8_t R = allocReg();
+      if (Failed)
+        return 0;
+      if (!materialize(C, R, C->getType()))
+        return 0;
+      FillRegs.push_back(R);
+      return R;
+    }
+  }
+  fail(isa<Constant>(V) ? "constant was not hoisted" : "value has no register");
   return 0;
 }
 
@@ -776,8 +1046,12 @@ bool VMTranslator::callSignatureOK(CallInst &CI, std::string &Why) {
       Why = "unsupported call argument type";
       return false;
     }
+    // `sret` is transparent here: the slot is allocated by our caller and the
+    // callee only writes through the pointer, so forwarding it unchanged is
+    // exactly what the ABI does.  The remaining attributes change the calling
+    // convention itself (a private copy, a shadow slot, a special register) and
+    // cannot be reproduced by a plain forward.
     if (CI.paramHasAttr(I, Attribute::ByVal) ||
-        CI.paramHasAttr(I, Attribute::StructRet) ||
         CI.paramHasAttr(I, Attribute::InAlloca) ||
         CI.paramHasAttr(I, Attribute::Preallocated) ||
         CI.paramHasAttr(I, Attribute::SwiftSelf) ||
@@ -794,6 +1068,10 @@ bool VMTranslator::translateCall(CallInst &CI) {
   std::string Why;
   if (!callSignatureOK(CI, Why))
     return fail("call: " + Why);
+  // The argument copies below write into the reserved block; a short
+  // reservation would overwrite the scratch registers.
+  if ((unsigned)Program.ArgBase + CI.arg_size() > (unsigned)Program.TmpReg)
+    return fail("call argument block overlaps scratch registers");
 
   bool Indirect = (CI.getCalledFunction() == nullptr);
   unsigned Id = thunkForCall(CI);
@@ -807,7 +1085,7 @@ bool VMTranslator::translateCall(CallInst &CI) {
 
   for (unsigned I = 0; I < CI.arg_size(); ++I) {
     Value *Arg = CI.getArgOperand(I);
-    uint8_t Dst = kArgBase + I;
+    uint8_t Dst = Program.ArgBase + I;
     uint8_t W;
     if (!widthCodeForBits(bitWidthOf(Arg->getType(), DL), W))
       return fail("call argument width");
@@ -817,10 +1095,19 @@ bool VMTranslator::translateCall(CallInst &CI) {
     emit(OP_MOV, W, Dst, Src);
   }
 
-  uint8_t CFlags = (uint8_t)CI.arg_size() | (Indirect ? 0x80 : 0);
-  emit(OP_CALL, 0, 0, FnReg, 0, CFlags, Id);
+  // Only bit 7 carries information here.  The thunk's signature already fixes
+  // the argument count, so packing `arg_size()` into the low bits only ever
+  // hurt: a call with 128 or more arguments set bit 7 by itself and the
+  // interpreter then took the indirect path, loading a garbage function pointer
+  // from a register that was never written.
+  uint8_t CFlags = Indirect ? 0x80 : 0;
 
   if (CI.getType()->isVoidTy()) {
+    // A void call still has to name a destination: the thunk returns an i64
+    // (zero), and letting the handler store it unconditionally keeps the
+    // "has a result" test out of the interpreter.  The scratch slot is never
+    // live across an instruction, so clobbering it is free.
+    emit(OP_CALL, W_I64, Program.TmpReg, FnReg, 0, CFlags, Id);
     if (CI.doesNotReturn())
       emit(OP_TRAP, 0);
     return true;
@@ -829,10 +1116,12 @@ bool VMTranslator::translateCall(CallInst &CI) {
   uint8_t W;
   if (!widthCodeForBits(bitWidthOf(CI.getType(), DL), W))
     return fail("call return width");
+  // The result goes straight into its register: OP_CALL already knows where to
+  // put it, so the extra move through a fixed return slot is not needed.
   uint8_t Dst = allocReg();
   if (Failed)
     return false;
-  emit(OP_MOV, W, Dst, kRetReg);
+  emit(OP_CALL, W, Dst, FnReg, 0, CFlags, Id);
   Regs[&CI] = Dst;
   if (CI.doesNotReturn())
     emit(OP_TRAP, 0);
@@ -862,19 +1151,32 @@ bool VMTranslator::translateGEP(GetElementPtrInst &GEP) {
   for (unsigned I = 0; I < GEP.getNumIndices(); ++I) {
     Value *Idx = GEP.getOperand(I + 1);
     int64_t Stride = 0;
+    // A scalable type has no fixed allocation size: getFixedValue() asserts on
+    // it.  The VM cannot express a vscale-sized stride, so refuse the function
+    // instead of asserting or baking in a wrong constant.
+    auto allocSize = [&](Type *T, int64_t &Out) {
+      TypeSize Sz = DL.getTypeAllocSize(T);
+      if (Sz.isScalable())
+        return false;
+      Out = (int64_t)Sz.getFixedValue();
+      return true;
+    };
     if (I == 0) {
       // The first index steps over the source element type.
       if (!Cur->isSized())
         return fail("GEP of unsized type");
-      Stride = (int64_t)DL.getTypeAllocSize(Cur).getFixedValue();
+      if (!allocSize(Cur, Stride))
+        return fail("GEP of scalable type");
     } else if (Cur->isStructTy()) {
       auto *CI = dyn_cast<ConstantInt>(Idx);
       if (!CI)
         return fail("dynamic struct index");
       auto *ST = cast<StructType>(Cur);
-      unsigned Field = (unsigned)CI->getZExtValue();
-      if (Field >= ST->getNumElements())
+      // Compare before narrowing: a 64-bit index that does not fit in unsigned
+      // would otherwise wrap to a small, valid-looking field number.
+      if (CI->getValue().uge(ST->getNumElements()))
         return fail("struct index out of range");
+      unsigned Field = (unsigned)CI->getZExtValue();
       ConstOff += (int64_t)DL.getStructLayout(ST)->getElementOffset(Field);
       Cur = ST->getElementType(Field);
       continue;
@@ -882,15 +1184,20 @@ bool VMTranslator::translateGEP(GetElementPtrInst &GEP) {
       Type *Elem = Cur->getArrayElementType();
       if (!Elem->isSized())
         return fail("unsized array element");
-      Stride = (int64_t)DL.getTypeAllocSize(Elem).getFixedValue();
+      if (!allocSize(Elem, Stride))
+        return fail("GEP of scalable array element");
       Cur = Elem;
     } else {
       return fail("GEP into unsupported type");
     }
 
-    if (auto *CI = dyn_cast<ConstantInt>(Idx))
-      ConstOff += CI->getSExtValue() * Stride;
-    else {
+    if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
+      // Wrapping arithmetic: the address computation is allowed to wrap, but a
+      // signed multiply would be undefined behaviour on the host for a huge
+      // index, and a GEP is free to carry one.
+      ConstOff = (int64_t)((uint64_t)ConstOff +
+                           (uint64_t)CI->getSExtValue() * (uint64_t)Stride);
+    } else {
       uint8_t R = regOf(Idx);
       if (Failed)
         return false;
@@ -898,46 +1205,51 @@ bool VMTranslator::translateGEP(GetElementPtrInst &GEP) {
     }
   }
 
+  // The result register is allocated before any intermediate: the last step
+  // of the address computation can then write into it directly instead of
+  // producing a temporary that has to be moved afterwards.  On a typical GEP
+  // that removes one instruction per address.
+  uint8_t Dst = allocReg();
+  if (Failed)
+    return false;
+
   uint8_t Acc = Base;
   bool First = true;
   if (ConstOff != 0) {
+    // base + constant is a single immediate add on a 64-bit pointer.
+    if (Dyn.empty() && PtrBits == 64) {
+      emit(OP_ADD_IMM, W_I64, Dst, Base, 0, 0,
+           addIntConst((uint64_t)ConstOff));
+      Regs[&GEP] = Dst;
+      return true;
+    }
     uint8_t CR = allocReg();
     if (Failed)
       return false;
     emit(OP_IMM, W_I64, CR, 0, 0, 0, addIntConst((uint64_t)ConstOff));
-    uint8_t NR = allocReg();
-    if (Failed)
-      return false;
-    emit(OP_ADD, W_I64, NR, Base, CR);
-    Acc = NR;
+    emit(OP_ADD, W_I64, Dst, Base, CR);
+    Acc = Dst;
     First = false;
   }
   for (const DynTerm &T : Dyn) {
-    uint8_t SR = allocReg();
-    if (Failed)
-      return false;
-    emit(OP_IMM, W_I64, SR, 0, 0, 0, addIntConst((uint64_t)T.Stride));
-    uint8_t MR = allocReg();
-    if (Failed)
-      return false;
-    emit(OP_MUL, W_I64, MR, T.Reg, SR);
-    uint8_t NR = allocReg();
-    if (Failed)
-      return false;
-    emit(OP_ADD, W_I64, NR, First ? Base : Acc, MR);
-    Acc = NR;
+    uint8_t MR = T.Reg;
+    if (T.Stride != 1) {
+      MR = allocReg();
+      if (Failed)
+        return false;
+      emit(OP_MUL_IMM, W_I64, MR, T.Reg, 0, 0,
+           addIntConst((uint64_t)T.Stride));
+    }
+    emit(OP_ADD, W_I64, Dst, First ? Base : Acc, MR);
+    Acc = Dst;
     First = false;
   }
 
-  uint8_t Dst = allocReg();
-  if (Failed)
-    return false;
   if (First)
     emit(OP_MOV, W_PTR, Dst, Base);
   else if (PtrBits < 64)
     emit(OP_TRUNC, W_PTR, Dst, Acc, 0, W_I64);
-  else
-    emit(OP_MOV, W_PTR, Dst, Acc);
+  // Otherwise the last add already produced the pointer in Dst.
   Regs[&GEP] = Dst;
   return true;
 }
@@ -954,32 +1266,107 @@ bool VMTranslator::translateGEP(GetElementPtrInst &GEP) {
 // moves form at least one cycle, so stash one source in a scratch register to
 // break it.
 bool VMTranslator::phiCopiesFor(BasicBlock *From, BasicBlock *To) {
+  // A copy endpoint is either a register or a frame slot.  The scheduling rule
+  // below is unchanged; only the identity comparison and the emitted
+  // instruction differ.  A constant source is carried symbolically: in spill
+  // mode materialising one costs a register, and a parallel copy of a thousand
+  // constant phis would need a thousand of them at once.
+  struct Loc {
+    bool Slot = false;
+    uint32_t Id = 0;
+    Constant *C = nullptr;
+  };
   struct PendingCopy {
-    uint8_t Dst;
-    uint8_t Src;
+    Loc Dst;
+    Loc Src;
     uint8_t Width;
   };
   SmallVector<PendingCopy, 8> Pending;
+  size_t FillMark = FillRegs.size();
+
+  auto Same = [](const Loc &A, const Loc &B) {
+    return A.Slot == B.Slot && A.Id == B.Id && A.C == B.C;
+  };
+  auto EmitFill = [&](uint32_t Slot, uint8_t Dst) {
+    emit(OP_FILL, W_I64, Dst, 0, 0, 0, SpillBase + Slot * 8);
+  };
+  auto EmitSpill = [&](uint8_t Src, uint32_t Slot) {
+    emit(OP_SPILL, W_I64, Src, 0, 0, 0, SpillBase + Slot * 8);
+  };
+  auto EmitCopy = [&](const Loc &D, const Loc &S, uint8_t W) {
+    if (S.C) {
+      // A constant never aliases a destination, so it can be written straight
+      // into the target and the scratch register released immediately.
+      if (D.Slot) {
+        uint8_t T = allocReg();
+        if (Failed)
+          return false;
+        if (!materialize(S.C, T, S.C->getType()))
+          return false;
+        EmitSpill(T, D.Id);
+        FreeRegs.push_back(T);
+      } else if (!materialize(S.C, (uint8_t)D.Id, S.C->getType())) {
+        return false;
+      }
+      return true;
+    }
+    if (D.Slot && S.Slot) {
+      // One scratch register, released as soon as the value has been written
+      // back: a parallel copy of a thousand phis must not need a thousand
+      // registers.
+      uint8_t T = allocReg();
+      if (Failed)
+        return false;
+      EmitFill(S.Id, T);
+      EmitSpill(T, D.Id);
+      FreeRegs.push_back(T);
+    } else if (D.Slot) {
+      EmitSpill((uint8_t)S.Id, D.Id);
+    } else if (S.Slot) {
+      EmitFill(S.Id, (uint8_t)D.Id);
+    } else {
+      emit(OP_MOV, W, (uint8_t)D.Id, (uint8_t)S.Id);
+    }
+    return true;
+  };
 
   for (PHINode &PN : To->phis()) {
     PhiEdgesDone.insert({From, &PN});
-    auto It = Regs.find(&PN);
-    if (It == Regs.end()) {
-      uint8_t R = allocReg();
-      if (Failed)
-        return false;
-      Regs[&PN] = R;
-      It = Regs.find(&PN);
+    Loc Dst;
+    if (isSpilled(&PN)) {
+      Dst = {true, slotOf(&PN), nullptr};
+    } else {
+      auto It = Regs.find(&PN);
+      if (It == Regs.end()) {
+        uint8_t R = allocReg();
+        if (Failed) {
+          releaseFills(FillMark);
+          return false;
+        }
+        Regs[&PN] = R;
+        It = Regs.find(&PN);
+      }
+      Dst = {false, It->second, nullptr};
     }
-    uint8_t Dst = It->second;
     Value *Src = PN.getIncomingValueForBlock(From);
     uint8_t W;
-    if (!widthCodeForBits(bitWidthOf(PN.getType(), DL), W))
+    if (!widthCodeForBits(bitWidthOf(PN.getType(), DL), W)) {
+      releaseFills(FillMark);
       return fail("phi width");
-    uint8_t S = regOf(Src);
-    if (Failed)
-      return false;
-    if (S != Dst)
+    }
+    Loc S;
+    if (auto *C = dyn_cast<Constant>(Src)) {
+      S = {false, 0, C};
+    } else if (isSpilled(Src)) {
+      S = {true, slotOf(Src), nullptr};
+    } else {
+      S = {false, regOf(Src), nullptr};
+      if (Failed) {
+        releaseFills(FillMark);
+        return false;
+      }
+    }
+    if (!Same(S, Dst))
       Pending.push_back({Dst, S, W});
   }
 
@@ -993,31 +1380,44 @@ bool VMTranslator::phiCopiesFor(BasicBlock *From, BasicBlock *To) {
   while (!Pending.empty()) {
     bool Progress = false;
     for (unsigned I = 0; I < Pending.size(); ++I) {
-      uint8_t Dst = Pending[I].Dst;
+      const Loc &Dst = Pending[I].Dst;
       bool Blocked = false;
       for (unsigned J = 0; J < Pending.size(); ++J)
-        if (J != I && Pending[J].Src == Dst) {
+        if (J != I && Same(Pending[J].Src, Dst)) {
           Blocked = true;
           break;
         }
       if (Blocked)
         continue;
-      emit(OP_MOV, Pending[I].Width, Pending[I].Dst, Pending[I].Src);
+      if (!EmitCopy(Pending[I].Dst, Pending[I].Src, Pending[I].Width)) {
+        releaseFills(FillMark);
+        return false;
+      }
       Pending.erase(Pending.begin() + I);
       Progress = true;
       break;
     }
     if (Progress)
       continue;
-    // All remaining sources are live destinations: a cycle exists.  Allocate a
-    // scratch slot (phi registers and their sources are pinned, so this cannot
-    // collide with a live value) and redirect one copy through it.
+    // All remaining sources are live destinations: a cycle exists.  Stash one
+    // source in a scratch register to break it.
     uint8_t Tmp = allocReg();
-    if (Failed)
+    if (Failed) {
+      releaseFills(FillMark);
       return false;
-    emit(OP_MOV, Pending[0].Width, Tmp, Pending[0].Src);
-    Pending[0].Src = Tmp;
+    }
+    FillRegs.push_back(Tmp);
+    if (Pending[0].Src.C) {
+      if (!materialize(Pending[0].Src.C, Tmp, Pending[0].Src.C->getType()))
+        return false;
+    } else if (Pending[0].Src.Slot) {
+      EmitFill(Pending[0].Src.Id, Tmp);
+    } else {
+      emit(OP_MOV, Pending[0].Width, Tmp, (uint8_t)Pending[0].Src.Id);
+    }
+    Pending[0].Src = {false, Tmp, nullptr};
   }
+  releaseFills(FillMark);
   return true;
 }
 
@@ -1038,14 +1438,14 @@ bool VMTranslator::translateSwitch(SwitchInst &SI) {
     uint8_t CaseReg = regOf(CI);
     if (Failed)
       return false;
-    emit(OP_ICMP_EQ, W, kTmpReg, CondReg, CaseReg);
+    emit(OP_ICMP_EQ, W, Program.TmpReg, CondReg, CaseReg);
 
     BasicBlock *Target = Case.getCaseSuccessor();
     if (hasPhi(Target)) {
       // CBR true -> stub; CBR false -> the BR below, which jumps to the next
       // comparison.  The stub is placed after that BR.
       uint32_t StubPC = (uint32_t)Program.Code.size() + 2;
-      emit(OP_CBR, 0, kTmpReg, 0, 0, 0, StubPC);
+      emit(OP_CBR, 0, Program.TmpReg, 0, 0, 0, StubPC);
       uint32_t NextBrIdx = (uint32_t)Program.Code.size();
       emit(OP_BR, 0, 0, 0, 0, 0, 0);
       if (!phiCopiesFor(From, Target))
@@ -1053,7 +1453,7 @@ bool VMTranslator::translateSwitch(SwitchInst &SI) {
       emitFixup(OP_BR, 0, 0, 0, 0, 0, Target);
       Program.Code[NextBrIdx].Imm = (uint32_t)Program.Code.size();
     } else {
-      emitFixup(OP_CBR, 0, kTmpReg, 0, 0, 0, Target);
+      emitFixup(OP_CBR, 0, Program.TmpReg, 0, 0, 0, Target);
     }
   }
   // The default edge is the fall-through of the comparison chain, so its PHI
@@ -1160,28 +1560,38 @@ bool VMTranslator::translateTerminator(Instruction &I) {
 }
 
 bool VMTranslator::translateInst(Instruction &I) {
+  CurI = &I;
   if (isa<PHINode>(I))
     return true;
 
   // Defer an icmp that feeds a conditional branch of this block; hasOneUse
   // makes the decision exact -- nothing else can observe the compare result.
-  if (auto *CI = dyn_cast<ICmpInst>(&I)) {
-    if (!DeferredCmp && CI->hasOneUse()) {
-      User *U = *CI->user_begin();
-      if (auto *BI = dyn_cast<BranchInst>(U))
-        if (BI->isConditional() && BI->getParent() == CI->getParent()) {
-          DeferredCmp = CI;
-          JustDeferred = true;
-          return true;
-        }
+  // Spill mode never defers: the fused opcode is emitted by the terminator,
+  // long after the scratch registers holding frame-resident operands have been
+  // recycled.
+  if (!SpillPinned)
+    if (auto *CI = dyn_cast<ICmpInst>(&I)) {
+      if (!DeferredCmp && CI->hasOneUse()) {
+        User *U = *CI->user_begin();
+        if (auto *BI = dyn_cast<BranchInst>(U))
+          if (BI->isConditional() && BI->getParent() == CI->getParent()) {
+            DeferredCmp = CI;
+            JustDeferred = true;
+            return true;
+          }
+      }
     }
-  }
   if (isa<DbgInfoIntrinsic>(I))
     return true;
 
   if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
     if (MI->isVolatile())
       return fail("volatile memintrinsic");
+    // The three arguments live in the outgoing-argument block.  If that block
+    // was sized too small the stores below would land on the scratch
+    // registers, so refuse rather than emit a program that corrupts itself.
+    if ((unsigned)Program.ArgBase + 3 > (unsigned)Program.TmpReg)
+      return fail("memintrinsic argument block overlaps scratch registers");
     bool IsSet = isa<MemSetInst>(MI);
     const char *Name = IsSet ? "memset"
                              : (isa<MemMoveInst>(MI) ? "memmove" : "memcpy");
@@ -1191,13 +1601,31 @@ bool VMTranslator::translateInst(Instruction &I) {
         Ptr, {Ptr, IsSet ? Type::getInt32Ty(C) : Ptr,
               MI->getLength()->getType()},
         false);
-    Function *Fn = cast<Function>(M.getOrInsertFunction(Name, FT).getCallee());
-    SmallVector<Type *, 4> MTys = {Ptr, IsSet ? Type::getInt32Ty(C) : Ptr,
-                                   MI->getLength()->getType()};
+    // The module may already declare memset/memcpy/memmove, and not
+    // necessarily with our prototype: libc headers declare `void *memset(void
+    // *, int, size_t)` while some code declares it returning void, and the
+    // length is `size_t` or `unsigned` depending on the source.  When a
+    // declaration already exists getOrInsertFunction hands it back unchanged,
+    // so a call built from our own signature would not match it -- and two
+    // memintrinsics with different length widths would also collide on the
+    // same name.  Take the types from the declaration that actually won and
+    // let the thunk convert each VM register to its real parameter type.
+    Function *Fn = dyn_cast<Function>(M.getOrInsertFunction(Name, FT).getCallee());
+    if (!Fn)
+      return fail("memintrinsic symbol is not a function");
+    FunctionType *ActualFT = Fn->getFunctionType();
+    if (ActualFT->isVarArg() || ActualFT->getNumParams() != 3)
+      return fail("memintrinsic with an unexpected prototype");
+    SmallVector<Type *, 4> MTys(ActualFT->params());
+    for (Type *T : MTys)
+      if (!T->isPointerTy() &&
+          !(T->isIntegerTy() && (T->getIntegerBitWidth() == 32 ||
+                                 T->getIntegerBitWidth() == 64)))
+        return fail("memintrinsic with an unsupported parameter type");
     unsigned Id = thunkForFunction(Fn, MTys);
-    uint8_t Dst0 = kArgBase;
-    uint8_t Src0 = kArgBase + 1;
-    uint8_t Len0 = kArgBase + 2;
+    uint8_t Dst0 = Program.ArgBase;
+    uint8_t Src0 = Program.ArgBase + 1;
+    uint8_t Len0 = Program.ArgBase + 2;
     uint8_t W;
     if (!widthCodeForBits(bitWidthOf(Ptr, DL), W))
       return fail("memintrinsic pointer width");
@@ -1223,7 +1651,9 @@ bool VMTranslator::translateInst(Instruction &I) {
     if (!widthCodeForBits(bitWidthOf(MI->getLength()->getType(), DL), LW))
       return fail("memintrinsic length width");
     emit(OP_MOV, LW, Len0, regOf(MI->getLength()));
-    emit(OP_CALL, 0, 0, 0, 0, 3, Id);
+    // The handler always stores a result, so name the scratch slot: a zero
+    // destination would overwrite a live SSA register.
+    emit(OP_CALL, W_I64, Program.TmpReg, 0, 0, 3, Id);
     return true;
   }
 
@@ -1298,6 +1728,98 @@ bool VMTranslator::translateInst(Instruction &I) {
         Regs[&I] = A;
         return true;
       }
+      case Intrinsic::abs: {
+        // abs(x) = x < 0 ? -x : x.  The `is_int_min_poison` flag only licenses
+        // the backend to assume INT_MIN never appears; wrapping negation gives
+        // the same value, so it can be ignored.
+        Type *T = CI->getArgOperand(0)->getType();
+        unsigned Bits = bitWidthOf(T, DL);
+        auto *IT = dyn_cast<IntegerType>(T);
+        uint8_t W;
+        if (!IT || !Bits || !storageWidthCode(T, DL, W))
+          return fail("abs width");
+        uint8_t Bv = regOf(CI->getArgOperand(0));
+        uint8_t Zero = allocReg();
+        uint8_t Cmp = allocReg();
+        uint8_t Neg = allocReg();
+        uint8_t R = allocReg();
+        if (Failed)
+          return false;
+        if (!materialize(ConstantInt::get(IT, APInt::getZero(Bits)), Zero, T))
+          return false;
+        emit(OP_ICMP_SLT, W, Cmp, Bv, Zero);
+        emit(OP_SUB, W, Neg, Zero, Bv);
+        emit(OP_SELECT, W, R, Cmp, Neg, 0, Bv);
+        Regs[&I] = R;
+        return true;
+      }
+      case Intrinsic::uadd_sat:
+      case Intrinsic::usub_sat:
+      case Intrinsic::sadd_sat:
+      case Intrinsic::ssub_sat: {
+        // Saturating arithmetic is a handful of ordinary operations: compute
+        // the wrapping result, detect the overflow with a compare, then select
+        // the clamped value.  Nothing here needs a new opcode.
+        Type *T = CI->getArgOperand(0)->getType();
+        unsigned Bits = bitWidthOf(T, DL);
+        auto *IT = dyn_cast<IntegerType>(T);
+        uint8_t W;
+        if (!IT || !Bits || !storageWidthCode(T, DL, W))
+          return fail("saturating intrinsic width");
+        Intrinsic::ID Id = Callee->getIntrinsicID();
+        bool Signed = (Id == Intrinsic::sadd_sat || Id == Intrinsic::ssub_sat);
+        bool Add = (Id == Intrinsic::sadd_sat || Id == Intrinsic::uadd_sat);
+        uint8_t Bv = regOf(CI->getArgOperand(0));
+        uint8_t Cv = regOf(CI->getArgOperand(1));
+        uint8_t Tmp = allocReg();
+        uint8_t Cmp = allocReg();
+        uint8_t Sat = allocReg();
+        uint8_t R = allocReg();
+        if (Failed)
+          return false;
+        emit(Add ? OP_ADD : OP_SUB, W, Tmp, Bv, Cv);
+        if (!Signed) {
+          // The unsigned result wraps past the other operand exactly when the
+          // operation overflows (add) or underflows (sub).
+          if (Add)
+            emit(OP_ICMP_ULT, W, Cmp, Tmp, Bv);
+          else
+            emit(OP_ICMP_ULT, W, Cmp, Bv, Cv);
+          APInt Clamp = Add ? APInt::getAllOnes(Bits) : APInt::getZero(Bits);
+          if (!materialize(ConstantInt::get(IT, Clamp), Sat, T))
+            return false;
+        } else {
+          // Signed overflow: the operands and the result disagree in sign.
+          uint8_t X = allocReg();
+          uint8_t Y = allocReg();
+          uint8_t Z = allocReg();
+          uint8_t Sgn = allocReg();
+          uint8_t Hi = allocReg();
+          if (Failed)
+            return false;
+          // add: (B ^ Tmp) & (C ^ Tmp) < 0
+          // sub: (B ^ C)   & (B ^ Tmp) < 0
+          emit(OP_XOR, W, X, Bv, Tmp);
+          emit(OP_XOR, W, Y, Add ? Cv : Bv, Add ? Tmp : Cv);
+          emit(OP_AND, W, Z, X, Y);
+          if (!materialize(ConstantInt::get(IT, APInt::getZero(Bits)), Sat, T))
+            return false;
+          emit(OP_ICMP_SLT, W, Cmp, Z, Sat);
+          // The clamped value is INT_MIN when the first operand is negative,
+          // which is the sign the true result would have had.
+          emit(OP_ICMP_SLT, W, Sgn, Bv, Sat);
+          if (!materialize(
+                  ConstantInt::get(IT, APInt::getSignedMinValue(Bits)), Sat, T))
+            return false;
+          if (!materialize(
+                  ConstantInt::get(IT, APInt::getSignedMaxValue(Bits)), Hi, T))
+            return false;
+          emit(OP_SELECT, W, Sat, Sgn, Sat, 0, Hi);
+        }
+        emit(OP_SELECT, W, R, Cmp, Sat, 0, Tmp);
+        Regs[&I] = R;
+        return true;
+      }
       case Intrinsic::fabs:
       case Intrinsic::sqrt:
       case Intrinsic::fmuladd: {
@@ -1348,6 +1870,22 @@ bool VMTranslator::translateInst(Instruction &I) {
         Regs[&I] = A;
         return true;
       }
+      case Intrinsic::fshl:
+      case Intrinsic::fshr: {
+        uint8_t W;
+        if (!widthCodeForBits(bitWidthOf(CI->getType(), DL), W))
+          return fail("funnel shift width");
+        uint8_t A = allocReg();
+        uint8_t Bv = regOf(CI->getArgOperand(0));
+        uint8_t Cv = regOf(CI->getArgOperand(1));
+        uint8_t Sv = regOf(CI->getArgOperand(2));
+        if (Failed)
+          return false;
+        emit(Callee->getIntrinsicID() == Intrinsic::fshl ? OP_FSHL : OP_FSHR,
+             W, A, Bv, Cv, 0, Sv);
+        Regs[&I] = A;
+        return true;
+      }
       default:
         return fail("unsupported intrinsic: " + Callee->getName());
       }
@@ -1374,8 +1912,12 @@ bool VMTranslator::translateInst(Instruction &I) {
     return translateTerminator(I);
 
   Type *Ty = I.getType();
-  if (!Ty->isVoidTy() && !isSupportedScalar(Ty, DL))
-    return fail("unsupported value type");
+  if (!Ty->isVoidTy() && !isSupportedScalar(Ty, DL)) {
+    std::string S;
+    raw_string_ostream OS(S);
+    Ty->print(OS);
+    return fail("unsupported value type: " + OS.str());
+  }
 
   if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
     uint8_t W;
@@ -1402,6 +1944,31 @@ bool VMTranslator::translateInst(Instruction &I) {
       Regs[&I] = A;
       return true;
     }
+
+    // Immediate form: buildImmCandidates() proved the constant has no other
+    // use, so it was never given a register.  Shifts carry the amount inline;
+    // everything else indexes the constant pool.
+    auto EmitImm = [&](ConstantInt *CI, Value *Other) -> bool {
+      uint8_t Op = immOpcodeFor(BO->getOpcode());
+      if (Op == OP_COUNT)
+        return false;
+      uint8_t A = allocReg();
+      uint8_t B = regOf(Other);
+      if (Failed)
+        return false;
+      uint32_t Imm = isShiftImm(Op) ? (uint32_t)CI->getZExtValue()
+                                    : addIntConst(CI->getZExtValue());
+      emit(Op, W, A, B, 0, 0, Imm);
+      Regs[&I] = A;
+      return true;
+    };
+    if (auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1)))
+      if (ImmOnly.count(CI))
+        return EmitImm(CI, BO->getOperand(0));
+    if (auto *CI = dyn_cast<ConstantInt>(BO->getOperand(0)))
+      if (ImmOnly.count(CI) && BO->isCommutative())
+        return EmitImm(CI, BO->getOperand(1));
+
     uint8_t A = allocReg();
     uint8_t B = regOf(BO->getOperand(0));
     uint8_t C = regOf(BO->getOperand(1));
@@ -1635,32 +2202,52 @@ bool VMTranslator::translateInst(Instruction &I) {
 
 bool VMTranslator::translateBlock(BasicBlock &BB) {
   for (PHINode &PN : BB.phis()) {
-    if (!Regs.count(&PN)) {
-      uint8_t R = allocReg();
-      if (Failed)
-        return false;
-      Regs[&PN] = R;
-    }
+    // A frame-resident phi has no register at all: its incoming edges write
+    // the slot and every use reads it back.
+    if (SpillPinned || Regs.count(&PN))
+      continue;
+    uint8_t R = allocReg();
+    if (Failed)
+      return false;
+    Regs[&PN] = R;
   }
   unsigned Idx = 0;
   DeferredOps.clear();
   DeferredCmp = nullptr;
   for (Instruction &I : BB) {
     JustDeferred = false;
+    size_t FillMark = FillRegs.size();
     if (!translateInst(I))
       return false;
-    if (JustDeferred) {
+    if (!JustDeferred) {
+      // Frame-resident definition: the slot becomes authoritative right away.
+      // The defining register survives only while the block still reads it,
+      // which is what keeps the register file from filling up with values that
+      // are already in memory.
+      if (isSpilled(&I)) {
+        auto R = Regs.find(&I);
+        if (R != Regs.end()) {
+          emit(OP_SPILL, W_I64, R->second, 0, 0, 0, spillOff(&I));
+          auto LU = LastUse.find(&BB);
+          bool ReadLater = LU != LastUse.end() && LU->second.count(&I) != 0;
+          if (!ReadLater)
+            releaseValue(&I);
+        }
+      }
+      releaseDeadOperands(I, Idx);
+    } else {
       // The compare is emitted by the terminator, which is the only place its
       // operands are read.  Keeping them until then also keeps their registers
       // out of the free list while the terminator still needs them.
       for (Value *Op : I.operands())
         if (!isa<Constant>(Op))
           DeferredOps.push_back(Op);
-    } else {
-      releaseDeadOperands(I, Idx);
     }
+    releaseFills(FillMark);
     ++Idx;
   }
+  // The block is done; any frame-resident definition that was still holding a
+  // register has its slot written already.
   // The terminator has run; now the deferred operands are genuinely dead.
   for (Value *V : DeferredOps)
     if (!PinnedSet.count(V))
@@ -1686,6 +2273,39 @@ bool VMTranslator::run() {
     Regs[&A] = R;
   }
   Program.ArgCount = (unsigned)F.arg_size();
+
+  // Reserve the scratch slots immediately above the argument registers.  The
+  // outgoing-argument block is sized from the widest call in this function so
+  // a leaf that never calls anything does not pay for it; those small leaves
+  // are exactly the functions that tend to recurse deeply.
+  unsigned CallArgs = 0;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      // memcpy/memmove/memset are intrinsics but are lowered to a three
+      // argument call, so they need the same argument block as a real call.
+      if (isa<MemIntrinsic>(&I)) {
+        CallArgs = std::max(CallArgs, 3u);
+        continue;
+      }
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      if (Function *Callee = CB->getCalledFunction())
+        if (Callee->isIntrinsic())
+          continue;
+      CallArgs = std::max(CallArgs, (unsigned)CB->arg_size());
+    }
+  Program.ArgBase = NextReg;
+  for (unsigned I = 0; I < CallArgs; ++I) {
+    allocReg();
+    if (Failed)
+      return false;
+  }
+  Program.TmpReg = allocReg();
+  Program.FrameReg = allocReg();
+  if (Failed)
+    return false;
+  Program.RegBase = NextReg;
 
   uint8_t Perm[OP_COUNT];
   for (unsigned I = 0; I < OP_COUNT; ++I)
@@ -1743,31 +2363,40 @@ bool VMTranslator::run() {
       Stack.push_back(S);
   }
 
+  // Decide which constants fold into an immediate instruction before the
+  // hoist loop runs; collectConstant() consults the result.
+  buildImmCandidates();
+
   // Hoist every constant to a prologue so a value materialised in one arm is
   // still available on every other path (constants must dominate all uses).
-  for (BasicBlock *BB : Order) {
-    for (Instruction &I : *BB) {
-      if (auto *CB = dyn_cast<CallBase>(&I)) {
-        for (Use &U : CB->args())
-          collectConstant(U.get());
-      } else {
-        for (Value *Op : I.operands())
-          collectConstant(Op);
+  // Spill mode trades that for register pressure: a function that has already
+  // overflowed the register file is usually also constant-heavy, and a
+  // materialisation per use is far cheaper than failing outright.
+  if (!SpillPinned) {
+    for (BasicBlock *BB : Order) {
+      for (Instruction &I : *BB) {
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+          for (Use &U : CB->args())
+            collectConstant(U.get());
+        } else {
+          for (Value *Op : I.operands())
+            collectConstant(Op);
+        }
+        if (auto *PN = dyn_cast<PHINode>(&I))
+          for (Value *V : PN->incoming_values())
+            collectConstant(V);
       }
-      if (auto *PN = dyn_cast<PHINode>(&I))
-        for (Value *V : PN->incoming_values())
-          collectConstant(V);
     }
-  }
-  for (Constant *C : ConstOrder) {
-    if (Regs.count(C))
-      continue;
-    uint8_t R = allocReg();
-    if (Failed)
-      return false;
-    if (!materialize(C, R, C->getType()))
-      return false;
-    Regs[C] = R;
+    for (Constant *C : ConstOrder) {
+      if (Regs.count(C))
+        continue;
+      uint8_t R = allocReg();
+      if (Failed)
+        return false;
+      if (!materialize(C, R, C->getType()))
+        return false;
+      Regs[C] = R;
+    }
   }
 
   // Static allocas live in the wrapper's frame.  Only entry-block allocas with
@@ -1787,6 +2416,12 @@ bool VMTranslator::run() {
         return fail("dynamic alloca");
       uint64_t Count = N->getZExtValue();
       uint64_t Elem = DL.getTypeAllocSize(AI->getAllocatedType()).getFixedValue();
+      // The frame is capped at kMaxFrameBytes later, so an alloca larger than
+      // that is rejected anyway.  Checking here as well keeps the multiply
+      // below from wrapping: a wrapped size would hand out a slot that is far
+      // smaller than the object the function believes it owns.
+      if (Elem && Count > kMaxFrameBytes / Elem)
+        return fail("alloca too large");
       uint64_t Size = Count * Elem;
       uint64_t A = std::max<uint64_t>(AI->getAlign().value(), 1);
       FrameSize = alignTo(FrameSize, A);
@@ -1802,13 +2437,22 @@ bool VMTranslator::run() {
     }
     Allocas.push_back(AI);
   }
+  // Frame slots start after the last alloca, 8-byte aligned.  The offsets are
+  // baked into the bytecode, so this has to be fixed before the first block is
+  // translated.
+  SpillBase = (uint32_t)alignTo(FrameSize, 8);
+  // Register-reuse information has to exist before the prologue: whether an
+  // alloca pointer stays in a register or moves to the frame depends on whether
+  // its live range crosses a block boundary.
+  buildReuseInfo();
   for (AllocaInst *AI : Allocas) {
     uint8_t R = allocReg();
     if (Failed)
       return false;
-    Regs[AI] = R;
     uint64_t Off = AllocaOff[AI];
-    emit(OP_MOV, W_PTR, R, kFrameReg);
+    emit(OP_MOV, W_PTR, R, Program.FrameReg);
+    SmallVector<uint8_t, 4> Temps{R};
+    uint8_t Final = R;
     if (Off) {
       uint8_t CR = allocReg();
       if (Failed)
@@ -1818,19 +2462,33 @@ bool VMTranslator::run() {
       if (Failed)
         return false;
       emit(OP_ADD, W_I64, NR, R, CR);
+      Temps.push_back(CR);
+      Temps.push_back(NR);
       if (PtrBits < 64) {
         uint8_t TR = allocReg();
         if (Failed)
           return false;
         emit(OP_TRUNC, W_PTR, TR, NR, 0, W_I64);
-        Regs[AI] = TR;
+        Temps.push_back(TR);
+        Final = TR;
       } else {
-        Regs[AI] = NR;
+        Final = NR;
       }
+    }
+    if (isSpilled(AI)) {
+      // The pointer is frame-resident like any other cross-block value; the
+      // address registers can go straight back to the free list.
+      emit(OP_SPILL, W_I64, Final, 0, 0, 0, spillOff(AI));
+      for (uint8_t X : Temps)
+        FreeRegs.push_back(X);
+    } else {
+      Regs[AI] = Final;
+      for (uint8_t X : Temps)
+        if (X != Final)
+          FreeRegs.push_back(X);
     }
   }
   Program.FrameSize = FrameSize;
-  buildReuseInfo();
   Program.EntryPC = 0;
   for (BasicBlock *BB : Order) {
     BlockPC[BB] = (uint32_t)Program.Code.size();
@@ -1866,28 +2524,86 @@ bool VMTranslator::run() {
   Program.Key = nextRand() | 1;
   Program.Level = Level;
   Program.BodyHash = nextRand();
+  // The wrapper allocates Program.FrameSize bytes, so the spill area has to be
+  // part of it.  SpillBase was fixed before translation and the slot count is
+  // only known now.
+  Program.SpillSlots = (unsigned)SpillSlot.size();
+  if (Program.SpillSlots)
+    Program.FrameSize = SpillBase + (uint64_t)Program.SpillSlots * 8;
+  // The frame is a stack object in the wrapper, so its size is charged to every
+  // call, including recursive ones.  A function with tens of thousands of
+  // cross-block values would otherwise turn into a stack overflow at run time,
+  // which is worse than leaving it unvirtualized.
+  if (Program.FrameSize > kMaxFrameBytes)
+    return fail(Twine("frame too large: ") + Twine(Program.FrameSize) + " bytes");
 
-  // Level 2+: permute all non-argument registers.  Arguments stay at
-  // 0..ArgCount-1 because the interpreter prologue writes them there.
-  if (Level >= 2) {
-    uint8_t Perm[236];
-    for (unsigned I = 0; I < 236; ++I)
-      Perm[I] = (uint8_t)I;
-    for (unsigned I = 236; I > std::max(Program.ArgCount, 1u); --I) {
-      unsigned J = Program.ArgCount +
-                   (unsigned)(nextRand() % (I - Program.ArgCount));
-      std::swap(Perm[I - 1], Perm[J]);
+  // Size the interpreter's register file from the registers this function
+  // actually uses.  A small pad keeps the array size from being a recognisable
+  // constant without reintroducing the fixed two-kilobyte frame that made deep
+  // recursion overflow the stack.
+  {
+    unsigned Slots = (unsigned)NextReg + (unsigned)(nextRand() % 8);
+    if (Slots > kRegLimit)
+      Slots = kRegLimit;
+    if (Slots < (unsigned)NextReg)
+      Slots = NextReg;
+    Program.RegSlots = std::max(Slots, 1u);
+  }
+
+  // A recursive function keeps one interpreter frame per activation, so its
+  // per-call footprint is multiplied by the recursion depth.  A function that
+  // spills heavily would exhaust the stack after a few hundred levels, which
+  // is worse than leaving it unvirtualized: callers of the original see the
+  // same depth they always had.  The driver reports how many functions share
+  // this one's call-graph cycle, so mutual recursion (A -> B -> A) is charged
+  // like a direct self-call: one level of recursion runs every member once,
+  // therefore the whole cycle has to fit in the budget together.
+  {
+    uint64_t PerCall = Program.FrameSize + (uint64_t)Program.RegSlots * 8 +
+                       (uint64_t)Program.ArgCount * 8;
+    unsigned Cycle = RecursionCycle;
+    if (!Cycle) {
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *CB = dyn_cast<CallBase>(&I))
+            if (CB->getCalledOperand()->stripPointerCasts() == &F)
+              Cycle = 1;
     }
-    auto Map = [&](uint8_t &R) {
-      if (R <= 235)
-        R = Perm[R];
-    };
-    for (VInst &I : Program.Code) {
-      Map(I.A);
-      Map(I.B);
-      Map(I.C);
-      if ((I.Op == OP_SELECT || I.Op == OP_FMA) && I.Imm <= 235)
-        I.Imm = Perm[I.Imm];
+    if (Cycle && PerCall > kMaxRecursiveVmBytes / Cycle) {
+      std::string Msg = "recursive function";
+      if (Cycle > 1)
+        Msg += " in a call cycle of " + std::to_string(Cycle);
+      Msg += " with " + std::to_string(PerCall) +
+             " bytes of per-call VM state";
+      return fail(Msg);
+    }
+  }
+
+  // Level 2+: permute the ordinary value registers.  Arguments and the scratch
+  // slots stay put: the interpreter prologue writes arguments at 0..ArgCount-1
+  // and the handlers name the scratch slots directly.
+  if (Level >= 2) {
+    unsigned Base = Program.RegBase;
+    unsigned Count = Program.RegSlots;
+    if (Count > Base) {
+      std::vector<uint8_t> Perm(Count);
+      for (unsigned I = 0; I < Count; ++I)
+        Perm[I] = (uint8_t)I;
+      for (unsigned I = Count; I > Base + 1; --I) {
+        unsigned J = Base + (unsigned)(nextRand() % (I - Base));
+        std::swap(Perm[I - 1], Perm[J]);
+      }
+      auto Map = [&](uint8_t &R) {
+        if (R >= Base && R < Count)
+          R = Perm[R];
+      };
+      for (VInst &I : Program.Code) {
+        Map(I.A);
+        Map(I.B);
+        Map(I.C);
+        if (immHoldsReg(I.Op) && I.Imm >= Base && I.Imm < Count)
+          I.Imm = Perm[I.Imm];
+      }
     }
   }
   return true;
@@ -2004,6 +2720,7 @@ bool VMRuntimeBuilder::createThunks() {
     } else {
       Call = B.CreateCall(D.SiteFT, T->getArg(1), CallArgs);
       Call->setCallingConv(D.CC);
+      Call->setAttributes(D.Attrs);
     }
     Call->setTailCallKind(CallInst::TCK_None);
 
@@ -2155,9 +2872,12 @@ Function *VMRuntimeBuilder::createInterpreter() {
     Used.insert(V.Op);
   DenseSet<uint8_t> Covered;
 
-  // Randomised slot count: the register file is still indexed by an 8-bit
-  // operand, but the array no longer has a constant, recognisable size.
-  unsigned RegSlots = 256 + (unsigned)((P.Key >> 8) & 0x7f);
+  // The register file is sized from the translator's actual register count
+  // (plus a small random pad), not from the 8-bit operand space.  It is a
+  // stack object in every interpreter activation, so a fixed 2 KB array would
+  // be paid again on every recursive call and blow the stack long before the
+  // native version does.
+  unsigned RegSlots = P.RegSlots;
   Type *RegArrayTy = ArrayType::get(I64, RegSlots);
 
   FunctionType *FT = FunctionType::get(I64, {Ptr, Ptr}, false);
@@ -2176,6 +2896,13 @@ Function *VMRuntimeBuilder::createInterpreter() {
 
   Value *Regs = B.CreateAlloca(RegArrayTy, nullptr, "r");
   Regs->setName("r");
+  // The handlers load and store every slot with `align 8`, so the array has to
+  // be at least that aligned.  The natural alignment of `[N x i64]` is only 4
+  // on targets whose i64 ABI alignment is 4 (i386 SysV, some bare-metal ARM
+  // ABIs), which would make every odd slot's `store i64, align 8` an
+  // over-aligned access -- undefined behaviour even though x86 and ARM happen
+  // to tolerate it.  Allocas may be over-aligned freely, so pin it here.
+  cast<AllocaInst>(Regs)->setAlignment(Align(8));
   Value *PcSlot = B.CreateAlloca(I32, nullptr, "pc");
   PcSlot->setName("pc");
 
@@ -2189,7 +2916,7 @@ Function *VMRuntimeBuilder::createInterpreter() {
   {
     Value *FrameBits = B.CreatePtrToInt(Fn->getArg(1), I64);
     Value *Dst = B.CreateGEP(RegArrayTy, Regs,
-                             {B.getInt32(0), B.getInt32(kFrameReg)});
+                             {B.getInt32(0), B.getInt32(P.FrameReg)});
     B.CreateAlignedStore(FrameBits, Dst, Align(8));
   }
   B.CreateAlignedStore(B.getInt32(P.EntryPC), PcSlot, Align(4));
@@ -2271,6 +2998,21 @@ Function *VMRuntimeBuilder::createInterpreter() {
       return ConstantInt::getAllOnesValue(I64);
     return ConstantInt::get(I64, (1ULL << PB) - 1);
   };
+  // Read one entry of the integer constant pool.  Level 2+ stores it encrypted
+  // with a per-index mask, and the volatile load keeps the optimiser from
+  // folding the plaintext back in.
+  auto loadIntConst = [&](Value *IdxV) -> Value * {
+    Value *Cp = B.CreateGEP(I64, IntGV, IdxV);
+    Value *V = B.CreateAlignedLoad(I64, Cp, Align(8), P.Level >= 2);
+    if (P.Level >= 2) {
+      Value *Mask = B.CreateAdd(
+          B.getInt64(P.Key),
+          B.CreateMul(B.CreateZExt(IdxV, I64),
+                      B.getInt64(0x9E3779B97F4A7C15ULL)));
+      V = B.CreateXor(V, Mask);
+    }
+    return V;
+  };
   auto newBB = [&]() { return BasicBlock::Create(Ctx, "", Fn); };
 
   auto AddCase = [&](VMOp Op, BasicBlock *BB) {
@@ -2302,15 +3044,7 @@ Function *VMRuntimeBuilder::createInterpreter() {
   if (Used.count(OP_IMM)) {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
-    Value *Cp = B.CreateGEP(I64, IntGV, D.Imm);
-    Value *V = B.CreateAlignedLoad(I64, Cp, Align(8), P.Level >= 2);
-    if (P.Level >= 2) {
-      Value *Mask = B.CreateAdd(
-          B.getInt64(P.Key),
-          B.CreateMul(B.CreateZExt(D.Imm, I64),
-                      B.getInt64(0x9E3779B97F4A7C15ULL)));
-      V = B.CreateXor(V, Mask);
-    }
+    Value *V = loadIntConst(D.Imm);
     storeReg(D.A, zextTo(V, D.W));
     B.CreateAlignedStore(B.CreateAdd(Pc, B.getInt32(1)), PcSlot, Align(4));
     B.CreateBr(Loop);
@@ -2322,7 +3056,10 @@ Function *VMRuntimeBuilder::createInterpreter() {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     Value *Pp = B.CreateGEP(Ptr, PtrGV, D.Imm);
-    Value *V = B.CreateAlignedLoad(Ptr, Pp, Align(8), false);
+    // `[N x ptr]` only guarantees the element ABI alignment, which is 4 on a
+    // 32-bit target: claiming 8 for an odd index would be an over-aligned
+    // access.
+    Value *V = B.CreateAlignedLoad(Ptr, Pp, DL.getPointerABIAlignment(0), false);
     storeReg(D.A, zextTo(B.CreatePtrToInt(V, I64), D.W));
     B.CreateAlignedStore(B.CreateAdd(Pc, B.getInt32(1)), PcSlot, Align(4));
     B.CreateBr(Loop);
@@ -2383,8 +3120,37 @@ Function *VMRuntimeBuilder::createInterpreter() {
     AddCase(OP_STORE, BB);
   }
 
-  auto emitBin = [&](VMOp Op, bool Signed, bool Div) {
+  // ---- OP_SPILL / OP_FILL ----------------------------------------------
+  // Frame traffic.  The frame base is already in a register; the slot offset
+  // is an immediate, so the addressable frame is not limited by the 8-bit
+  // register operand.
+  auto frameAddr = [&](Value *Off) {
+    Value *Base = B.CreateAnd(loadReg(B.getInt32(P.FrameReg)), ptrMask());
+    Value *Bits =
+        B.CreateAnd(B.CreateAdd(Base, B.CreateZExt(Off, I64)), ptrMask());
+    return B.CreateIntToPtr(Bits, Ptr);
+  };
+  if (Used.count(OP_SPILL)) {
     BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    Value *Addr = frameAddr(D.Imm);
+    B.CreateAlignedStore(loadReg(D.A), Addr, Align(8));
+    B.CreateAlignedStore(B.CreateAdd(Pc, B.getInt32(1)), PcSlot, Align(4));
+    B.CreateBr(Loop);
+    AddCase(OP_SPILL, BB);
+  }
+  if (Used.count(OP_FILL)) {
+    BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    Value *Addr = frameAddr(D.Imm);
+    Value *V = B.CreateAlignedLoad(I64, Addr, Align(8), false);
+    storeReg(D.A, V);
+    B.CreateAlignedStore(B.CreateAdd(Pc, B.getInt32(1)), PcSlot, Align(4));
+    B.CreateBr(Loop);
+    AddCase(OP_FILL, BB);
+  }
+
+  auto emitBin = [&](VMOp Op, bool Signed, bool Div) {    BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     Value *X = Signed ? sextTo(loadReg(D.B), D.W) : zextTo(loadReg(D.B), D.W);
     Value *Y =
@@ -2444,6 +3210,54 @@ Function *VMRuntimeBuilder::createInterpreter() {
   if (Used.count(OP_SHL)) emitShift(OP_SHL);
   if (Used.count(OP_LSHR)) emitShift(OP_LSHR);
   if (Used.count(OP_ASHR)) emitShift(OP_ASHR);
+
+  // ---- immediate superinstructions --------------------------------------
+  // A = B <op> constant.  The shift variants keep the amount in the
+  // instruction word; the rest read the pool.  Masking matches emitShift so a
+  // malformed bytecode cannot shift by more than the operand width.
+  auto emitBinImm = [&](VMOp Op) {
+    BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    bool Signed = isSignedImm(Op);
+    Value *X = Signed ? sextTo(loadReg(D.B), D.W) : zextTo(loadReg(D.B), D.W);
+    Value *R = nullptr;
+    if (isShiftImm(Op)) {
+      Value *Bits = loadBits(D.W);
+      Value *AmtMask = B.CreateSub(Bits, B.getInt32(1));
+      Value *Amt = B.CreateAnd(D.Imm, AmtMask);
+      Value *ZAmt = B.CreateZExt(Amt, I64);
+      if (Op == OP_SHL_IMM)
+        R = B.CreateShl(X, ZAmt);
+      else if (Op == OP_LSHR_IMM)
+        R = B.CreateLShr(X, ZAmt);
+      else
+        R = B.CreateAShr(X, ZAmt);
+    } else {
+      Value *Cst = loadIntConst(D.Imm);
+      Value *Y = Signed ? sextTo(Cst, D.W) : zextTo(Cst, D.W);
+      switch (Op) {
+      case OP_ADD_IMM: R = B.CreateAdd(X, Y); break;
+      case OP_SUB_IMM: R = B.CreateSub(X, Y); break;
+      case OP_MUL_IMM: R = B.CreateMul(X, Y); break;
+      case OP_AND_IMM: R = B.CreateAnd(X, Y); break;
+      case OP_OR_IMM:  R = B.CreateOr(X, Y); break;
+      default:         R = B.CreateXor(X, Y); break;
+      }
+    }
+    storeReg(D.A, zextTo(R, D.W));
+    B.CreateAlignedStore(B.CreateAdd(Pc, B.getInt32(1)), PcSlot, Align(4));
+    B.CreateBr(Loop);
+    AddCase(Op, BB);
+  };
+  if (Used.count(OP_ADD_IMM)) emitBinImm(OP_ADD_IMM);
+  if (Used.count(OP_SUB_IMM)) emitBinImm(OP_SUB_IMM);
+  if (Used.count(OP_MUL_IMM)) emitBinImm(OP_MUL_IMM);
+  if (Used.count(OP_AND_IMM)) emitBinImm(OP_AND_IMM);
+  if (Used.count(OP_OR_IMM)) emitBinImm(OP_OR_IMM);
+  if (Used.count(OP_XOR_IMM)) emitBinImm(OP_XOR_IMM);
+  if (Used.count(OP_SHL_IMM)) emitBinImm(OP_SHL_IMM);
+  if (Used.count(OP_LSHR_IMM)) emitBinImm(OP_LSHR_IMM);
+  if (Used.count(OP_ASHR_IMM)) emitBinImm(OP_ASHR_IMM);
 
   auto emitCmp = [&](VMOp Op, CmpInst::Predicate Pred, bool Signed) {
     BasicBlock *BB = newBB();
@@ -2563,6 +3377,36 @@ Function *VMRuntimeBuilder::createInterpreter() {
   if (Used.count(OP_CTTZ)) emitBitIntrinsic(OP_CTTZ);
   if (Used.count(OP_BSWAP)) emitBitIntrinsic(OP_BSWAP);
   if (Used.count(OP_BITREVERSE)) emitBitIntrinsic(OP_BITREVERSE);
+
+  // ---- funnel shifts ----------------------------------------------------
+  // fshl(a,b,s) = s == 0 ? a : (a << s) | (b >> (Bits - s))
+  // fshr(a,b,s) = s == 0 ? b : (a << (Bits - s)) | (b >> s)
+  // The shift amount is masked to Bits-1 and the zero case is selected
+  // explicitly, so neither a 64-bit shift-by-64 nor a spurious OR of the two
+  // inputs can happen.
+  auto emitFunnel = [&](VMOp Op) {
+    BasicBlock *BB = newBB();
+    B.SetInsertPoint(BB);
+    Value *Bits = loadBits(D.W);
+    Value *X = zextTo(loadReg(D.B), D.W);
+    Value *Y = zextTo(loadReg(D.C), D.W);
+    Value *AmtMask = B.CreateSub(Bits, B.getInt32(1));
+    Value *S32 = B.CreateAnd(B.CreateTrunc(loadReg(D.Imm), I32), AmtMask);
+    Value *S = B.CreateZExt(S32, I64);
+    Value *B64 = B.CreateZExt(Bits, I64);
+    Value *Inv = B.CreateAnd(B.CreateSub(B64, S), B.getInt64(63));
+    Value *L = Op == OP_FSHL ? B.CreateShl(X, S) : B.CreateShl(X, Inv);
+    Value *R = Op == OP_FSHL ? B.CreateLShr(Y, Inv) : B.CreateLShr(Y, S);
+    Value *V = B.CreateOr(L, R);
+    Value *IsZero = B.CreateICmpEQ(S, B.getInt64(0));
+    Value *Res = B.CreateSelect(IsZero, Op == OP_FSHL ? X : Y, V);
+    storeReg(D.A, zextTo(Res, D.W));
+    B.CreateAlignedStore(B.CreateAdd(Pc, B.getInt32(1)), PcSlot, Align(4));
+    B.CreateBr(Loop);
+    AddCase(Op, BB);
+  };
+  if (Used.count(OP_FSHL)) emitFunnel(OP_FSHL);
+  if (Used.count(OP_FSHR)) emitFunnel(OP_FSHR);
 
   // ---- floating point ---------------------------------------------------
   auto fpTy = [&](unsigned Code) -> Type * {
@@ -2789,9 +3633,11 @@ Function *VMRuntimeBuilder::createInterpreter() {
     BasicBlock *BB = newBB();
     B.SetInsertPoint(BB);
     Value *Pp = B.CreateGEP(Ptr, ThunkGV, D.Imm);
-    Value *FnPtr = B.CreateAlignedLoad(Ptr, Pp, Align(8), false);
+    // Same element-alignment rule as OP_PTR: the thunk table is `[N x ptr]`.
+    Value *FnPtr =
+        B.CreateAlignedLoad(Ptr, Pp, DL.getPointerABIAlignment(0), false);
     Value *ArgBase = B.CreateGEP(RegArrayTy, Regs,
-                                 {B.getInt32(0), B.getInt32(kArgBase)});
+                                 {B.getInt32(0), B.getInt32(P.ArgBase)});
     Value *HasFn = B.CreateICmpNE(B.CreateAnd(D.Flags, B.getInt32(0x80)),
                                   B.getInt32(0));
     Value *Target = B.CreateIntToPtr(loadReg(D.B), Ptr);
@@ -2800,7 +3646,9 @@ Function *VMRuntimeBuilder::createInterpreter() {
     FunctionType *ThunkFT = FunctionType::get(I64, {Ptr, Ptr}, false);
     CallInst *Call = B.CreateCall(ThunkFT, FnPtr, {ArgBase, FnArg});
     Call->setCallingConv(CallingConv::C);
-    storeReg(B.getInt32(kRetReg), Call);
+    // The destination is part of the instruction, so the result lands in its
+    // register without a separate move.  Void calls name the scratch slot.
+    storeReg(D.A, zextTo(Call, D.W));
     B.CreateAlignedStore(B.CreateAdd(Pc, B.getInt32(1)), PcSlot, Align(4));
     B.CreateBr(Loop);
     AddCase(OP_CALL, BB);
@@ -2891,26 +3739,38 @@ bool VMRuntimeBuilder::emitWrapper() {
 
   // The old body is unreachable now; drop it.  (It was kept attached during
   // verification so that no instruction is left without a parent.)
+  //
+  // Operands must be released before the blocks are destroyed.  An alloca in
+  // the entry block is referenced by loads and stores in later blocks, so
+  // erasing the entry first would destroy the alloca while those uses are
+  // still live -- a use-after-free that only an assertions build reports.
   SmallVector<BasicBlock *, 32> Dead;
   for (BasicBlock &BB : F)
     if (&BB != Entry)
       Dead.push_back(&BB);
+  for (BasicBlock *BB : Dead)
+    BB->dropAllReferences();
   for (BasicBlock *BB : Dead)
     BB->eraseFromParent();
   return true;
 }
 
 void VMRuntimeBuilder::discard() {
-  if (Interp) {
-    Interp->eraseFromParent();
-    Interp = nullptr;
-  }
+  // `Interp` is also the first entry of `CreatedFunctions`, so erasing it here
+  // and then walking the list would touch the freed object: `getParent()` on a
+  // deleted Function reads recycled storage and, when the allocator hands the
+  // block back with the old contents, calls eraseFromParent() a second time --
+  // a double free.  Delete each function exactly once and clear Interp last.
+  Function *Skip = Interp;
   for (auto It = CreatedFunctions.rbegin(); It != CreatedFunctions.rend();
        ++It) {
     Function *Fn = *It;
-    if (Fn && Fn->getParent())
+    if (Fn && Fn != Skip && Fn->getParent())
       Fn->eraseFromParent();
   }
+  if (Skip && Skip->getParent())
+    Skip->eraseFromParent();
+  Interp = nullptr;
   CreatedFunctions.clear();
   for (GlobalVariable *GV : CreatedGlobals)
     if (GV && GV->getParent())
@@ -2935,49 +3795,626 @@ Function *VMRuntimeBuilder::build() {
   return I;
 }
 
+// ---------------------------------------------------------------------------
+// Vector memory scalarisation
+// ---------------------------------------------------------------------------
+//
+// SLP turns constant initialisers and struct copies into vector stores and
+// loads.  The VM has no vector registers, so one such instruction is enough to
+// keep an entire function out of the virtualiser.  Splitting them back into
+// element accesses costs nothing: the backend re-vectorises whatever it can
+// still prove, and the function becomes translatable.
+//
+// Only the shapes whose memory layout is exactly that of the equivalent array
+// are handled.  A <3 x i32> occupies 16 bytes with padding while [3 x i32]
+// occupies 12, so splitting it would touch the wrong offsets.
+
+static bool vectorLayoutMatchesArray(Type *Ty, const DataLayout &DL) {
+  auto *VT = dyn_cast<FixedVectorType>(Ty);
+  if (!VT)
+    return false;
+  Type *Elem = VT->getElementType();
+  if (!Elem->isSized() || Elem->isVectorTy())
+    return false;
+  ArrayType *Arr = ArrayType::get(Elem, VT->getNumElements());
+  return DL.getTypeStoreSize(Ty) == DL.getTypeStoreSize(Arr);
+}
+
+
+// True when every lane of the constant is known.  A constant expression such
+// as `bitcast (i64 1 to <2 x i32>)` has no per-lane value without evaluating
+// the whole register, so it is left for the skip path.
+static bool isLaneWiseConstant(Constant *C) {
+  auto *VT = dyn_cast<FixedVectorType>(C->getType());
+  if (!VT)
+    return false;
+  if (isa<PoisonValue>(C) || isa<UndefValue>(C))
+    return true;
+  for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i)
+    if (!C->getAggregateElement(i))
+      return false;
+  return true;
+}
+
+// An elementwise intrinsic applied to a vector is the same operation applied
+// to each lane, so it scalarises into one call to the scalar overload.  Only
+// the intrinsics the translator understands are listed: a whitelist keeps
+// shapes such as masked.load -- whose scalar form still reads a whole vector
+// from one address -- out of the rewrite.
+// Returns the scalar declaration, or null when the call is not of that shape.
+static Function *scalarIntrinsicCallee(CallInst *CI) {
+  Function *Callee = CI->getCalledFunction();
+  if (!Callee || !Callee->isIntrinsic())
+    return nullptr;
+  Intrinsic::ID Id = Callee->getIntrinsicID();
+  switch (Id) {
+  case Intrinsic::sadd_sat:
+  case Intrinsic::uadd_sat:
+  case Intrinsic::ssub_sat:
+  case Intrinsic::usub_sat:
+  case Intrinsic::abs:
+  case Intrinsic::ctlz:
+  case Intrinsic::cttz:
+  case Intrinsic::ctpop:
+  case Intrinsic::bswap:
+  case Intrinsic::bitreverse:
+  case Intrinsic::fshl:
+  case Intrinsic::fshr:
+  case Intrinsic::fabs:
+  case Intrinsic::sqrt:
+  case Intrinsic::fmuladd:
+    break;
+  default:
+    return nullptr;
+  }
+  auto *VT = dyn_cast<FixedVectorType>(CI->getType());
+  if (!VT)
+    return nullptr;
+  Type *Elem = VT->getElementType();
+  if (!Elem->isIntegerTy() && !Elem->isFloatingPointTy())
+    return nullptr;
+  Function *Scalar = Intrinsic::getOrInsertDeclaration(CI->getModule(), Id,
+                                                       {Elem});
+  if (!Scalar || Scalar == Callee)
+    return nullptr;
+  FunctionType *FT = Scalar->getFunctionType();
+  if (FT->getReturnType() != Elem || FT->getNumParams() != CI->arg_size())
+    return nullptr;
+  for (unsigned i = 0; i != CI->arg_size(); ++i) {
+    Type *PT = FT->getParamType(i);
+    Type *AT = CI->getArgOperand(i)->getType();
+    if (PT != AT && !(AT->isVectorTy() && PT == Elem))
+      return nullptr;
+  }
+  return Scalar;
+}
+
+// Reductions fold every lane into one scalar.  Only the associative integer
+// forms the vectoriser emits are handled.
+static bool isVectorReduceCall(CallInst *CI) {
+  Function *Callee = CI->getCalledFunction();
+  if (!Callee || !Callee->isIntrinsic() || CI->arg_size() != 1)
+    return false;
+  switch (Callee->getIntrinsicID()) {
+  case Intrinsic::vector_reduce_add:
+  case Intrinsic::vector_reduce_mul:
+  case Intrinsic::vector_reduce_and:
+  case Intrinsic::vector_reduce_or:
+  case Intrinsic::vector_reduce_xor:
+  case Intrinsic::vector_reduce_smax:
+  case Intrinsic::vector_reduce_smin:
+  case Intrinsic::vector_reduce_umax:
+  case Intrinsic::vector_reduce_umin:
+    return dyn_cast<FixedVectorType>(CI->getArgOperand(0)->getType()) != nullptr;
+  default:
+    return false;
+  }
+}
+
+// Instructions that mean the same thing when rebuilt one lane at a time.
+// `bitcast` does not: it reinterprets the whole register.
+static bool isLaneWiseOp(const Instruction &I) {
+  if (isa<BinaryOperator>(I) || isa<UnaryOperator>(I) || isa<ICmpInst>(I) ||
+      isa<FCmpInst>(I) || isa<SelectInst>(I))
+    return true;
+  if (auto *CI = dyn_cast<CastInst>(&I))
+    return !isa<BitCastInst>(CI);
+  return false;
+}
+
+// Scalarisation replaces one vector value with one value per lane, so a
+// pathological width would multiply the function instead of shrinking it.
+// SLP and the loop vectoriser stay far below this.
+constexpr unsigned kMaxVectorLanes = 64;
+
+static bool canScalarizeVectors(Function &F, const DataLayout &DL) {
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB) {
+      bool HasVector = false;
+      if (auto *VT = dyn_cast<VectorType>(I.getType())) {
+        if (VT->getElementCount().isScalable() ||
+            VT->getElementCount().getKnownMinValue() > kMaxVectorLanes)
+          return false;
+        HasVector = true;
+      }
+      for (Value *Op : I.operands()) {
+        if (auto *VT = dyn_cast<VectorType>(Op->getType())) {
+          if (VT->getElementCount().isScalable() ||
+              VT->getElementCount().getKnownMinValue() > kMaxVectorLanes)
+            return false;
+          HasVector = true;
+        }
+      }
+      if (!HasVector)
+        continue;
+      // Every vector constant has to be readable one lane at a time.
+      for (Value *Op : I.operands())
+        if (auto *C = dyn_cast<Constant>(Op))
+          if (C->getType()->isVectorTy() && !isLaneWiseConstant(C))
+            return false;
+
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (!LI->isVolatile() && !LI->isAtomic() &&
+            vectorLayoutMatchesArray(LI->getType(), DL))
+          continue;
+        return false;
+      }
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (!SI->isVolatile() && !SI->isAtomic() &&
+            vectorLayoutMatchesArray(SI->getValueOperand()->getType(), DL))
+          continue;
+        return false;
+      }
+      if (auto *EE = dyn_cast<ExtractElementInst>(&I)) {
+        if (isa<ConstantInt>(EE->getIndexOperand()))
+          continue;
+        return false;
+      }
+      if (auto *IE = dyn_cast<InsertElementInst>(&I)) {
+        if (isa<ConstantInt>(IE->getOperand(2)))
+          continue;
+        return false;
+      }
+      if (auto *PN = dyn_cast<PHINode>(&I)) {
+        if (isa<FixedVectorType>(PN->getType()))
+          continue;
+        return false;
+      }
+      if (auto *CB = dyn_cast<CallInst>(&I)) {
+        if (isVectorReduceCall(CB) || scalarIntrinsicCallee(CB))
+          continue;
+        return false;
+      }
+      if (isa<ShuffleVectorInst>(&I))
+        continue;
+      if (!isLaneWiseOp(I))
+        return false;
+    }
+  return true;
+}
+
+// Splits every vector value in F into one scalar value per lane.  Returns
+// false, leaving F untouched, when the function holds a vector shape the
+// rewrite does not understand.
+static bool scalarizeVectors(Function &F, const DataLayout &DL) {
+  SmallVector<BasicBlock *, 32> Order;
+  for (BasicBlock *BB : ReversePostOrderTraversal<Function *>(&F))
+    Order.push_back(BB);
+  // A value defined in an unreachable block has no lane mapping by the time
+  // its use is reached, so those functions are left alone.
+  if (Order.size() != F.size() || !canScalarizeVectors(F, DL))
+    return false;
+
+  DenseMap<Value *, SmallVector<Value *, 4>> Lanes;
+  SmallVector<Instruction *, 32> Dead;
+  // Vector PHIs whose incoming lists are filled once every block has been
+  // walked: a latch value is not known when its header is reached in RPO.
+  SmallVector<PHINode *, 8> PendingPHIs;
+
+  auto LaneOf = [&](Value *V, unsigned Idx) -> Value * {
+    if (auto *C = dyn_cast<Constant>(V)) {
+      if (isa<PoisonValue>(C) || isa<UndefValue>(C))
+        return PoisonValue::get(
+            cast<FixedVectorType>(V->getType())->getElementType());
+      return C->getAggregateElement(Idx);
+    }
+    auto It = Lanes.find(V);
+    if (It == Lanes.end() || Idx >= It->second.size())
+      return nullptr;
+    return It->second[Idx];
+  };
+
+  for (BasicBlock *BB : Order) {
+    for (Instruction &I : make_early_inc_range(*BB)) {
+      Type *Ty = I.getType();
+      bool Vector = Ty->isVectorTy();
+      for (Value *Op : I.operands())
+        Vector |= Op->getType()->isVectorTy();
+      if (!Vector)
+        continue;
+
+      if (auto *PN = dyn_cast<PHINode>(&I)) {
+        auto *VT = cast<FixedVectorType>(Ty);
+        Type *Elem = VT->getElementType();
+        SmallVector<Value *, 4> V;
+        for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+          PHINode *LP = PHINode::Create(
+              Elem, PN->getNumIncomingValues(),
+              PN->getName() + Twine(".lane") + Twine(i), PN->getIterator());
+          V.push_back(LP);
+        }
+        Lanes[PN] = std::move(V);
+        PendingPHIs.push_back(PN);
+        Dead.push_back(PN);
+        continue;
+      }
+
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        auto *VT = cast<FixedVectorType>(Ty);
+        Type *Elem = VT->getElementType();
+        uint64_t ElemSize = DL.getTypeStoreSize(Elem);
+        IRBuilder<> B(LI);
+        SmallVector<Value *, 4> V;
+        for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+          Value *P = B.CreateGEP(B.getInt8Ty(), LI->getPointerOperand(),
+                                 B.getInt64(i * ElemSize));
+          LoadInst *E = B.CreateLoad(Elem, P);
+          E->setAlignment(Align(MinAlign(LI->getAlign().value(), ElemSize)));
+          V.push_back(E);
+        }
+        Lanes[LI] = std::move(V);
+        Dead.push_back(LI);
+        continue;
+      }
+
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        auto *VT = cast<FixedVectorType>(SI->getValueOperand()->getType());
+        Type *Elem = VT->getElementType();
+        uint64_t ElemSize = DL.getTypeStoreSize(Elem);
+        SmallVector<Value *, 4> V;
+        for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+          Value *L = LaneOf(SI->getValueOperand(), i);
+          if (!L)
+            return false;
+          V.push_back(L);
+        }
+        IRBuilder<> B(SI);
+        for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+          Value *P = B.CreateGEP(B.getInt8Ty(), SI->getPointerOperand(),
+                                 B.getInt64(i * ElemSize));
+          StoreInst *E = B.CreateStore(V[i], P);
+          E->setAlignment(Align(MinAlign(SI->getAlign().value(), ElemSize)));
+        }
+        Dead.push_back(SI);
+        continue;
+      }
+
+      if (auto *EE = dyn_cast<ExtractElementInst>(&I)) {
+        unsigned Idx =
+            (unsigned)cast<ConstantInt>(EE->getIndexOperand())->getZExtValue();
+        Value *L = LaneOf(EE->getVectorOperand(), Idx);
+        if (!L)
+          return false;
+        EE->replaceAllUsesWith(L);
+        Dead.push_back(EE);
+        continue;
+      }
+
+      if (auto *IE = dyn_cast<InsertElementInst>(&I)) {
+        auto *VT = cast<FixedVectorType>(Ty);
+        unsigned Idx =
+            (unsigned)cast<ConstantInt>(IE->getOperand(2))->getZExtValue();
+        SmallVector<Value *, 4> V;
+        for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+          if (i == Idx) {
+            V.push_back(IE->getOperand(1));
+            continue;
+          }
+          Value *L = LaneOf(IE->getOperand(0), i);
+          if (!L)
+            return false;
+          V.push_back(L);
+        }
+        Lanes[IE] = std::move(V);
+        Dead.push_back(IE);
+        continue;
+      }
+
+      if (auto *SV = dyn_cast<ShuffleVectorInst>(&I)) {
+        auto *VT = cast<FixedVectorType>(Ty);
+        unsigned NumA = cast<FixedVectorType>(SV->getOperand(0)->getType())
+                            ->getNumElements();
+        SmallVector<Value *, 4> V;
+        for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+          int M = SV->getMaskValue(i);
+          Value *L;
+          if (M < 0) {
+            L = PoisonValue::get(VT->getElementType());
+          } else if ((unsigned)M < NumA) {
+            L = LaneOf(SV->getOperand(0), (unsigned)M);
+          } else {
+            L = LaneOf(SV->getOperand(1), (unsigned)M - NumA);
+          }
+          if (!L)
+            return false;
+          V.push_back(L);
+        }
+        Lanes[SV] = std::move(V);
+        Dead.push_back(SV);
+        continue;
+      }
+
+      if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+        auto *VT = cast<FixedVectorType>(Ty);
+        IRBuilder<> B(BO);
+        SmallVector<Value *, 4> V;
+        for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+          Value *A = LaneOf(BO->getOperand(0), i);
+          Value *C = LaneOf(BO->getOperand(1), i);
+          if (!A || !C)
+            return false;
+          Value *N = B.CreateBinOp(BO->getOpcode(), A, C);
+          if (auto *NBO = dyn_cast<BinaryOperator>(N))
+            NBO->copyIRFlags(BO);
+          V.push_back(N);
+        }
+        Lanes[BO] = std::move(V);
+        Dead.push_back(BO);
+        continue;
+      }
+
+      if (auto *UO = dyn_cast<UnaryOperator>(&I)) {
+        auto *VT = cast<FixedVectorType>(Ty);
+        IRBuilder<> B(UO);
+        SmallVector<Value *, 4> V;
+        for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+          Value *A = LaneOf(UO->getOperand(0), i);
+          if (!A)
+            return false;
+          Value *N = B.CreateFNeg(A);
+          if (auto *NUO = dyn_cast<UnaryOperator>(N))
+            NUO->copyIRFlags(UO);
+          V.push_back(N);
+        }
+        Lanes[UO] = std::move(V);
+        Dead.push_back(UO);
+        continue;
+      }
+
+      if (auto *IC = dyn_cast<ICmpInst>(&I)) {
+        auto *VT = cast<FixedVectorType>(Ty);
+        IRBuilder<> B(IC);
+        SmallVector<Value *, 4> V;
+        for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+          Value *A = LaneOf(IC->getOperand(0), i);
+          Value *C = LaneOf(IC->getOperand(1), i);
+          if (!A || !C)
+            return false;
+          V.push_back(B.CreateICmp(IC->getPredicate(), A, C));
+        }
+        Lanes[IC] = std::move(V);
+        Dead.push_back(IC);
+        continue;
+      }
+
+      if (auto *FC = dyn_cast<FCmpInst>(&I)) {
+        auto *VT = cast<FixedVectorType>(Ty);
+        IRBuilder<> B(FC);
+        SmallVector<Value *, 4> V;
+        for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+          Value *A = LaneOf(FC->getOperand(0), i);
+          Value *C = LaneOf(FC->getOperand(1), i);
+          if (!A || !C)
+            return false;
+          Value *N = B.CreateFCmp(FC->getPredicate(), A, C);
+          if (auto *NFC = dyn_cast<FCmpInst>(N))
+            NFC->copyIRFlags(FC);
+          V.push_back(N);
+        }
+        Lanes[FC] = std::move(V);
+        Dead.push_back(FC);
+        continue;
+      }
+
+      if (auto *SEL = dyn_cast<SelectInst>(&I)) {
+        auto *VT = cast<FixedVectorType>(Ty);
+        bool VecCond = SEL->getCondition()->getType()->isVectorTy();
+        IRBuilder<> B(SEL);
+        SmallVector<Value *, 4> V;
+        for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+          Value *Cond =
+              VecCond ? LaneOf(SEL->getCondition(), i) : SEL->getCondition();
+          Value *T = LaneOf(SEL->getTrueValue(), i);
+          Value *Fv = LaneOf(SEL->getFalseValue(), i);
+          if (!Cond || !T || !Fv)
+            return false;
+          SelectInst *N = SelectInst::Create(Cond, T, Fv, "", SEL->getIterator());
+          N->copyIRFlags(SEL);
+          V.push_back(N);
+        }
+        Lanes[SEL] = std::move(V);
+        Dead.push_back(SEL);
+        continue;
+      }
+
+      if (auto *CB = dyn_cast<CallInst>(&I)) {
+        IRBuilder<> B(CB);
+        // A reduction folds the lanes into one scalar, so it has no lane
+        // mapping of its own: the folded value replaces the call outright.
+        if (isVectorReduceCall(CB)) {
+          auto *VT = cast<FixedVectorType>(CB->getArgOperand(0)->getType());
+          SmallVector<Value *, 4> V;
+          for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+            Value *L = LaneOf(CB->getArgOperand(0), i);
+            if (!L)
+              return false;
+            V.push_back(L);
+          }
+          Value *Acc = V.front();
+          for (unsigned i = 1, e = V.size(); i != e; ++i) {
+            Value *N = nullptr;
+            switch (CB->getIntrinsicID()) {
+            case Intrinsic::vector_reduce_add:
+              N = B.CreateAdd(Acc, V[i]);
+              break;
+            case Intrinsic::vector_reduce_mul:
+              N = B.CreateMul(Acc, V[i]);
+              break;
+            case Intrinsic::vector_reduce_and:
+              N = B.CreateAnd(Acc, V[i]);
+              break;
+            case Intrinsic::vector_reduce_or:
+              N = B.CreateOr(Acc, V[i]);
+              break;
+            case Intrinsic::vector_reduce_xor:
+              N = B.CreateXor(Acc, V[i]);
+              break;
+            case Intrinsic::vector_reduce_smax:
+              N = B.CreateSelect(B.CreateICmpSGT(Acc, V[i]), Acc, V[i]);
+              break;
+            case Intrinsic::vector_reduce_smin:
+              N = B.CreateSelect(B.CreateICmpSLT(Acc, V[i]), Acc, V[i]);
+              break;
+            case Intrinsic::vector_reduce_umax:
+              N = B.CreateSelect(B.CreateICmpUGT(Acc, V[i]), Acc, V[i]);
+              break;
+            case Intrinsic::vector_reduce_umin:
+              N = B.CreateSelect(B.CreateICmpULT(Acc, V[i]), Acc, V[i]);
+              break;
+            default:
+              return false;
+            }
+            Acc = N;
+          }
+          CB->replaceAllUsesWith(Acc);
+          Dead.push_back(CB);
+          continue;
+        }
+        // Elementwise intrinsic: one call per lane, scalar arguments passed
+        // through unchanged.
+        if (Function *Scalar = scalarIntrinsicCallee(CB)) {
+          auto *VT = cast<FixedVectorType>(Ty);
+          SmallVector<Value *, 4> V;
+          for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+            SmallVector<Value *, 4> Args;
+            for (Value *A : CB->args()) {
+              if (!A->getType()->isVectorTy()) {
+                Args.push_back(A);
+                continue;
+              }
+              Value *L = LaneOf(A, i);
+              if (!L)
+                return false;
+              Args.push_back(L);
+            }
+            V.push_back(B.CreateCall(Scalar, Args));
+          }
+          Lanes[CB] = std::move(V);
+          Dead.push_back(CB);
+          continue;
+        }
+        return false;
+      }
+
+      if (auto *CI = dyn_cast<CastInst>(&I)) {
+        auto *VT = cast<FixedVectorType>(Ty);
+        IRBuilder<> B(CI);
+        SmallVector<Value *, 4> V;
+        for (unsigned i = 0, e = VT->getNumElements(); i != e; ++i) {
+          Value *A = LaneOf(CI->getOperand(0), i);
+          if (!A)
+            return false;
+          V.push_back(B.CreateCast(CI->getOpcode(), A, VT->getElementType()));
+        }
+        Lanes[CI] = std::move(V);
+        Dead.push_back(CI);
+        continue;
+      }
+    }
+  }
+
+  // Second pass: every value now has lanes, so the deferred PHI edges can be
+  // resolved even when they come from a loop latch.
+  for (PHINode *PN : PendingPHIs) {
+    auto &LV = Lanes[PN];
+    for (unsigned k = 0, e = PN->getNumIncomingValues(); k != e; ++k) {
+      BasicBlock *In = PN->getIncomingBlock(k);
+      Value *Inc = PN->getIncomingValue(k);
+      for (unsigned i = 0, n = LV.size(); i != n; ++i) {
+        Value *L = LaneOf(Inc, i);
+        if (!L)
+          return false;
+        cast<PHINode>(LV[i])->addIncoming(L, In);
+      }
+    }
+  }
+
+  // Users always come after their producers in RPO, so erasing in reverse
+  // order peels insertelement/shuffle chains from the top down.  A PHI is the
+  // exception: a latch value feeds a header PHI, which makes the two reference
+  // each other.  Dropping the incoming edges first breaks that cycle.
+  DenseSet<Instruction *> DeadSet(Dead.begin(), Dead.end());
+  for (Instruction *I : Dead)
+    for (User *U : I->users())
+      if (auto *UI = dyn_cast<Instruction>(U))
+        if (!DeadSet.count(UI))
+          return false;
+  // Split the PHIs out *before* anything is freed.  `Dead` holds raw pointers,
+  // so walking it again after the non-PHI instructions have been erased would
+  // run `isa<PHINode>` on released storage: if the allocator has already
+  // recycled the object the vtable is garbage and the pass segfaults.  That is
+  // exactly the one-in-a-hundred crash the unseeded runs showed, since the seed
+  // decides whether a function ever reaches this retry at all.
+  SmallVector<PHINode *, 8> DeadPHIs;
+  for (Instruction *I : Dead)
+    if (auto *PN = dyn_cast<PHINode>(I))
+      DeadPHIs.push_back(PN);
+  for (PHINode *PN : DeadPHIs)
+    PN->dropAllReferences();
+  for (Instruction *I : reverse(Dead)) {
+    if (isa<PHINode>(I))
+      continue;
+    if (!I->use_empty())
+      return false;
+    I->eraseFromParent();
+  }
+  for (PHINode *PN : reverse(DeadPHIs))
+    PN->eraseFromParent();
+  return true;
+}
+
+
 } // namespace
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
-bool llvm::virtualizeFunction(Function &F, const VirtualizeConfig &Cfg,
-                              std::string &Reason) {
-  Reason.clear();
-  if (!Cfg.Enabled) {
-    Reason = "disabled";
-    return false;
-  }
-  // Translating our own runtime would produce interpreter^N: the thunks we
-  // emit are ordinary functions and would be picked up again by a module-wide
-  // driver.  Never virtualise generated code.
-  if (F.hasFnAttribute(kGeneratedAttr)) {
-    Reason = "generated by vmp";
-    return false;
-  }
-  uint64_t Seed = Cfg.Seed;
-  if (!Seed)
-    Seed = (uint64_t)std::chrono::high_resolution_clock::now()
-               .time_since_epoch()
-               .count();
-
-  VMTranslator T(F, Seed, Cfg.Level, Reason);
-  if (!T.run())
-    return false;
-
+// Emits the interpreter and the wrapper for a program that translated
+// successfully.  Split out so the vector-scalarisation retry can share it.
+static bool finishVirtualize(Function &F, VMTranslator &T, uint64_t Seed,
+                             std::string &Reason) {
   if (::getenv("OBORO_VMP_DUMP")) {
     static const char *Names[] = {
         "nop", "mov", "imm", "ptr", "load", "store", "add", "sub", "mul",
         "udiv", "sdiv", "urem", "srem", "and", "or", "xor", "shl", "lshr",
-        "ashr", "eq", "ne", "ugt", "uge", "ult", "ule", "sgt", "sge", "slt",
+        "ashr", "add_imm", "sub_imm", "mul_imm", "and_imm", "or_imm",
+        "xor_imm", "shl_imm", "lshr_imm", "ashr_imm",
+        "eq", "ne", "ugt", "uge", "ult", "ule", "sgt", "sge", "slt",
         "sle", "select", "zext", "sext", "trunc", "ctpop", "ctlz", "cttz",
-        "bswap", "bitrev", "fadd", "fsub", "fmul", "fdiv", "frem", "fneg",
+        "bswap", "bitrev", "fshl", "fshr", "fadd", "fsub", "fmul", "fdiv", "frem", "fneg",
         "fabs", "fsqrt", "fma", "fcmp", "fpext", "fptrunc", "fptosi",
         "fptoui", "sitofp", "uitofp", "ieq_cbr", "ine_cbr", "iugt_cbr",
         "iuge_cbr", "iult_cbr", "iule_cbr", "isgt_cbr", "isge_cbr",
-        "islt_cbr", "isle_cbr", "br", "cbr", "ret", "call", "trap"};
+        "islt_cbr", "isle_cbr", "br", "cbr", "ret", "call", "trap",
+        "spill", "fill"};
+    static_assert(sizeof(Names) / sizeof(Names[0]) == OP_COUNT,
+                  "opcode name table must cover every opcode");
     errs() << "[dump] " << F.getName() << " key=" << T.Program.Key
-           << " args=" << T.Program.ArgCount << "\n";
+           << " args=" << T.Program.ArgCount
+           << " regs=" << T.Program.RegSlots
+           << " spill=" << T.Program.SpillSlots
+           << " frame=" << T.Program.FrameSize << "\n";
     for (unsigned I = 0; I < T.Program.Code.size(); ++I) {
       const VInst &V = T.Program.Code[I];
       errs() << "  " << I << ": " << (V.Op < OP_COUNT ? Names[V.Op] : "?")
@@ -2998,4 +4435,120 @@ bool llvm::virtualizeFunction(Function &F, const VirtualizeConfig &Cfg,
     return false;
   }
   return true;
+}
+
+// Translation is read-only, so a failure costs nothing but the attempt.  Two
+// fallbacks are tried, cheapest first:
+//   1. frame-resident values -- a function with more cross-block values than
+//      the 236-slot register file can hold is translated again with those
+//      values kept in the wrapper frame;
+//   2. vector scalarisation -- vector accesses left behind by SLP are split
+//      and the function is retried.
+// The caller gets the translator that succeeded, or the original reason.
+static std::unique_ptr<VMTranslator>
+translateFunction(Function &F, uint64_t Seed, unsigned Level,
+                  std::string &Reason, unsigned RecursionCycle = 0) {
+  auto T = std::make_unique<VMTranslator>(F, Seed, Level, Reason, false,
+                                          RecursionCycle);
+  if (T->run())
+    return T;
+  if (!StringRef(Reason).starts_with("too many SSA values"))
+    return nullptr;
+  std::string SpillReason;
+  auto S = std::make_unique<VMTranslator>(F, Seed, Level, SpillReason, true,
+                                          RecursionCycle);
+  if (S->run()) {
+    Reason = SpillReason;
+    return S;
+  }
+  if (::getenv("OBORO_VMP_DEBUG"))
+    errs() << "[vmp] spill retry failed for " << F.getName() << ": "
+           << SpillReason << "\n";
+  return nullptr;
+}
+
+bool llvm::virtualizeFunction(Function &F, const VirtualizeConfig &Cfg,
+                              std::string &Reason, bool *IRChanged) {
+  if (IRChanged)
+    *IRChanged = false;
+  Reason.clear();
+  if (!Cfg.Enabled) {
+    Reason = "disabled";
+    return false;
+  }
+  // Translating our own runtime would produce interpreter^N: the thunks we
+  // emit are ordinary functions and would be picked up again by a module-wide
+  // driver.  Never virtualise generated code.
+  if (F.hasFnAttribute(kGeneratedAttr)) {
+    Reason = "generated by vmp";
+    return false;
+  }
+  uint64_t Seed = Cfg.Seed;
+  if (!Seed)
+    Seed = (uint64_t)std::chrono::high_resolution_clock::now()
+               .time_since_epoch()
+               .count();
+
+  std::unique_ptr<VMTranslator> T =
+      translateFunction(F, Seed, Cfg.Level, Reason, Cfg.RecursionCycle);
+  if (T) {
+    bool Ok = finishVirtualize(F, *T, Seed, Reason);
+    if (IRChanged)
+      *IRChanged = Ok;
+    return Ok;
+  }
+
+  std::string FirstReason = Reason;
+  const DataLayout &DL = F.getParent()->getDataLayout();
+
+  // Scalarisation only adds scalar values, so it cannot rescue a function that
+  // was rejected because its per-call VM state is already too large.  Bail out
+  // before the probe: scalarising cannot shrink the register file, so the
+  // retry would be rejected for the same reason and only waste time.
+  if (StringRef(FirstReason).starts_with("recursive function"))
+    return false;
+
+  // Probe the rewrite on a throw-away clone.  Splitting vector accesses
+  // pessimises the function unless the retry then succeeds, and translation has
+  // no side effects, so the decision is made before touching F.  The cycle
+  // size comes from the driver, not from the clone: a cloned function's calls
+  // still point at the original, so inspecting the clone would miss them.
+  ValueToValueMapTy VMap;
+  Function *Probe = CloneFunction(&F, VMap);
+  Probe->setName(F.getName() + ".vmp.probe");
+  bool Feasible = false;
+  if (scalarizeVectors(*Probe, DL)) {
+    std::string ProbeReason;
+    Feasible = translateFunction(*Probe, Seed, Cfg.Level, ProbeReason,
+                                 Cfg.RecursionCycle) != nullptr;
+  }
+  Probe->eraseFromParent();
+  if (!Feasible) {
+    Reason = FirstReason;
+    return false;
+  }
+
+  if (!scalarizeVectors(F, DL)) {
+    // The probe already succeeded on a clone, so reaching this means the
+    // rewrite was rolled out on the real function and then hit a check.  The
+    // partially scalarised body is still valid -- the original vector
+    // instructions are only erased at the very end -- but it is not the IR the
+    // pass manager last analysed, so report the change even though the
+    // function stays unvirtualised.
+    if (IRChanged)
+      *IRChanged = true;
+    Reason = FirstReason;
+    return false;
+  }
+  // The split stays only when the retry succeeds, so the pass manager has to
+  // hear about the change.
+  if (IRChanged)
+    *IRChanged = true;
+  std::unique_ptr<VMTranslator> Retry =
+      translateFunction(F, Seed, Cfg.Level, Reason, Cfg.RecursionCycle);
+  if (!Retry) {
+    Reason = FirstReason;
+    return false;
+  }
+  return finishVirtualize(F, *Retry, Seed, Reason);
 }
