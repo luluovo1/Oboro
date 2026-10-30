@@ -123,6 +123,7 @@ public:
     if (N == "bcf")    return F_Strength | F_Budget | F_BudgetPct;
     if (N == "decoy")  return F_Ratio | F_Pollute | F_Probe;
     if (N == "aux")    return F_Wrap | F_Shuffle | F_Split;
+    if (N == "vmp")    return F_Level;
     return 0;
   }
 
@@ -298,6 +299,7 @@ protected:
   std::shared_ptr<ObfOpt> DecoyOpt = nullptr;
   // 结构性后处理（转发包装 / 块乱序 / 块拆分）合成一个域。
   std::shared_ptr<ObfOpt> AuxOpt = nullptr;
+  std::shared_ptr<ObfOpt> VmpOpt  = nullptr;
 
   SmallString<32> RandomSeed;
   // AArch64 PAC pointer-table signing is opt-in: it needs a module
@@ -314,7 +316,7 @@ protected:
 
 public:
   SmallVector<std::shared_ptr<ObfOpt>> getAllOpt() const {
-    SmallVector<std::shared_ptr<ObfOpt>, 11> allOpt;
+    SmallVector<std::shared_ptr<ObfOpt>, 12> allOpt;
     allOpt.push_back(IndBrOpt);
     allOpt.push_back(ICallOpt);
     allOpt.push_back(IndGvOpt);
@@ -326,6 +328,7 @@ public:
     allOpt.push_back(BcfOpt);
     allOpt.push_back(DecoyOpt);
     allOpt.push_back(AuxOpt);
+    allOpt.push_back(VmpOpt);
     return allOpt;
   }
 
@@ -339,7 +342,8 @@ public:
                      const std::shared_ptr<ObfOpt> &rttiOpt,
                      const std::shared_ptr<ObfOpt> &bcfOpt,
                      const std::shared_ptr<ObfOpt> &decoyOpt,
-                     const std::shared_ptr<ObfOpt> &auxOpt) {
+                     const std::shared_ptr<ObfOpt> &auxOpt,
+                     const std::shared_ptr<ObfOpt> &vmpOpt) {
     this->IndBrOpt = indBrOpt;
     this->ICallOpt = iCallOpt;
     this->IndGvOpt = indGvOpt;
@@ -351,6 +355,7 @@ public:
     this->BcfOpt  = bcfOpt;
     this->DecoyOpt = decoyOpt;
     this->AuxOpt = auxOpt;
+    this->VmpOpt  = vmpOpt;
   }
 
   ObfuscationOptions() : ObfuscationOptions{
@@ -364,7 +369,8 @@ public:
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "rtti")),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "bcf")),
                            std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "decoy")),
-                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "aux"))
+                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "aux")),
+                           std::shared_ptr<ObfOpt>(new ObfOpt(false, 0, "vmp"))
                        } {}
 
   auto indBrOpt() const {
@@ -402,6 +408,8 @@ public:
   auto bcfOpt() const { return BcfOpt; }
   auto decoyOpt() const { return DecoyOpt; }
   auto auxOpt() const { return AuxOpt; }
+
+  auto vmpOpt() const { return VmpOpt; }
 
   auto &randomSeed() {
     return RandomSeed;

@@ -8,6 +8,7 @@
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationPassManager.h"
 #include "llvm/Transforms/Obfuscation/AuxPasses.h"
+#include "llvm/Transforms/Obfuscation/Virtualize.h"
 // CryptoUtils.h defines a function-like macro `R`, which collides with
 // std::function template parameters in CommandLine.h if included earlier.
 #include "llvm/CryptoUtils.h"
@@ -82,6 +83,16 @@ static cl::opt<bool>
 EnableRttiEraser("irobf-rtti", cl::init(false), cl::NotHidden,
   cl::desc("Randomise MSVC RTTI type-descriptor names (structure kept)."),
   cl::ZeroOrMore);
+
+// VMP 只跑在末端管线（OptimizerLast）：在 PipelineStart 跑，优化器会把
+// 字节码常量折回原始代码。
+static cl::opt<bool>
+EnableVmp("irobf-vmp", cl::init(false), cl::NotHidden,
+          cl::desc("Enable IR Virtualization (VMP)."),
+          cl::ZeroOrMore);
+static cl::opt<uint32_t>
+LevelVmp("level-vmp", cl::init(0), cl::NotHidden,
+         cl::desc("Set VMP level (1..3)."), cl::ZeroOrMore);
 
 // ---- 新功能域 --------------------------------------------------------------
 // BCF：不带值 = 默认强度 70，带值 = 0..100。
@@ -196,8 +207,15 @@ struct ObfuscationPassManager : public ModulePass {
   bool runFunctionPass(Module &M, FunctionPass *P) {
     bool Changed = false;
     Changed |= P->doInitialization(M);
-    for (Function &F : M) {
-      Changed |= P->runOnFunction(F);
+    // 先给工作列表拍快照。函数 pass 可能往模块里追加函数（VMP 会生成
+    // 解释器和每个被调方的 thunk），直接遍历活的 ilist 会把这些新函数
+    // 也当成待处理对象，模块会无界增长。
+    SmallVector<Function *, 64> Work;
+    Work.reserve(M.size());
+    for (Function &F : M)
+      Work.push_back(&F);
+    for (Function *F : Work) {
+      Changed |= P->runOnFunction(*F);
     }
     return Changed;
   }
@@ -257,6 +275,11 @@ struct ObfuscationPassManager : public ModulePass {
       Opt->cfeOpt()->setEnable(EnableIRConstantFPEncryption);
     if (isSet(EnableRttiEraser))
       Opt->rttiOpt()->setEnable(EnableRttiEraser);
+    // VMP：裸开关只启用，档位沿用 config；写了 -level-vmp 才覆盖。
+    if (isSet(EnableVmp))
+      Opt->vmpOpt()->setEnable(EnableVmp);
+    if (isSet(LevelVmp))
+      Opt->vmpOpt()->setLevel(LevelVmp);
 
     // bcf / decoy：带值开关。裸开关只启用，参数沿用 config / 默认值；
     // 只有真的写了值才覆盖——否则 `-irobf-bcf` 会把 config 的 90 重置成 70。
@@ -339,7 +362,10 @@ struct ObfuscationPassManager : public ModulePass {
       const bool WantIndBr =
           Options->mayBeEnabled(Options->indBrOpt(), M);
       const bool WantDual = WantIndBr && Options->indBrOpt()->mode() == 2;
-      if (!WantShuffle && !WantSplit && !WantIndBr)
+      // VMP 必须最后跑：它把整个函数体换成字节码，之后再插入块或改边都
+      // 只会破坏已经生成的解释器入口。
+      const bool WantVmp = Options->mayBeEnabled(Options->vmpOpt(), M);
+      if (!WantShuffle && !WantSplit && !WantIndBr && !WantVmp)
         return false;
       if (!Options->randomSeed().empty())
         cryptoutils->prng_seed(std::string(Options->randomSeed()));
@@ -352,6 +378,8 @@ struct ObfuscationPassManager : public ModulePass {
         add(llvm::createIndirectBranchPass(Options.get(), /*Dual=*/WantDual));
       if (WantShuffle)
         add(llvm::createShuffleBlocksPass(Options.get()));
+      if (WantVmp)
+        add(llvm::createVirtualizePass(Options.get()));
       return run(M);
     }
 

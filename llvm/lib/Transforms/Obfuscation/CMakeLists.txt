@@ -17,6 +17,8 @@ add_llvm_library(LLVMObfuscation
   ConstantFPEncryption.cpp
   MicrosoftRTTIEraser.cpp
   AuxPasses.cpp
+  Virtualize.cpp
+  VirtualizePass.cpp
   
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms/Obfuscation
