@@ -8,6 +8,7 @@
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationPassManager.h"
 #include "llvm/Transforms/Obfuscation/AuxPasses.h"
+#include "llvm/Transforms/Obfuscation/MergeFunction.h"
 #include "llvm/Transforms/Obfuscation/Virtualize.h"
 // CryptoUtils.h defines a function-like macro `R`, which collides with
 // std::function template parameters in CommandLine.h if included earlier.
@@ -93,6 +94,12 @@ EnableVmp("irobf-vmp", cl::init(false), cl::NotHidden,
 static cl::opt<uint32_t>
 LevelVmp("level-vmp", cl::init(0), cl::NotHidden,
          cl::desc("Set VMP level (1..3)."), cl::ZeroOrMore);
+
+// 函数合并也只在末端跑：合并后的大函数不能再被内联拆散。
+static cl::opt<bool>
+EnableMerge("irobf-merge", cl::init(false), cl::NotHidden,
+            cl::desc("Merge internal void functions into one dispatcher."),
+            cl::ZeroOrMore);
 
 // ---- 新功能域 --------------------------------------------------------------
 // BCF：不带值 = 默认强度 70，带值 = 0..100。
@@ -280,6 +287,8 @@ struct ObfuscationPassManager : public ModulePass {
       Opt->vmpOpt()->setEnable(EnableVmp);
     if (isSet(LevelVmp))
       Opt->vmpOpt()->setLevel(LevelVmp);
+    if (isSet(EnableMerge))
+      Opt->mergeOpt()->setEnable(EnableMerge);
 
     // bcf / decoy：带值开关。裸开关只启用，参数沿用 config / 默认值；
     // 只有真的写了值才覆盖——否则 `-irobf-bcf` 会把 config 的 90 重置成 70。
@@ -365,7 +374,8 @@ struct ObfuscationPassManager : public ModulePass {
       // VMP 必须最后跑：它把整个函数体换成字节码，之后再插入块或改边都
       // 只会破坏已经生成的解释器入口。
       const bool WantVmp = Options->mayBeEnabled(Options->vmpOpt(), M);
-      if (!WantShuffle && !WantSplit && !WantIndBr && !WantVmp)
+      const bool WantMerge = Options->mayBeEnabled(Options->mergeOpt(), M);
+      if (!WantShuffle && !WantSplit && !WantIndBr && !WantVmp && !WantMerge)
         return false;
       if (!Options->randomSeed().empty())
         cryptoutils->prng_seed(std::string(Options->randomSeed()));
@@ -378,6 +388,10 @@ struct ObfuscationPassManager : public ModulePass {
         add(llvm::createIndirectBranchPass(Options.get(), /*Dual=*/WantDual));
       if (WantShuffle)
         add(llvm::createShuffleBlocksPass(Options.get()));
+      // 合并必须在 VMP 之前：VMP 会把整个函数体换成字节码，之后再合并
+      // 只是把解释器挪个位置，函数边界并没有消失。
+      if (WantMerge)
+        add(llvm::createMergeFunctionPass(Options.get()));
       if (WantVmp)
         add(llvm::createVirtualizePass(Options.get()));
       return run(M);

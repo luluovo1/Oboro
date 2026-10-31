@@ -42,6 +42,7 @@ All obfuscation flags are passed to the compiler via `-mllvm -<flag>`.
 | `-irobf-bcf` | `[=0..100]` | off | Bogus control flow v2. No value = keep the config `strength` (default 70); `=0` turns it off and skips the pass |
 | `-irobf-decoy` | `[=0..100]` | off | Runtime decoy paths (independent of BCF). No value = keep the config `ratio` (default: 30% of sites become decoy diamonds, the rest pure poison); `=0` turns it off |
 | `-irobf-aux` | `[=wrap,shuffle,split]` | off | Structural passes. No value = keep the config sub-switches (default: `wrap` only); `shuffle` and `split` are **experimental** and must be named explicitly (see boundaries below) |
+| `-irobf-merge` | bool | off | Merge internal `void` functions into one `switch` dispatcher; the originals are erased and call sites become `merged(id, ...)` |
 
 ### Per-feature sub-config (config only)
 
@@ -83,6 +84,48 @@ Global fields: `seed` / `randomSeed`, `ptrauth`, `deny`, `patterns`.
 Hidden testing switches (never for production): `-irobf-bcf_pred`, `-irobf-bcf_topo`, `-irobf-force-decoy`, `-irobf-force-real`, `-irobf-debug-names`.
 
 ---
+
+## Build Integration
+
+### Multiple translation units
+
+Compiling each `.c`/`.cpp` separately and linking afterwards is supported. The
+decoy probe is merged through COMDAT, so multi-TU links no longer hit LNK1227.
+
+### LTO
+
+`-flto` works, with three constraints:
+
+1. The linker must be the same LLVM version. NDK's bundled `ld.lld` (LLVM 17)
+   cannot read this toolchain's (LLVM 21) bitcode; pass
+   `--ld-path=<llvm-21>/ld.lld`.
+2. **Weaker obfuscation than non-LTO**: the LTO backend re-optimises and folds
+   back part of the indirection and wrapping. Measured on zlib (relative to the
+   clean baseline): 7.1x without LTO, 3.7x with LTO.
+3. `-mllvm -irobf-*` must appear on both the compile and the link command line
+   (the clang driver forwards them to lld).
+
+### Custom dynamic linker (packers / in-house loaders)
+
+If the app maps `.so` files with its own loader instead of the system linker,
+three requirements must be met, otherwise obfuscated output crashes during
+initialisation or reads wrong pointers:
+
+1. **`R_AARCH64_ABS64` must be computed as `S + A`** (symbol address plus
+   addend). The constant-encryption tables store "symbol address + encrypted
+   addend"; treating ABS64 like RELATIVE (`base + addend`) yields a bogus
+   pointer.
+2. **RELRO may only become read-only after `init_array` returns.** The
+   indbr/indgv page tables live in `.data.rel.ro` and are written by an init
+   entry; mprotecting early SIGSEGVs during initialisation.
+3. **Support `ANDROID_RELR` (APS2) packed relocations**, or build with
+   `-Wl,--pack-dyn-relocs=none` to emit plain `RELA`. Android uses RELR by
+   default; a loader that ignores it never relocates `init_array` and calls
+   jump to a file offset.
+
+Two further requirements are standard: `init_array` must run (page and
+constant tables are initialised there), and dependencies must be loaded with
+`RTLD_GLOBAL` first so `GLOB_DAT` / `JUMP_SLOT` can resolve.
 
 ## Supported Flags in Detail
 
@@ -283,6 +326,38 @@ Integer constants are protected with runtime decryption.
 -mllvm -irobf-cfe
 ```
 Floating-point constants are encrypted.
+
+#### Function Merging (MERGE)
+```bash
+-mllvm -irobf-merge
+```
+
+Merges internal `void` functions of a module into one `switch` dispatcher: each
+member becomes a case, call sites are rewritten to `merged(id, args...)`, and the
+original function is **erased**. The function list and the cross-reference graph
+of a decompiler no longer contain them; hooking one of them with Frida requires
+hooking the dispatcher and filtering by id.
+
+A function is skipped unless all of the following hold (a missed reference would
+be a dangling call at runtime):
+
+- `internal` / `private` linkage, returns `void`, not varargs, not `main`,
+  not `naked` / `alwaysinline`
+- **every use is a direct `call`**: users are walked one by one, so `invoke`,
+  `callbr`, address-taking and constant expressions all disqualify it
+- no `sret` / `byval` / `inalloca` / `preallocated` / `swiftself` / `swifterror`
+  / `nest`
+- no self recursion and no `musttail` call
+- at most 24 arguments; at most 32 functions and 64 arguments per group
+
+Arguments are passed as `i64` (pointers via `ptrtoint`, floats via `bitcast`,
+narrow integers via `zext`) and converted back inside the dispatcher. The
+`default` edge of the dispatcher is `llvm.trap`, so an out-of-range id crashes
+instead of returning an uninitialised value.
+
+Cost: IR size +1% (zlib), +0% (lz4), +2% (regex); runtime +1% on a fixed
+workload. With VMP enabled, MERGE runs first and the merged function is then
+virtualised as a whole.
 
 ---
 

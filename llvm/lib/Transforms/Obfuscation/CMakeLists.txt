@@ -17,6 +17,7 @@ add_llvm_library(LLVMObfuscation
   ConstantFPEncryption.cpp
   MicrosoftRTTIEraser.cpp
   AuxPasses.cpp
+  MergeFunction.cpp
   Virtualize.cpp
   VirtualizePass.cpp
   

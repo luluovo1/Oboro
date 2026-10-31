@@ -42,6 +42,7 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 | `-irobf-bcf` | `[=0..100]` | 关闭 | 虚假控制流 v2。不带值 = 沿用 config 的 `strength`（默认 70）；`=0` 表示关闭，不挂 pass |
 | `-irobf-decoy` | `[=0..100]` | 关闭 | 运行时诱饵路径（独立功能，不依赖 BCF）。不带值 = 沿用 config 的 `ratio`（默认 30% 的站点走诱饵菱形，其余为纯 poison）；`=0` 表示关闭 |
 | `-irobf-aux` | `[=wrap,shuffle,split]` | 关闭 | 结构性后处理。不带值 = 沿用 config 的子项（默认只开 `wrap`）；`shuffle` / `split` 为**实验性**，必须显式列出（见下文边界） |
+| `-irobf-merge` | bool | 关闭 | 函数合并。把若干 `internal` / `private` 的 `void` 函数合成一个 `switch` 分派函数，原函数从模块中删除，调用点改写成 `merged(id, ...)` |
 
 ### 各功能的子配置（只走 config）
 
@@ -83,6 +84,32 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 隐藏的测试开关（不要用于生产）：`-irobf-bcf_pred`、`-irobf-bcf_topo`、`-irobf-force-decoy`、`-irobf-force-real`、`-irobf-debug-names`。
 
 ---
+
+## 构建集成
+
+### 多文件编译
+
+每个 `.c`/`.cpp` 独立编译再链接是受支持的（decoy 的 probe 用 COMDAT 合并，不会出现 LNK1227 冲突）。
+
+### LTO
+
+`-flto` 可用，但有三点约束：
+
+1. 链接器必须是同一版本的 LLVM。NDK 自带的 `ld.lld`（LLVM 17）读不了本工具链（LLVM 21）的 bitcode，需要 `--ld-path=<llvm-21>/ld.lld`。
+2. **混淆强度低于非 LTO**：LTO 后端会重新优化，部分间接化与包装被合并或折回。实测 zlib（相对无混淆基线）：非 LTO 7.1×，LTO 3.7×。
+3. `-mllvm -irobf-*` 必须同时出现在编译和链接命令行（clang 驱动会转发给 lld）。
+
+### 注意
+
+### 自定义动态 linker（加固壳 / 自研 loader）
+
+如果 App 用自己的 loader 映射 `.so`（不经过系统 linker），必须满足下面三条，否则混淆产物会在初始化阶段崩或读到错误指针：
+
+1. **`R_AARCH64_ABS64` 必须按 `S + A` 计算**（符号地址 + addend）。常量加密表用「符号地址 + 加密 addend」的形式，把它当 RELATIVE（`base + addend`）处理会得到错误指针。
+2. **RELRO 只能在 `init_array` 执行完之后设为只读**。indbr/indgv 的页表放在 `.data.rel.ro`，由 init entry 写入；提前 mprotect 成只读会在初始化时 SIGSEGV。
+3. **支持 `ANDROID_RELR`（APS2）打包重定位**，或构建时加 `-Wl,--pack-dyn-relocs=none` 生成普通 `RELA`。Android 默认用 RELR，不支持的 loader 不会重定位 `init_array`，调用会直接跳到文件偏移。
+
+另外两个常规要求：`init_array` 必须执行（页表与常量表的初始化在里面），依赖库要先以 `RTLD_GLOBAL` 加载，否则 `GLOB_DAT` / `JUMP_SLOT` 无法解析。
 
 ## 当前支持的混淆参数
 
@@ -271,6 +298,30 @@ L3 站点。
 -mllvm -irobf-cfe
 ```
 对浮点类型的常量进行加密。
+
+#### 函数合并 (MERGE)
+```bash
+-mllvm -irobf-merge
+```
+
+把同一模块里的内部 `void` 函数合并成一个 `switch` 分派的大函数：每个成员变成一个
+`case`，调用点改写成 `merged(id, 参数...)`，原函数从模块里**删除**。反编译器的
+函数列表和交叉引用图里不再出现这些函数，Frida 也只能 hook 到分派函数再按 id 过滤。
+
+合并条件（任何一条不满足就跳过 —— 宁可少合并，也不留悬垂调用）：
+
+- `internal` / `private` 链接、返回 `void`、非 vararg、非 `main`、非 `naked` / `alwaysinline`
+- **所有使用点都是直接 `call`**：逐个 user 检查，`invoke`、`callbr`、取地址、常量表达式一律跳过
+- 没有 `sret` / `byval` / `inalloca` / `preallocated` / `swiftself` / `swifterror` / `nest`
+- 没有自递归、没有 `musttail` 调用
+- 参数个数 ≤ 24；每组 ≤ 32 个函数、≤ 64 个参数
+
+参数统一按 `i64` 传递（指针 `ptrtoint`、浮点 `bitcast`、窄整数 `zext`），合并函数
+内部再转回原类型。分派函数的 `default` 是 `llvm.trap`，任何越界 id 直接崩，而不是
+带着未初始化的返回值继续跑。
+
+开销：zlib 的 IR +1%、lz4 +0%、regex +2%；固定工作负载的运行时开销 +1%。
+与 VMP 同时开启时 MERGE 先跑，合并后的大函数再整体虚拟化。
 
 ---
 
