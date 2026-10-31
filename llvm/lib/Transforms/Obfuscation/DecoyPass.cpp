@@ -114,14 +114,22 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
     return nullptr;
   }
   auto EmitDefaultProbeBody = [&](Function *F) {
-    F->setLinkage(GlobalValue::WeakAnyLinkage);
+    // COFF 的 WeakAny 会生成 `.weak.<sym>.default.<module-id>` 别名，每个
+    // 目标文件的 module-id 不同，多 TU 链接直接 LNK1227。linkonce_odr +
+    // 固定 comdat 名走 COMDAT 合并，App 的强定义仍然覆盖它。
+    F->setLinkage(GlobalValue::LinkOnceODRLinkage);
+    F->setComdat(M.getOrInsertComdat(ProbeName));
     F->setVisibility(GlobalValue::HiddenVisibility);
     F->addFnAttr(Attribute::NoInline);
     F->addFnAttr(Attribute::OptimizeNone);
     obf::markRuntimeFunction(M, *F);
     BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
     IRBuilder<> B(BB);
-    const std::string DefaultEnvName = obf::stableName(M, "oboro.default_env");
+    // 这个全局必须跨 TU 同名：COFF 的 weak 别名形如
+    // `.weak.__oboro_probe.default.<目标符号>`，每个目标文件的目标符号名
+    // 不同（stableName 是模块内随机），链接器就会报 LNK1227 冲突。
+    // 它只有 private 链接，多 TU 各有一份副本，不会被导出；strip 后消失。
+    const std::string DefaultEnvName = "oboro_probe_env";
     GlobalVariable *DefaultEnv = M.getNamedGlobal(DefaultEnvName);
     if (!DefaultEnv) {
       DefaultEnv = new GlobalVariable(

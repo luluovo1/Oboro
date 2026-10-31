@@ -13,4 +13,4 @@ entry:
 ; CHECK-DAG: define {{.*}}@f
 ; CHECK-DAG: bcf.env
 ; CHECK-DAG: @oboro.getenv
-; CHECK-DAG: define weak hidden i32 @__oboro_probe
+; CHECK-DAG: define linkonce_odr hidden i32 @__oboro_probe
