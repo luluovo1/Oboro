@@ -142,8 +142,14 @@ static bool auxHas(StringRef List, StringRef Name) {
 }
 
 // 带值开关是否出现（出现即启用，空值表示用默认参数）。
+//
+// lld 的 COFF driver 在解析完 `/mllvm:` 参数后会调用
+// `cl::ResetAllOptionOccurrences()`（lld/COFF/Driver.cpp），把所有选项的
+// occurrence 计数清零，但解析出来的值保留。于是 LTO 后端里
+// `getNumOccurrences() > 0` 恒为 false，`-irobf-*` 全部被当成没传。
+// 这里同时比较值：非 LTO 路径行为不变（occurrence 优先），LTO 路径靠值识别。
 template <typename T> static bool isSet(const cl::opt<T> &O) {
-  return O.getNumOccurrences() > 0;
+  return O.getNumOccurrences() > 0 || O.getValue() != T{};
 }
 
 // 解析 0..100 的强度；空串用 Default。

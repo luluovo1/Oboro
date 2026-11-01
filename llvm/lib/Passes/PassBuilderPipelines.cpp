@@ -2198,6 +2198,13 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
 
   invokeFullLinkTimeOptimizationLastEPCallbacks(MPM, Level);
 
+  // Oboro late obfuscation.  The ThinLTO post-link pipeline calls this hook,
+  // but the full-LTO pipeline never did, so `-flto` silently dropped every
+  // OptimizerLast pass (merge, VMP, aux, indbr): they were added to a pipeline
+  // that does not exist on this path.
+  invokeOptimizerLastEPCallbacks(MPM, Level,
+                                 ThinOrFullLTOPhase::FullLTOPostLink);
+
   // Emit annotation remarks.
   addAnnotationRemarksPass(MPM);
 

@@ -93,11 +93,15 @@ clang -O2 -mllvm irobf-bcf file.c -o file
 
 ### LTO
 
-`-flto` 可用，但有三点约束：
+`-flto` 可用，但有四点约束：
 
 1. 链接器必须是同一版本的 LLVM。NDK 自带的 `ld.lld`（LLVM 17）读不了本工具链（LLVM 21）的 bitcode，需要 `--ld-path=<llvm-21>/ld.lld`。
-2. **混淆强度低于非 LTO**：LTO 后端会重新优化，部分间接化与包装被合并或折回。实测 zlib（相对无混淆基线）：非 LTO 7.1×，LTO 3.7×。
-3. `-mllvm -irobf-*` 必须同时出现在编译和链接命令行（clang 驱动会转发给 lld）。
+2. **混淆强度低于非 LTO**：LTO 后端会重新优化，部分间接化与包装被合并或折回。实测 zlib（相对无混淆基线）：非 LTO 7.1×，LTO 3.7×（该数据是修复前测的；Late pass 现在能在 LTO 下运行，差距会缩小）。
+3. **混淆选项要用 `/mllvm:` 形式传给链接器**：clang 驱动只把 `-mllvm` 交给 cc1，而 LTO 的优化在 lld 里跑，所以要写
+   `-Wl,/mllvm:-irobf-merge`。逗号分隔的 `-Wl,-mllvm,-irobf-merge` 不被 lld-link 接受（会报 `ignoring unknown argument '-mllvm'`）。
+4. **两类 pass 在 LTO 下表现不同**：`PipelineStart` 阶段的 pass（BCF / CSE / FLA / INDBR）在 cc1 就改完 IR，
+   但 LTO 后端的重新优化会折回一部分；`OptimizerLast` 阶段的 pass（merge / VMP / aux）跑在 LTO 的 postlink 管线末尾，
+   产物完整保留。
 
 ### 注意
 

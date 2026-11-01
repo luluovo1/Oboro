@@ -94,16 +94,24 @@ decoy probe is merged through COMDAT, so multi-TU links no longer hit LNK1227.
 
 ### LTO
 
-`-flto` works, with three constraints:
+`-flto` works, with four constraints:
 
 1. The linker must be the same LLVM version. NDK's bundled `ld.lld` (LLVM 17)
    cannot read this toolchain's (LLVM 21) bitcode; pass
    `--ld-path=<llvm-21>/ld.lld`.
 2. **Weaker obfuscation than non-LTO**: the LTO backend re-optimises and folds
    back part of the indirection and wrapping. Measured on zlib (relative to the
-   clean baseline): 7.1x without LTO, 3.7x with LTO.
-3. `-mllvm -irobf-*` must appear on both the compile and the link command line
-   (the clang driver forwards them to lld).
+   clean baseline): 7.1x without LTO, 3.7x with LTO.  That figure predates
+   the full-LTO fix below; late passes now survive, so the gap is smaller.
+3. **Pass obfuscation options to the linker with the `/mllvm:` form**: the
+   clang driver only hands `-mllvm` to cc1, while LTO optimises inside lld, so
+   write `-Wl,/mllvm:-irobf-merge`.  The comma-separated
+   `-Wl,-mllvm,-irobf-merge` form is rejected by lld-link (`ignoring unknown
+   argument '-mllvm'`).
+4. **Two groups of passes behave differently under LTO**: `PipelineStart`
+   passes (BCF / CSE / FLA / INDBR) rewrite the IR in cc1, but the LTO backend's
+   re-optimisation folds part of it back; `OptimizerLast` passes (merge / VMP /
+   aux) run at the end of the LTO post-link pipeline and survive intact.
 
 ### Custom dynamic linker (packers / in-house loaders)
 
