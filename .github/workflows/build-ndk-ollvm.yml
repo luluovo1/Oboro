@@ -1,10 +1,19 @@
-name: Build OLLVM Toolchain (Multi-Platform)
+name: Build Oboro Toolchain
 
 on:
-  # 手动触发：在 GitHub Actions 页面点击 "Run workflow" 触发
-  # push 自动触发已禁用，需要手动在 GitHub 上触发
+  # Push a tag like oboro-v1.0.0-llvm21 to build and publish a release.
+  push:
+    tags:
+      - 'oboro-v*'
+  # Manual run: builds and uploads the artifact, no release.
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+env:
+  DIST: Oboro-LLVM21-NDK-r30-Windows-x64-MSVC
+  CLANG_VER: 21
 
 jobs:
   build-windows:
@@ -24,89 +33,111 @@ jobs:
           cmake -S llvm -B build -G Ninja `
                 -DCMAKE_BUILD_TYPE=Release `
                 -DLLVM_ENABLE_PROJECTS="clang;lld" `
-                -DLLVM_TARGETS_TO_BUILD="X86;ARM;AArch64;RISCV" `
+                -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM" `
+                -DLLVM_INCLUDE_TESTS=OFF `
+                -DLLVM_INCLUDE_EXAMPLES=OFF `
+                -DLLVM_INCLUDE_BENCHMARKS=OFF `
                 -DCMAKE_C_COMPILER=cl `
                 -DCMAKE_CXX_COMPILER=cl
 
       - name: Build
-        run: ninja -C build clang lld llvm-ar llvm-strip llvm-nm llvm-objdump llvm-readelf llvm-objcopy llvm-ranlib
+        run: |
+          ninja -C build clang lld llvm-ar llvm-strip llvm-nm llvm-objdump `
+                        llvm-readelf llvm-objcopy llvm-ranlib
 
       - name: Package
+        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path OLLVM_Dist\bin -Force
+          # The toolchain needs the builtin headers (stddef.h, stdint.h,
+          # arm_neon.h ...) as well as the binaries.  Shipping bin/ alone makes
+          # every compile fail with "'stddef.h' file not found".
+          New-Item -ItemType Directory -Path "$env:DIST\bin" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$env:DIST\lib\clang\$env:CLANG_VER\include" -Force | Out-Null
+
           $tools = @("clang.exe","clang++.exe","lld.exe","ld.lld.exe","llvm-ar.exe",
                      "llvm-strip.exe","llvm-nm.exe","llvm-objdump.exe","llvm-readelf.exe",
                      "llvm-objcopy.exe","llvm-ranlib.exe","clang-cl.exe","clang-cpp.exe")
           foreach ($t in $tools) {
-            if (Test-Path "build\bin\$t") { Copy-Item "build\bin\$t" "OLLVM_Dist\bin\" }
+            if (Test-Path "build\bin\$t") {
+              Copy-Item "build\bin\$t" "$env:DIST\bin\"
+            } else {
+              Write-Error "missing build\bin\$t"
+            }
           }
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: OLLVM-Windows-x64
-          path: OLLVM_Dist/
+          Copy-Item "build\lib\clang\$env:CLANG_VER\include\*" `
+                    "$env:DIST\lib\clang\$env:CLANG_VER\include\" -Recurse
 
-  build-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+          Compress-Archive -Path $env:DIST -DestinationPath "$env:DIST.zip" -Force
+          Get-ChildItem "$env:DIST.zip" | Select-Object Name, Length
 
-      - name: Install Dependencies
-        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake build-essential
-
-      - name: Configure CMake
+      - name: Smoke test
+        shell: pwsh
         run: |
-          cmake -S llvm -B build -G Ninja \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DLLVM_ENABLE_PROJECTS="clang;lld" \
-                -DLLVM_TARGETS_TO_BUILD="X86;ARM;AArch64;RISCV"
-
-      - name: Build
-        run: ninja -C build clang lld llvm-ar llvm-strip llvm-nm llvm-objdump llvm-readelf llvm-objcopy llvm-ranlib
-
-      - name: Package
-        run: |
-          mkdir -p OLLVM_Dist/bin
-          for tool in clang clang++ lld ld.lld llvm-ar llvm-strip llvm-nm llvm-objdump llvm-readelf llvm-objcopy llvm-ranlib; do
-            [ -f "build/bin/$tool" ] && cp "build/bin/$tool" OLLVM_Dist/bin/
-          done
+          # Compile with the packaged toolchain so a missing header or DLL
+          # shows up here instead of in a user's build.
+          $env:PATH = "$PWD\$env:DIST\bin;$env:PATH"
+          @'
+          #include <stdint.h>
+          #include <stdio.h>
+          int main(void) { printf("%d\n", (int)sizeof(uint64_t)); return 0; }
+          '@ | Set-Content -Encoding ascii smoke.c
+          & "$env:DIST\bin\clang.exe" -O2 -mllvm -irobf-merge smoke.c -o smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "smoke compile failed" }
+          & .\smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "smoke run failed" }
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OLLVM-Linux-x64
-          path: OLLVM_Dist/
+          name: ${{ env.DIST }}
+          path: ${{ env.DIST }}.zip
 
-  build-macos:
-    runs-on: macos-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Install Dependencies
-        run: brew install ninja cmake
-
-      - name: Configure CMake
-        run: |
-          cmake -S llvm -B build -G Ninja \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DLLVM_ENABLE_PROJECTS="clang;lld" \
-                -DLLVM_TARGETS_TO_BUILD="X86;ARM;AArch64;RISCV"
-
-      - name: Build
-        run: ninja -C build clang lld llvm-ar llvm-strip llvm-nm llvm-objdump llvm-readelf llvm-objcopy llvm-ranlib
-
-      - name: Package
-        run: |
-          mkdir -p OLLVM_Dist/bin
-          for tool in clang clang++ lld ld.lld llvm-ar llvm-strip llvm-nm llvm-objdump llvm-readelf llvm-objcopy llvm-ranlib; do
-            [ -f "build/bin/$tool" ] && cp "build/bin/$tool" OLLVM_Dist/bin/
-          done
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
         with:
-          name: OLLVM-macOS
-          path: OLLVM_Dist/
+          files: ${{ env.DIST }}.zip
+          name: Oboro v1.0.0 (LLVM 21 / Android NDK r30)
+          body: |
+            Windows x64 host toolchain, built with MSVC.
+
+            - Baseline: Android NDK r30 (30.0.14904198), LLVM 21.0.0git
+            - Backends: X86, AArch64, ARM
+            - Targets: `aarch64-linux-android21..34`, `armv7a-linux-androideabi21..34`,
+              `x86_64-linux-android21..34`, plus `x86_64-pc-windows-msvc`
+
+            ## Contents
+
+            ```
+            bin/                     clang, clang++, lld, ld.lld, llvm-ar, llvm-strip,
+                                     llvm-nm, llvm-objdump, llvm-readelf, llvm-objcopy,
+                                     llvm-ranlib, clang-cl, clang-cpp
+            lib/clang/21/include/    builtin headers
+            ```
+
+            ## Obfuscation passes
+
+            `-irobf-vmp`, `-irobf-merge`, `-irobf-bcf`, `-irobf-decoy`, `-irobf-fla`,
+            `-irobf-indbr`, `-irobf-icall`, `-irobf-indgv`, `-irobf-cse`, `-irobf-cie`,
+            `-irobf-cfe`, `-irobf-rtti`, `-irobf-aux`
+
+            ## Usage
+
+            ```bash
+            clang --target=aarch64-linux-android28 \
+                  --sysroot=$NDK/toolchains/llvm/prebuilt/windows-x86_64/sysroot \
+                  -O2 -mllvm -irobf-vmp -mllvm -level-vmp=2 \
+                  -shared -fPIC foo.c -o libfoo.so
+            ```
+
+            LTO builds must pass the options to the linker:
+            `-Wl,/mllvm:-irobf-merge`.
+
+            ## Known limitations
+
+            - Under LTO, PipelineStart passes (BCF/CSE/FLA/INDBR) are partially
+              folded back by the LTO backend; OptimizerLast passes (merge/VMP/aux)
+              survive intact.
+            - INDBR and VMP are mutually exclusive on the same function (VMP skips
+              functions containing `blockaddress`).
