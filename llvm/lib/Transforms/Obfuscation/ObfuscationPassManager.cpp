@@ -234,7 +234,9 @@ struct ObfuscationPassManager : public ModulePass {
   }
 
   bool runModulePass(Module &M, ModulePass *P) {
-    return P->doInitialization(M) || P->runOnModule(M);
+    bool InitChanged = P->doInitialization(M);
+    bool RunChanged = P->runOnModule(M);
+    return InitChanged || RunChanged;
   }
 
   static std::shared_ptr<ObfuscationOptions> getOptions() {
@@ -368,7 +370,8 @@ struct ObfuscationPassManager : public ModulePass {
     if (Late) {
       // 这些 pass 必须看到最终 IR：在 PipelineStart 跑会被优化器折回。
       const bool WantShuffle =
-          Options->auxOpt()->isEnabled() && Options->auxOpt()->shuffle();
+          Options->mayBeEnabled(Options->auxOpt(), M) &&
+          Options->auxOpt()->shuffle();
       const bool WantSplit = Options->auxOpt()->isEnabled() &&
                              Options->auxOpt()->splitCount() > 0;
       // INDBR 的三种模式都必须在这里跑：在 PipelineStart 跑，O1+ 的
@@ -414,6 +417,21 @@ struct ObfuscationPassManager : public ModulePass {
       EnableIRObfuscation = true;
     }
 
+    // Annotation/pattern-only enablement must reach the Early pipeline too.
+    // Only the Early pass set is considered here; VMP/Merge/INDBR run Late.
+    if (!EnableIRObfuscation &&
+        (Options->mayBeEnabled(Options->cieOpt(), M) ||
+         Options->mayBeEnabled(Options->cfeOpt(), M) ||
+         Options->mayBeEnabled(Options->cseOpt(), M) ||
+         Options->mayBeEnabled(Options->indGvOpt(), M) ||
+         Options->mayBeEnabled(Options->auxOpt(), M) ||
+         Options->mayBeEnabled(Options->iCallOpt(), M) ||
+         Options->mayBeEnabled(Options->flaOpt(), M) ||
+         Options->mayBeEnabled(Options->bcfOpt(), M) ||
+         Options->mayBeEnabled(Options->decoyOpt(), M) ||
+         Options->mayBeEnabled(Options->rttiOpt(), M)))
+      EnableIRObfuscation = true;
+
     if (!EnableIRObfuscation) {
       return false;
     }
@@ -456,7 +474,8 @@ struct ObfuscationPassManager : public ModulePass {
     add(llvm::createIndirectGlobalVariablePass(Options.get()));
 
     // aux.wrap 必须在 ICALL 之前：调用一旦被间接化，包装器就没有意义了。
-    if (Options->auxOpt()->isEnabled() && Options->auxOpt()->wrap() > 0)
+    if (Options->mayBeEnabled(Options->auxOpt(), M) &&
+        Options->auxOpt()->wrap() > 0)
       add(llvm::createFunctionWrapperPass(Options.get(),
                                           Options->auxOpt()->wrap()));
 

@@ -9,6 +9,7 @@
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/CryptoUtils.h"
 #include <map>
@@ -87,7 +88,7 @@ struct StringEncryption : public ModulePass {
   bool runOnModule(Module &M) override;
   static void collectConstantStringUser(GlobalVariable *CString, std::set<GlobalVariable *> &Users);
   static bool isValidToEncrypt(GlobalVariable *GV);
-  bool processConstantStringUse(Function *F);
+  bool processConstantStringUse(Function *F, bool Force = false);
   void deleteUnusedGlobalVariable();
   static Function *buildDecryptFunction(Module *M, const CSPEntry *Entry);
   Function *buildSharedDecryptFunction(Module *M, bool IsUTF16);
@@ -131,6 +132,10 @@ bool StringEncryption::runOnModule(Module &M) {
       continue;
     }
     if (isRTTINameString(GV))
+      continue;
+    // Custom sections (.modinfo, ObjC metadata, ...) have semantics the
+    // replacement .bss buffer cannot preserve.
+    if (GV.hasSection())
       continue;
     Constant *Init = GV.getInitializer();
     if (Init == nullptr)
@@ -292,7 +297,7 @@ bool StringEncryption::runOnModule(Module &M) {
   }
 
   Constant *CDA = ConstantDataArray::get(M.getContext(), ArrayRef<uint8_t>(Data));
-  EncryptedStringTable = new GlobalVariable(M, CDA->getType(), false, GlobalValue::PrivateLinkage,
+  EncryptedStringTable = new GlobalVariable(M, CDA->getType(), true, GlobalValue::PrivateLinkage,
                                             CDA, obf::freshName(M, "EncryptedStringTable"));
 
   // decrypt string back at every use, change the plain string use to the decrypted one
@@ -305,7 +310,7 @@ bool StringEncryption::runOnModule(Module &M) {
 
   for (auto &I : CSUserMap) {
     CSUser *User = I.second;
-    Changed |= processConstantStringUse(User->InitFunc);
+    Changed |= processConstantStringUse(User->InitFunc, /*Force=*/true);
   }
 
   // delete unused global variables.  In shared mode DecFunc points at the
@@ -331,7 +336,7 @@ void StringEncryption::getRandomBytes(std::vector<T> &Bytes, uint32_t MinSize, u
   if (MinSize == MaxSize) {
     Len = MinSize;
   } else {
-    Len = MinSize + (N % (MaxSize - MinSize));
+    Len = MinSize + (N % (MaxSize - MinSize + 1));
   }
 
   char *Buffer = new char[Len * sizeof(T)];
@@ -391,6 +396,9 @@ static void buildDecryptBody(Function *DecFunc, Value *PlainString, Value *Data,
   IRBuilder<> IRB(Ctx);
 
   BasicBlock *Enter = BasicBlock::Create(Ctx, "Enter", DecFunc);
+  BasicBlock *TryClaim = BasicBlock::Create(Ctx, "TryClaim", DecFunc);
+  BasicBlock *DoClaim = BasicBlock::Create(Ctx, "DoClaim", DecFunc);
+  BasicBlock *Spin = BasicBlock::Create(Ctx, "Spin", DecFunc);
   BasicBlock *LoopBody = BasicBlock::Create(Ctx, "LoopBody", DecFunc);
   BasicBlock *LoopBr0 = BasicBlock::Create(Ctx, "LoopBr0", DecFunc);
   BasicBlock *LoopBr1 = BasicBlock::Create(Ctx, "LoopBr1", DecFunc);
@@ -407,17 +415,38 @@ static void buildDecryptBody(Function *DecFunc, Value *PlainString, Value *Data,
     KeySizeInBytes = IRB.CreateMul(KeyElemSize, IRB.getInt32(2));
 
   Value *EncPtr = IRB.CreateInBoundsGEP(IRB.getInt8Ty(), Data, KeySizeInBytes);
-  Value *DecStatus = IRB.CreateLoad(IRB.getInt32Ty(), StatusPtr);
-  Value *IsDecrypted = IRB.CreateICmpEQ(DecStatus, IRB.getInt32(1));
-  IRB.CreateCondBr(IsDecrypted, Exit, LoopBody);
+  // DecStatus: 0 = uninitialized, 1 = decrypting, 2 = ready.  The status is
+  // shared by every caller, so both the state transitions and the data reads
+  // must be ordered.
+  LoadInst *Status0 = IRB.CreateLoad(IRB.getInt32Ty(), StatusPtr);
+  Status0->setAtomic(AtomicOrdering::Acquire);
+  Value *IsReady = IRB.CreateICmpEQ(Status0, IRB.getInt32(2));
+  IRB.CreateCondBr(IsReady, Exit, TryClaim);
+
+  IRB.SetInsertPoint(TryClaim);
+  Value *IsBusy = IRB.CreateICmpEQ(Status0, IRB.getInt32(1));
+  IRB.CreateCondBr(IsBusy, Spin, DoClaim);
+
+  IRB.SetInsertPoint(DoClaim);
+  Value *Cmp = IRB.CreateAtomicCmpXchg(
+      StatusPtr, IRB.getInt32(0), IRB.getInt32(1), MaybeAlign(4),
+      AtomicOrdering::AcquireRelease, AtomicOrdering::Acquire);
+  Value *Claimed = IRB.CreateExtractValue(Cmp, 1);
+  IRB.CreateCondBr(Claimed, LoopBody, Spin);
+
+  IRB.SetInsertPoint(Spin);
+  LoadInst *Status1 = IRB.CreateLoad(IRB.getInt32Ty(), StatusPtr);
+  Status1->setAtomic(AtomicOrdering::Acquire);
+  Value *Ready1 = IRB.CreateICmpEQ(Status1, IRB.getInt32(2));
+  IRB.CreateCondBr(Ready1, Exit, Spin);
 
   IRB.SetInsertPoint(LoopBody);
   PHINode *LoopCounter = IRB.CreatePHI(IRB.getInt32Ty(), 2);
-  LoopCounter->addIncoming(IRB.getInt32(0), Enter);
+  LoopCounter->addIncoming(IRB.getInt32(0), DoClaim);
 
   PHINode *LastDecrypted = IRB.CreatePHI(PlainEltTy, 2);
   // incoming last decrypted initial is 0
-  LastDecrypted->addIncoming(Constant::getNullValue(PlainEltTy), Enter);
+  LastDecrypted->addIncoming(Constant::getNullValue(PlainEltTy), DoClaim);
 
   // Compute KeyIdx = LoopCounter % KeyElemSize
   Value *KeyIdx = IRB.CreateURem(LoopCounter, KeyElemSize);
@@ -495,11 +524,12 @@ static void buildDecryptBody(Function *DecFunc, Value *PlainString, Value *Data,
   Value *NewCounter = IRB.CreateAdd(LoopCounter, IRB.getInt32(1), "", true, true);
   LoopCounter->addIncoming(NewCounter, LoopEnd);
 
-  Value *Cond = IRB.CreateICmpEQ(NewCounter, DataSize);
+  Value *Cond = IRB.CreateICmpUGE(NewCounter, DataSize);
   IRB.CreateCondBr(Cond, UpdateDecStatus, LoopBody);
 
   IRB.SetInsertPoint(UpdateDecStatus);
-  IRB.CreateStore(IRB.getInt32(1), StatusPtr);
+  StoreInst *Done = IRB.CreateStore(IRB.getInt32(2), StatusPtr);
+  Done->setAtomic(AtomicOrdering::Release);
   IRB.CreateBr(Exit);
 
   IRB.SetInsertPoint(Exit);
@@ -635,19 +665,42 @@ Function *StringEncryption::buildInitFunction(Module *M, const StringEncryption:
 
   // convert constant initializer into a series of instructions
   BasicBlock *Enter = BasicBlock::Create(Ctx, "Enter", InitFunc);
+  BasicBlock *TryClaim = BasicBlock::Create(Ctx, "TryClaim", InitFunc);
+  BasicBlock *DoClaim = BasicBlock::Create(Ctx, "DoClaim", InitFunc);
+  BasicBlock *Spin = BasicBlock::Create(Ctx, "Spin", InitFunc);
   BasicBlock *InitBlock = BasicBlock::Create(Ctx, "InitBlock", InitFunc);
   BasicBlock *Exit = BasicBlock::Create(Ctx, "Exit", InitFunc);
 
   IRB.SetInsertPoint(Enter);
-  Value *DecStatus = IRB.CreateLoad(
+  LoadInst *Status0 = IRB.CreateLoad(
       User->DecStatus->getValueType(), User->DecStatus);
-  Value *IsDecrypted = IRB.CreateICmpEQ(DecStatus, IRB.getInt32(1));
-  IRB.CreateCondBr(IsDecrypted, Exit, InitBlock);
+  Status0->setAtomic(AtomicOrdering::Acquire);
+  Value *IsReady = IRB.CreateICmpEQ(Status0, IRB.getInt32(2));
+  IRB.CreateCondBr(IsReady, Exit, TryClaim);
+
+  IRB.SetInsertPoint(TryClaim);
+  Value *IsBusy = IRB.CreateICmpEQ(Status0, IRB.getInt32(1));
+  IRB.CreateCondBr(IsBusy, Spin, DoClaim);
+
+  IRB.SetInsertPoint(DoClaim);
+  Value *Cmp = IRB.CreateAtomicCmpXchg(
+      User->DecStatus, IRB.getInt32(0), IRB.getInt32(1), MaybeAlign(4),
+      AtomicOrdering::AcquireRelease, AtomicOrdering::Acquire);
+  Value *Claimed = IRB.CreateExtractValue(Cmp, 1);
+  IRB.CreateCondBr(Claimed, InitBlock, Spin);
+
+  IRB.SetInsertPoint(Spin);
+  LoadInst *Status1 = IRB.CreateLoad(
+      User->DecStatus->getValueType(), User->DecStatus);
+  Status1->setAtomic(AtomicOrdering::Acquire);
+  Value *Ready1 = IRB.CreateICmpEQ(Status1, IRB.getInt32(2));
+  IRB.CreateCondBr(Ready1, Exit, Spin);
 
   IRB.SetInsertPoint(InitBlock);
   Constant *Init = User->GV->getInitializer();
   lowerGlobalConstant(Init, IRB, User->DecGV, User->Ty);
-  IRB.CreateStore(IRB.getInt32(1), User->DecStatus);
+  StoreInst *Done = IRB.CreateStore(IRB.getInt32(2), User->DecStatus);
+  Done->setAtomic(AtomicOrdering::Release);
   IRB.CreateBr(Exit);
 
   IRB.SetInsertPoint(Exit);
@@ -670,7 +723,14 @@ void StringEncryption::lowerGlobalConstant(Constant *CV, IRBuilder<> &IRB, Value
   }
 }
 
+static constexpr unsigned kMaxLowerElements = 256;
+
 void StringEncryption::lowerGlobalConstantArray(ConstantArray *CA, IRBuilder<> &IRB, Value *Ptr, Type *Ty) {
+  // Huge aggregates would otherwise expand into thousands of scalar stores.
+  if (CA->getNumOperands() > kMaxLowerElements) {
+    IRB.CreateStore(CA, Ptr);
+    return;
+  }
   for (unsigned i = 0, e = CA->getNumOperands(); i != e; ++i) {
     Constant *CV = CA->getOperand(i);
     Value *GEP = IRB.CreateGEP(Ty,
@@ -680,6 +740,10 @@ void StringEncryption::lowerGlobalConstantArray(ConstantArray *CA, IRBuilder<> &
 }
 
 void StringEncryption::lowerGlobalConstantStruct(ConstantStruct *CS, IRBuilder<> &IRB, Value *Ptr, Type *Ty) {
+  if (CS->getNumOperands() > kMaxLowerElements) {
+    IRB.CreateStore(CS, Ptr);
+    return;
+  }
   for (unsigned i = 0, e = CS->getNumOperands(); i != e; ++i) {
     Constant* CV = CS->getOperand(i);
     Value *GEP = IRB.CreateGEP(Ty,
@@ -688,10 +752,12 @@ void StringEncryption::lowerGlobalConstantStruct(ConstantStruct *CS, IRBuilder<>
   }
 }
 
-bool StringEncryption::processConstantStringUse(Function *F) {
-  auto opt = ArgsOptions->toObfuscate(ArgsOptions->cseOpt(), F);
-  if (!opt.isEnabled()) {
-    return false;
+bool StringEncryption::processConstantStringUse(Function *F, bool Force) {
+  if (!Force) {
+    auto opt = ArgsOptions->toObfuscate(ArgsOptions->cseOpt(), F);
+    if (!opt.isEnabled()) {
+      return false;
+    }
   }
   LLVMContext &Ctx = F->getContext();
   LowerConstantExpr(*F);
@@ -707,42 +773,45 @@ bool StringEncryption::processConstantStringUse(Function *F) {
             auto Iter2 = CSUserMap.find(GV);
             if (Iter2 != CSUserMap.end()) { // GV is a constant string user
               CSUser *User = Iter2->second;
-              if (DecryptedGV.count(GV) > 0) {
-                Inst.replaceUsesOfWith(GV, User->DecGV);
-              } else {
-                Instruction *InsertPoint = PHI->getIncomingBlock(i)->getTerminator();
-                IRBuilder<> IRB(InsertPoint);
-                fixEH(IRB.CreateCall(User->InitFunc, {User->DecGV}));
-                Inst.replaceUsesOfWith(GV, User->DecGV);
-                MaybeDeadGlobalVars.insert(GV);
-                DecryptedGV.insert(GV);
-              }
+              // Each incoming edge needs its own decrypt: the call lives in
+              // that edge's predecessor, and a PHI edge must not reuse a
+              // value decrypted in a different block.
+              Instruction *InsertPoint =
+                  PHI->getIncomingBlock(i)->getTerminator();
+              if (isa<CatchSwitchInst>(InsertPoint))
+                continue;
+              IRBuilder<> IRB(InsertPoint);
+              fixEH(IRB.CreateCall(User->InitFunc, {User->DecGV}));
+              PHI->setIncomingValue(i, User->DecGV);
+              MaybeDeadGlobalVars.insert(GV);
               Changed = true;
             } else if (Iter1 != CSPEntryMap.end()) { // GV is a constant string
               CSPEntry *Entry = Iter1->second;
-              if (DecryptedGV.count(GV) > 0) {
-                Inst.replaceUsesOfWith(GV, Entry->DecGV);
-              } else {
-                Instruction *InsertPoint = PHI->getIncomingBlock(i)->getTerminator();
-                IRBuilder<> IRB(InsertPoint);
+              Instruction *InsertPoint =
+                  PHI->getIncomingBlock(i)->getTerminator();
+              if (isa<CatchSwitchInst>(InsertPoint))
+                continue;
+              IRBuilder<> IRB(InsertPoint);
 
-                Value *OutBuf = IRB.CreateBitCast(Entry->DecGV,
-                                                  PointerType::getUnqual(Ctx));
-                Value *Data = IRB.CreateInBoundsGEP(
-                    EncryptedStringTable->getValueType(),
-                    EncryptedStringTable,
-                    {IRB.getInt32(0), IRB.getInt32(Entry->Offset)});
-                emitDecryptCall(IRB, Entry, OutBuf, Data);
+              Value *OutBuf = IRB.CreateBitCast(Entry->DecGV,
+                                                PointerType::getUnqual(Ctx));
+              Value *Data = IRB.CreateInBoundsGEP(
+                  EncryptedStringTable->getValueType(),
+                  EncryptedStringTable,
+                  {IRB.getInt32(0), IRB.getInt32(Entry->Offset)});
+              emitDecryptCall(IRB, Entry, OutBuf, Data);
 
-                Inst.replaceUsesOfWith(GV, Entry->DecGV);
-                MaybeDeadGlobalVars.insert(GV);
-                DecryptedGV.insert(GV);
-              }
+              PHI->setIncomingValue(i, Entry->DecGV);
+              MaybeDeadGlobalVars.insert(GV);
               Changed = true;
             }
           }
         }
       } else {
+        // An EH pad must stay the first non-PHI instruction of its block;
+        // inserting a decrypt call before or after it would break the pad.
+        if (Inst.isEHPad())
+          continue;
         for (User::op_iterator op = Inst.op_begin(); op != Inst.op_end(); ++op) {
           if (GlobalVariable *GV = dyn_cast<GlobalVariable>(*op)) {
             auto Iter1 = CSPEntryMap.find(GV);
@@ -753,7 +822,7 @@ bool StringEncryption::processConstantStringUse(Function *F) {
                 Inst.replaceUsesOfWith(GV, User->DecGV);
               } else {
                 
-                IRBuilder<> IRB(Inst.isEHPad() ? &*Inst.getParent()->getPrevNode()->getFirstInsertionPt() : &Inst);
+                IRBuilder<> IRB(&Inst);
                 fixEH(IRB.CreateCall(User->InitFunc, {User->DecGV}));
                 Inst.replaceUsesOfWith(GV, User->DecGV);
                 MaybeDeadGlobalVars.insert(GV);
@@ -765,7 +834,7 @@ bool StringEncryption::processConstantStringUse(Function *F) {
               if (DecryptedGV.count(GV) > 0) {
                 Inst.replaceUsesOfWith(GV, Entry->DecGV);
               } else {
-                IRBuilder<> IRB(Inst.isEHPad() ? &*Inst.getParent()->getPrevNode()->getFirstInsertionPt() : &Inst);
+                IRBuilder<> IRB(&Inst);
                 
                 Value *OutBuf = IRB.CreateBitCast(Entry->DecGV,
                                                   PointerType::getUnqual(Ctx));

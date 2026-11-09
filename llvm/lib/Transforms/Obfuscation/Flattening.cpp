@@ -165,6 +165,11 @@ bool Flattening::flatten(Function *f, const ObfOpt &opt) {
     return v;
   };
 
+  // A single block without a switch cannot become more blocks; bail out
+  // before LowerSwitch so the pass does not change IR and then report false.
+  if (f->size() <= 1 && !isa<SwitchInst>(f->begin()->getTerminator()))
+    return false;
+
   // Lower switch
   auto lower = std::unique_ptr<FunctionPass>(createLegacyLowerSwitchPass());
   lower->runOnFunction(*f);

@@ -8,6 +8,7 @@
 #include "llvm/CryptoUtils.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/IR/EHPersonalities.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 
@@ -95,7 +96,8 @@ struct IndirectBranch : public FunctionPass {
         }
         // 拆分点不能是 PHI（必须留在块首）或终结符。
         while (It != Cur->end() &&
-               (isa<PHINode>(&*It) || It->isTerminator()))
+               (isa<PHINode>(&*It) || It->isTerminator() ||
+                isa<AllocaInst>(&*It)))
           ++It;
         if (It == Cur->end())
           break;
@@ -112,6 +114,10 @@ struct IndirectBranch : public FunctionPass {
           F.isIntrinsic()) {
         continue;
       }
+      // WinEH / Wasm funclets cannot share a single indirectbr table.
+      if (F.hasPersonalityFn() &&
+          isScopedEHPersonality(classifyEHPersonality(F.getPersonalityFn())))
+        continue;
       // Only collect edges from functions this pass will actually rewrite.
       // Taking BlockAddress values from skipped functions keeps their blocks
       // alive and can block later optimizations.
@@ -222,6 +228,10 @@ struct IndirectBranch : public FunctionPass {
   bool runOnFunction(Function &Fn) override {
     // 弱符号等红黄区函数的跳过已统一收敛到
     // ObfuscationOptions::toObfuscate()（安全底线），此处不再单独判断。
+    // WinEH / Wasm funclets cannot share a single indirectbr table.
+    if (Fn.hasPersonalityFn() &&
+        isScopedEHPersonality(classifyEHPersonality(Fn.getPersonalityFn())))
+      return false;
 
     const auto opt = ArgsOptions->toObfuscate(ArgsOptions->indBrOpt(), &Fn);
     if (!opt.isEnabled()) {

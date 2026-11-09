@@ -347,9 +347,16 @@ BasicBlock* LowerSwitch::newLeafBlock(CaseRange& Leaf, Value* Val,
   // from OrigBlock to come from NewLeaf.
   for (BasicBlock::iterator I = Succ->begin(); isa<PHINode>(I); ++I) {
     PHINode* PN = cast<PHINode>(I);
-    // Remove all but one incoming entries from the cluster
-    uint64_t Range = Leaf.High->getSExtValue() -
-                     Leaf.Low->getSExtValue();
+    // Remove all but one incoming entries from the cluster.  Compute the
+    // difference in unsigned space (int64 subtraction can wrap) and never
+    // remove more entries than the PHI actually has.
+    uint64_t Range = uint64_t(Leaf.High->getSExtValue()) -
+                     uint64_t(Leaf.Low->getSExtValue());
+    // Keep at least one incoming entry so the setIncomingBlock below still
+    // has a target.
+    unsigned NumIncoming = PN->getNumIncomingValues();
+    if (Range >= NumIncoming)
+      Range = NumIncoming > 0 ? NumIncoming - 1 : 0;
     for (uint64_t j = 0; j < Range; ++j) {
       PN->removeIncomingValue(OrigBlock);
     }
@@ -385,7 +392,8 @@ unsigned LowerSwitch::Clusterify(CaseVector& Cases, SwitchInst *SI) {
       // If the two neighboring cases go to the same destination, merge them
       // into a single case.
       assert(nextValue > currentValue && "Cases should be strictly ascending");
-      if ((nextValue == currentValue + 1) && (currentBB == nextBB)) {
+      if ((currentValue < std::numeric_limits<int64_t>::max()) &&
+          (nextValue == currentValue + 1) && (currentBB == nextBB)) {
         I->High = J->High;
         // FIXME: Combine branch weights.
       } else if (++I != J) {
@@ -421,6 +429,12 @@ void LowerSwitch::processSwitchInst(SwitchInst *SI,
     DeleteList.insert(CurBlock);
     return;
   }
+
+  // The range arithmetic below is int64-based.  Leave wider switches alone
+  // instead of asserting in APInt::getSExtValue().
+  if (Val->getType()->isIntegerTy() &&
+      Val->getType()->getIntegerBitWidth() > 64)
+    return;
 
   // If there is only the default destination, just branch.
   if (!SI->getNumCases()) {
@@ -474,10 +488,18 @@ void LowerSwitch::processSwitchInst(SwitchInst *SI,
             {High + 1, std::numeric_limits<int64_t>::max()});
       }
 
-      // Count popularity.
-      int64_t N = High - Low + 1;
+      // Count popularity.  High - Low can overflow int64; use unsigned
+      // arithmetic and saturate at UINT_MAX.
+      uint64_t Diff = uint64_t(High) - uint64_t(Low);
+      uint64_t N = Diff == std::numeric_limits<uint64_t>::max()
+                       ? Diff
+                       : Diff + 1;
       unsigned &Pop = Popularity[I.BB];
-      if ((Pop += N) > MaxPop) {
+      if (N > std::numeric_limits<unsigned>::max() - Pop)
+        Pop = std::numeric_limits<unsigned>::max();
+      else
+        Pop += static_cast<unsigned>(N);
+      if (Pop > MaxPop) {
         MaxPop = Pop;
         PopSucc = I.BB;
       }

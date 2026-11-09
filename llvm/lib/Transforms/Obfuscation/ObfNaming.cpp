@@ -108,10 +108,14 @@ bool obf::debugNames() {
 }
 
 std::string obf::freshName(Module &M, StringRef Tag) {
-  (void)M; // 命名层不持久化模块状态；保留参数以统一 API
   if (debugNames())
     return Tag.str();
   std::lock_guard<std::mutex> L(StateMu);
+  for (unsigned I = 0; I < 64; ++I) {
+    std::string Name = randomIdent();
+    if (!M.getNamedValue(Name))
+      return Name;
+  }
   return randomIdent();
 }
 

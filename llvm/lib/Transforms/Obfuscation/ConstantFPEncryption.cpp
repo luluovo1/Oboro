@@ -1,3 +1,4 @@
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Transforms/Obfuscation/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscation/ConstantFPEncryption.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
@@ -96,20 +97,29 @@ struct ConstantFPEncryption : public FunctionPass {
     // 统计常量出现次数：重复使用的常量在函数入口统一解密一次，
     // 避免每个使用点生成重复的加密全局与解密序列（体积/性能优化）
     std::unordered_map<ConstantFP *, unsigned> ConstUseCount;
+    // Deterministic first-use order: hash-map iteration would make PRNG
+    // consumption (and therefore the output) depend on ASLR.
+    SmallVector<ConstantFP *, 16> ConstOrder;
     for (auto I : FuncModifyIRs) {
-      auto CI = dyn_cast<CallInst>(I);
+      auto CB = dyn_cast<CallBase>(I);
       auto GEP = dyn_cast<GetElementPtrInst>(I);
       auto PHI = dyn_cast<PHINode>(I);
+      if (CB && CB->isInlineAsm())
+        continue;
       for (unsigned i = 0; i < I->getNumOperands(); ++i) {
-        if (CI && CI->isBundleOperand(i))
+        if (CB && CB->isBundleOperand(i))
           continue;
         if (GEP && i < 2)
           continue;
         if (auto CFP = dyn_cast<ConstantFP>(I->getOperand(i))) {
-          if (PHI &&
-              isa<SwitchInst>(PHI->getIncomingBlock(i)->getTerminator()))
+          if (!CFP->getType()->isFloatTy() && !CFP->getType()->isDoubleTy())
             continue;
-          ConstUseCount[CFP]++;
+          if (PHI &&
+              isa<SwitchInst, CatchSwitchInst>(
+                  PHI->getIncomingBlock(i)->getTerminator()))
+            continue;
+          if (ConstUseCount[CFP]++ == 0)
+            ConstOrder.push_back(CFP);
         }
       }
     }
@@ -117,11 +127,10 @@ struct ConstantFPEncryption : public FunctionPass {
     // 重复常量在函数入口解密一次并缓存
     std::unordered_map<ConstantFP *, AllocaInst *> DedupCache;
     auto &EntryBB = F.getEntryBlock();
-    Instruction *AllocaInsertPt = &*EntryBB.begin();
-    for (auto &KV : ConstUseCount) {
-      if (KV.second <= 1)
+    Instruction *AllocaInsertPt = &*EntryBB.getFirstInsertionPt();
+    for (ConstantFP *CFP : ConstOrder) {
+      if (ConstUseCount[CFP] <= 1)
         continue;
-      auto *CFP = KV.first;
       auto *Ty = CFP->getType();
       auto BitWidth = Ty->getPrimitiveSizeInBits().getFixedValue();
       if (BitWidth < 8)
@@ -140,20 +149,25 @@ struct ConstantFPEncryption : public FunctionPass {
       }
       if (!DecryptPt)
         DecryptPt = EntryBB.getTerminator();
-      for (auto &KV : DedupCache) {
-        Value *Dec = encryptConstant(KV.first, DecryptPt, &*cryptoutils, opt.level());
+      for (ConstantFP *CFP : ConstOrder) {
+        auto It = DedupCache.find(CFP);
+        if (It == DedupCache.end())
+          continue;
+        Value *Dec = encryptConstant(CFP, DecryptPt, &*cryptoutils, opt.level());
         IRBuilder<NoFolder> SIB(DecryptPt);
-        SIB.CreateAlignedStore(Dec, KV.second, Align{1}, true);
+        SIB.CreateAlignedStore(Dec, It->second, Align{1}, true);
       }
     }
 
     for (auto I : FuncModifyIRs) {
-      auto CI = dyn_cast<CallInst>(I);
+      auto CB = dyn_cast<CallBase>(I);
       auto GEP = dyn_cast<GetElementPtrInst>(I);
       auto PHI = dyn_cast<PHINode>(I);
+      if (CB && CB->isInlineAsm())
+        continue;
 
       for (unsigned i = 0; i < I->getNumOperands(); ++i) {
-        if (CI && CI->isBundleOperand(i)) {
+        if (CB && CB->isBundleOperand(i)) {
           continue;
         }
         if (GEP && i < 2) {
@@ -161,7 +175,10 @@ struct ConstantFPEncryption : public FunctionPass {
         }
         Value* Opr = I->getOperand(i);
         if (auto CFP = dyn_cast<ConstantFP>(Opr)) {
-          if (PHI && isa<SwitchInst>(PHI->getIncomingBlock(i)->getTerminator())) {
+          if (!CFP->getType()->isFloatTy() && !CFP->getType()->isDoubleTy())
+            continue;
+          if (PHI && isa<SwitchInst, CatchSwitchInst>(
+                         PHI->getIncomingBlock(i)->getTerminator())) {
             continue;
           }
 

@@ -39,7 +39,10 @@ public:
   }
 
   bool runOnModule(Module &M) override {
-    auto &seed = ArgsOptions->randomSeed();
+    // Copy: never write the per-run fallback back into the shared options,
+    // or later passes would receive a 19-character non-hex seed.
+    std::string seed(ArgsOptions->randomSeed().begin(),
+                     ArgsOptions->randomSeed().end());
     // A pass must never abort the compiler because a config file is missing.
     // Fall back to a per-run random seed: the output is still opaque, and an
     // explicit "seed" in the config keeps builds reproducible.
@@ -61,12 +64,12 @@ public:
         continue;
       }
 
-      ConstantStruct *   initStruct = cast<ConstantStruct>(gv.getInitializer());
-      ConstantDataArray *rttiDA = cast<ConstantDataArray>(
-          initStruct->getOperand(2));
-      if (!rttiDA->isString()) {
-        report_fatal_error("RTTI[2] is not a string.");
-      }
+      auto *initStruct = dyn_cast<ConstantStruct>(gv.getInitializer());
+      if (!initStruct || initStruct->getNumOperands() < 3)
+        continue;
+      auto *rttiDA = dyn_cast<ConstantDataArray>(initStruct->getOperand(2));
+      if (!rttiDA || !rttiDA->isString())
+        continue;
       StringRef tyInfoString = rttiDA->getAsString();
       if (!tyInfoString.starts_with(".?AV") &&
           !tyInfoString.starts_with(".?AU")

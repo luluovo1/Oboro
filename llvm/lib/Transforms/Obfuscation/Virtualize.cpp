@@ -321,6 +321,9 @@ struct VMProgram {
   // padded so the size is not a recognisable constant.
   unsigned RegSlots = 0;
   uint64_t FrameSize = 0;
+  // Maximum alignment required by any entry alloca; the wrapper must
+  // allocate the frame with at least this alignment.
+  uint64_t FrameAlign = 16;
   // Number of frame slots reserved for values that did not fit the register
   // file.  Zero for every function that translates without spilling.
   unsigned SpillSlots = 0;
@@ -516,6 +519,7 @@ private:
   DenseMap<AllocaInst *, uint64_t> AllocaOff;
   std::vector<AllocaInst *> Allocas;
   uint64_t FrameSize = 0;
+  uint64_t FrameAlign = 16;
   std::vector<std::pair<uint32_t, BasicBlock *>> Fixups;
   uint8_t NextReg = 0;
   const Instruction *CurI = nullptr;
@@ -851,6 +855,10 @@ void VMTranslator::releaseDeadOperands(Instruction &I, unsigned Idx) {
   if (It == LastUse.end())
     return;
   for (Value *Op : I.operands()) {
+    // The deferred compare is emitted by the terminator; its operands must
+    // survive until then.
+    if (llvm::is_contained(DeferredOps, Op))
+      continue;
     auto J = It->second.find(Op);
     if (J == It->second.end() || J->second != Idx)
       continue;
@@ -1022,6 +1030,12 @@ bool VMTranslator::callSignatureOK(CallInst &CI, std::string &Why) {
   }
   if (CI.isMustTailCall()) {
     Why = "musttail";
+    return false;
+  }
+  // setjmp/vfork return twice; the interpreter frame would be gone by the
+  // time the second return happens.
+  if (CI.canReturnTwice()) {
+    Why = "returns_twice call";
     return false;
   }
   Function *Callee = CI.getCalledFunction();
@@ -1695,9 +1709,16 @@ bool VMTranslator::translateInst(Instruction &I) {
         uint8_t W;
         if (!storageWidthCode(CI->getType(), DL, W))
           return fail("expect width");
-        uint8_t R = regOf(CI->getArgOperand(0));
+        uint8_t Src = regOf(CI->getArgOperand(0));
         if (Failed)
           return false;
+        // Do not alias the result onto the operand's register: the operand
+        // may die here, and releaseDeadOperands would hand its register to
+        // the next instruction.
+        uint8_t R = allocReg();
+        if (Failed)
+          return false;
+        emit(OP_MOV, W, R, Src);
         Regs[&I] = R;
         return true;
       }
@@ -2424,6 +2445,7 @@ bool VMTranslator::run() {
         return fail("alloca too large");
       uint64_t Size = Count * Elem;
       uint64_t A = std::max<uint64_t>(AI->getAlign().value(), 1);
+      FrameAlign = std::max(FrameAlign, A);
       FrameSize = alignTo(FrameSize, A);
       AllocaOff[AI] = FrameSize;
       FrameSize += std::max<uint64_t>(Size, 1);
@@ -2431,6 +2453,7 @@ bool VMTranslator::run() {
       uint64_t Size =
           DL.getTypeAllocSize(AI->getAllocatedType()).getFixedValue();
       uint64_t A = std::max<uint64_t>(AI->getAlign().value(), 1);
+      FrameAlign = std::max(FrameAlign, A);
       FrameSize = alignTo(FrameSize, A);
       AllocaOff[AI] = FrameSize;
       FrameSize += std::max<uint64_t>(Size, 1);
@@ -2489,6 +2512,7 @@ bool VMTranslator::run() {
     }
   }
   Program.FrameSize = FrameSize;
+  Program.FrameAlign = FrameAlign;
   Program.EntryPC = 0;
   for (BasicBlock *BB : Order) {
     BlockPC[BB] = (uint32_t)Program.Code.size();
@@ -2716,7 +2740,8 @@ bool VMRuntimeBuilder::createThunks() {
     if (D.Direct) {
       Call = B.CreateCall(D.Direct, CallArgs);
       Call->setCallingConv(D.CC);
-      Call->setAttributes(D.Direct->getAttributes());
+      Call->setAttributes(D.Attrs.isEmpty() ? D.Direct->getAttributes()
+                                            : D.Attrs);
     } else {
       Call = B.CreateCall(D.SiteFT, T->getArg(1), CallArgs);
       Call->setCallingConv(D.CC);
@@ -3710,7 +3735,7 @@ bool VMRuntimeBuilder::emitWrapper() {
   uint64_t FS = std::max<uint64_t>(P.FrameSize, 1);
   AllocaInst *Frame = B.CreateAlloca(ArrayType::get(B.getInt8Ty(), FS),
                                      nullptr, "f");
-  Frame->setAlignment(Align(16));
+  Frame->setAlignment(Align(P.FrameAlign));
   CallInst *Call = B.CreateCall(Interp, {Args, Frame});
   Call->setCallingConv(CallingConv::C);
 
@@ -3761,6 +3786,11 @@ void VMRuntimeBuilder::discard() {
   // deleted Function reads recycled storage and, when the allocator hands the
   // block back with the old contents, calls eraseFromParent() a second time --
   // a double free.  Delete each function exactly once and clear Interp last.
+  // Break the function<->global cycle first: ThunkGV's initializer references
+  // the thunks, and the interpreter references the bytecode globals.
+  for (GlobalVariable *GV : CreatedGlobals)
+    if (GV && GV->getParent())
+      GV->dropAllReferences();
   Function *Skip = Interp;
   for (auto It = CreatedFunctions.rbegin(); It != CreatedFunctions.rend();
        ++It) {

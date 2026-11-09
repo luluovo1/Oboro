@@ -22,6 +22,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
@@ -111,7 +112,15 @@ bool MergeFunction::isEligible(Function &F) {
   if (F.hasFnAttribute(Attribute::Naked) ||
       F.hasFnAttribute(Attribute::AlwaysInline) ||
       F.hasFnAttribute(Attribute::ReturnsTwice) ||
+      F.hasFnAttribute(Attribute::OptimizeNone) ||
       F.hasFnAttribute("presplitcoroutine"))
+    return false;
+  // These either change the dispatcher's ABI/section/GC or would leave a
+  // dangling reference to the erased member.  Reject instead of repairing.
+  if (F.hasFnAttribute(Attribute::NoReturn) ||
+      F.hasFnAttribute(Attribute::NoRecurse) ||
+      F.getMetadata(LLVMContext::MD_kcfi_type) ||
+      F.hasSection() || F.hasComdat() || F.hasGC())
     return false;
   if (F.getName() == "main")
     return false;
@@ -126,6 +135,10 @@ bool MergeFunction::isEligible(Function &F) {
     Type *T = A.getType();
     if (!T->isIntegerTy() && !T->isPointerTy() && !T->isFloatTy() &&
         !T->isDoubleTy())
+      return false;
+    // toI64/fromI64 use ZExtOrTrunc to i64; anything wider would be silently
+    // truncated and corrupted.
+    if (T->isIntegerTy() && T->getIntegerBitWidth() > 64)
       return false;
     if (A.hasAttribute(Attribute::ByVal) ||
         A.hasAttribute(Attribute::InAlloca) ||
@@ -145,6 +158,10 @@ bool MergeFunction::isEligible(Function &F) {
     if (!CI)
       return false;
     if (CI->getCalledOperand()->stripPointerCasts() != &F)
+      return false;
+    // Rebuilding the call would drop its operand bundles (WinEH funclet,
+    // KCFI, ARC attached-call, ptrauth) and musttail's tail-call guarantee.
+    if (CI->hasOperandBundles() || CI->isMustTailCall())
       return false;
   }
   if (F.hasAddressTaken())
@@ -190,6 +207,11 @@ bool MergeFunction::mergeGroup(Module &M, ArrayRef<Function *> Group) {
   // undid the merge would also undo the obfuscation.
   Merged->addFnAttr(Attribute::NoInline);
   Merged->setCallingConv(CallingConv::C);
+  // CloneFunctionInto copies each member's AttributeList, CC, section,
+  // alignment and GC onto Merged, and appends function-level metadata
+  // (!dbg/!prof/!kcfi_type).  Save the dispatcher's own state and restore it
+  // after every clone.
+  AttributeList SavedAttrs = Merged->getAttributes();
 
   BasicBlock *Dispatch = BasicBlock::Create(Ctx, "dispatch", Merged);
   BasicBlock *TrapBB = BasicBlock::Create(Ctx, "trap", Merged);
@@ -217,9 +239,31 @@ bool MergeFunction::mergeGroup(Module &M, ArrayRef<Function *> Group) {
     SmallVector<ReturnInst *, 8> Returns;
     CloneFunctionInto(Merged, F, VMap, CloneFunctionChangeType::LocalChangesOnly,
                       Returns, "", nullptr, nullptr, nullptr);
+    // Restore the dispatcher's own function state.  Section/alignment/GC are
+    // not part of AttributeList, and CloneFunctionMetadataInto appends
+    // !dbg/!prof/!kcfi_type; all of them must be undone per member.
+    Merged->setAttributes(SavedAttrs);
+    Merged->setCallingConv(CallingConv::C);
+    Merged->addFnAttr(Attribute::NoInline);
+    Merged->setSection("");
+    Merged->setAlignment(Align());
+    Merged->clearGC();
+    Merged->clearMetadata();
+    auto BI = Merged->begin();
+    std::advance(BI, Before);
+    for (auto BE = Merged->end(); BI != BE; ++BI)
+      for (Instruction &I : *BI)
+        I.setDebugLoc(DebugLoc());
     auto It = Merged->begin();
     std::advance(It, Before);
     BasicBlock *NewEntry = &*It;
+    // Keep the member's static allocas in the dispatcher entry block; left in
+    // NewEntry they would become dynamic stack allocations on every call.
+    for (auto II = NewEntry->begin(); II != NewEntry->end();) {
+      auto Cur = II++;
+      if (auto *AI = dyn_cast<AllocaInst>(&*Cur))
+        AI->moveBefore(*Dispatch, Dispatch->getFirstInsertionPt());
+    }
     PB.CreateBr(NewEntry);
 
     for (ReturnInst *RI : Returns)
@@ -293,20 +337,26 @@ bool MergeFunction::runOnModule(Module &M) {
     return false;
 
   bool Changed = false;
-  for (unsigned I = 0; I < Candidates.size(); I += kMaxFunctionsPerGroup) {
-    unsigned End =
-        std::min<unsigned>(I + kMaxFunctionsPerGroup, Candidates.size());
-    SmallVector<Function *, 32> Group(Candidates.begin() + I,
-                                      Candidates.begin() + End);
-    if (Group.size() < 2)
-      continue;
-    unsigned TotalArgs = 0;
-    for (Function *F : Group)
-      TotalArgs += F->arg_size();
-    if (TotalArgs > kMaxArgsPerGroup)
-      continue;
-    Changed |= mergeGroup(M, Group);
+  // Greedy packing: keep both the function-count and total-argument caps,
+  // but do not discard a whole 32-function chunk when it exceeds the arg cap.
+  SmallVector<Function *, 32> Group;
+  unsigned GroupArgs = 0;
+  auto Flush = [&]() {
+    if (Group.size() >= 2)
+      Changed |= mergeGroup(M, Group);
+    Group.clear();
+    GroupArgs = 0;
+  };
+  for (Function *F : Candidates) {
+    unsigned N = F->arg_size();
+    if (!Group.empty() &&
+        (Group.size() >= kMaxFunctionsPerGroup ||
+         GroupArgs + N > kMaxArgsPerGroup))
+      Flush();
+    Group.push_back(F);
+    GroupArgs += N;
   }
+  Flush();
   return Changed;
 }
 

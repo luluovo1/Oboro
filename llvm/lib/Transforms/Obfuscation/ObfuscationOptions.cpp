@@ -270,7 +270,11 @@ static bool isSafetyYellowZone(StringRef Demangled) {
 
 // 名称通配匹配：'*' 匹配任意字符但不跨 "::"；'**' 匹配任意字符（含 "::"）。
 // "**::" 额外允许匹配"零层作用域"（即全局函数，如 "**::test" 也匹配 "test"）。
-static bool matchNamePattern(StringRef Pattern, StringRef Name) {
+static bool matchNamePattern(StringRef Pattern, StringRef Name,
+                             unsigned Depth = 0) {
+  // A pathological '**' pattern can otherwise backtrack exponentially.
+  if (Depth > 64)
+    return false;
   while (!Pattern.empty()) {
     if (Pattern.consume_front("**")) {
       if (Pattern.empty())
@@ -278,10 +282,10 @@ static bool matchNamePattern(StringRef Pattern, StringRef Name) {
       const bool ScopeOptional = Pattern.starts_with("::");
       for (size_t I = 0; I <= Name.size(); ++I) {
         StringRef Rest = Name.drop_front(I);
-        if (matchNamePattern(Pattern, Rest))
+        if (matchNamePattern(Pattern, Rest, Depth + 1))
           return true;
         if (ScopeOptional && I == 0 &&
-            matchNamePattern(Pattern.drop_front(2), Rest))
+            matchNamePattern(Pattern.drop_front(2), Rest, Depth + 1))
           return true;
       }
       return false;
@@ -296,7 +300,7 @@ static bool matchNamePattern(StringRef Pattern, StringRef Name) {
       if (Limit == StringRef::npos)
         Limit = Name.size();
       for (size_t I = 0; I <= Limit; ++I) {
-        if (matchNamePattern(Pattern, Name.drop_front(I)))
+        if (matchNamePattern(Pattern, Name.drop_front(I), Depth + 1))
           return true;
       }
       return false;

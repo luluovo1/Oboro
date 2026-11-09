@@ -162,7 +162,7 @@ struct ConstantIntEncryption : public FunctionPass {
     // 重复常量在函数入口解密一次并缓存
     std::unordered_map<ConstantInt *, AllocaInst *> DedupCache;
     auto &EntryBB = F.getEntryBlock();
-    Instruction *AllocaInsertPt = &*EntryBB.begin();
+    Instruction *AllocaInsertPt = &*EntryBB.getFirstInsertionPt();
     for (auto *CTI : ConstOrder) {
       if (ConstUseCount[CTI] <= 1)
         continue;
@@ -211,7 +211,8 @@ struct ConstantIntEncryption : public FunctionPass {
           if (CTI->getBitWidth() < 4) {
             continue;
           }
-          if (PHI && isa<SwitchInst>(PHI->getIncomingBlock(i)->getTerminator())) {
+          if (PHI && isa<SwitchInst, CatchSwitchInst>(
+                         PHI->getIncomingBlock(i)->getTerminator())) {
             continue;
           }
 

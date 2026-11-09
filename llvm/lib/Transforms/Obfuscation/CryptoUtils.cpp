@@ -594,26 +594,42 @@ unsigned long long CryptoUtils::scramble64(const unsigned in, const char key[16]
 
 void CryptoUtils::prng_seed(const std::string _seed) {
   unsigned char s[16];
-  unsigned int i = 0;
 
-  /* We accept a prefix "0x" */
-  if (!(_seed.size() == 32 || _seed.size() == 34)) {
-    errs() <<
-        Twine("The AES-CTR PRNG seeding mechanism is expecting a 16-byte value "
-              "expressed in hexadecimal, like DEAD....BEEF");
+  /* We accept an optional "0x" prefix. */
+  const bool Has0x = _seed.size() == 34 && _seed[0] == '0' &&
+                     (_seed[1] == 'x' || _seed[1] == 'X');
+  const bool ValidLen = _seed.size() == 32 || Has0x;
+  auto IsHex = [](char C) {
+    return (C >= '0' && C <= '9') || (C >= 'a' && C <= 'f') ||
+           (C >= 'A' && C <= 'F');
+  };
+  bool ValidHex = ValidLen;
+  const unsigned Offset = Has0x ? 2 : 0;
+  if (ValidLen)
+    for (unsigned I = Offset; I < _seed.size(); ++I)
+      if (!IsHex(_seed[I])) {
+        ValidHex = false;
+        break;
+      }
+
+  if (!ValidLen || !ValidHex) {
+    errs() << Twine("The AES-CTR PRNG seeding mechanism is expecting a "
+                    "16-byte value expressed in hexadecimal, like "
+                    "DEAD....BEEF; falling back to a random seed\n");
+    // Never derive a key from a half-initialised buffer: use the platform
+    // random source instead.
+    prng_seed();
+    populate_pool();
+    return;
+  }
+
+  for (unsigned I = Offset; I < _seed.length(); I += 2) {
+    std::string Byte = _seed.substr(I, 2);
+    s[(I - Offset) >> 1] =
+        (unsigned char)(int)strtol(Byte.c_str(), NULL, 16);
   }
 
   seed = _seed;
-
-  if (_seed.size() == 34) {
-    // Assuming that the two first characters are "0x"
-    i = 2;
-  }
-
-  for (; i < _seed.length(); i += 2) {
-    std::string byte = _seed.substr(i, 2);
-    s[i >> 1] = (unsigned char)(int)strtol(byte.c_str(), NULL, 16);
-  }
 
   // _seed is defined to be the
   // key initial value
@@ -755,7 +771,7 @@ void CryptoUtils::get_bytes(char *buffer, const int len) {
         // This will trigger a loop exit
         sofar = len;
       }
-    } while (sofar < (len - 1));
+    } while (sofar < len);
   }
 }
 

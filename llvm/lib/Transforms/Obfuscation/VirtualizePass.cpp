@@ -185,11 +185,13 @@ struct VirtualizeLegacy : public FunctionPass {
       return false;
     if (Done >= Budget)
       return false;
-    // TEMP bisect hook: OBORO_VMP_SKIP=<substring> leaves matching functions
-    // untouched so a failure can be attributed to one function.
+#ifndef NDEBUG
+    // Debug-only bisect hook: OBORO_VMP_SKIP=<substring> leaves matching
+    // functions untouched so a failure can be attributed to one function.
     if (const char *Skip = ::getenv("OBORO_VMP_SKIP"))
       if (F.getName().contains(Skip))
         return false;
+#endif
 
     ObfOpt Opt = Options->toObfuscate(Options->vmpOpt(), &F);
     if (!Opt.isEnabled())

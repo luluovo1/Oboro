@@ -240,6 +240,7 @@ static Value *bcfConsecProduct(IRBuilder<> &B, Value *X, unsigned K,
 static unsigned bcfPickKind() {
   if (unsigned Forced = BCFPred.getValue())
     return Forced;
+  // Families 5, 8, 9, 11 and 12 are active; the others are reserved.
   //              1  2  3  4  5  6  7  8  9 10 11 12
   static const unsigned Weights[12] = {0, 0, 0, 0, 2, 0, 0, 2, 2, 0, 2, 2};
   unsigned R = cryptoutils->get_uint32_t() % 10;
@@ -510,7 +511,10 @@ void bcfFillBogusBB(BasicBlock *BogBB, Function &F) {
                       ", " + Reg + ", " + Reg + "\n\t";
     FunctionType *AsmFTy2 = FunctionType::get(
         Type::getVoidTy(Ctx), {PointerType::getUnqual(Ctx)}, false);
-    InlineAsm *IA = InlineAsm::get(AsmFTy2, Ops, "r", true);
+    // Declare the SP and the chosen scratch register as clobbers: the asm
+    // writes both, and an undeclared clobber is undefined behaviour.
+    std::string Constraints = "r,~{sp},~{" + Reg + "}";
+    InlineAsm *IA = InlineAsm::get(AsmFTy2, Ops, Constraints, true);
     B.CreateCall(IA, {TargetPtr});
     // BogBB 的 IR 终止符 (br <destination>) 会生成 b <destination>：
     // IDA 带着 SP±N 跟随死路进入汇合块 → SP 毒化生效。

@@ -233,7 +233,7 @@ struct IndirectCall : public FunctionPass {
     // 重复被调函数在函数入口解密一次并缓存
     std::unordered_map<Function *, AllocaInst *> CalleeDedupCache;
     auto &EntryBB = Fn.getEntryBlock();
-    Instruction *AllocaInsertPt = &*EntryBB.begin();
+    Instruction *AllocaInsertPt = &*EntryBB.getFirstInsertionPt();
     auto *PtrTy = PointerType::getUnqual(Fn.getContext());
     for (auto *Callee : CalleeOrder) {
       if (CalleeUseCount[Callee] <= 1)

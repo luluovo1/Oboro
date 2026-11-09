@@ -159,6 +159,11 @@ struct BogusControlFlow : public FunctionPass {
     for (BasicBlock &BB : F) {
       if (BB.isLandingPad() || BB.isEHPad())
         continue;
+      // Splitting the entry block moves its static allocas into OrigBB; if
+      // the function is later inlined into a loop those allocas become
+      // dynamic stack growth.
+      if (&BB == &F.getEntryBlock())
+        continue;
       // 只处理有正常终止指令且无 invoke/landingpad 的块
       if (BB.size() < 2)
         continue;

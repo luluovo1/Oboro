@@ -201,14 +201,17 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
   };
 
   auto CreateAtomicLoadI32 = [&](IRBuilder<> &B, Value *Ptr,
-                                 const Twine &Name) -> LoadInst * {
+                                 const Twine &Name,
+                                 AtomicOrdering Order = AtomicOrdering::Monotonic)
+      -> LoadInst * {
     LoadInst *LI = B.CreateLoad(I32, Ptr, Name);
-    LI->setAtomic(AtomicOrdering::Monotonic);
+    LI->setAtomic(Order);
     return LI;
   };
-  auto CreateAtomicStoreI32 = [&](IRBuilder<> &B, Value *Val, Value *Ptr) {
+  auto CreateAtomicStoreI32 = [&](IRBuilder<> &B, Value *Val, Value *Ptr,
+                                  AtomicOrdering Order = AtomicOrdering::Monotonic) {
     StoreInst *SI = B.CreateStore(Val, Ptr);
-    SI->setAtomic(AtomicOrdering::Monotonic);
+    SI->setAtomic(Order);
   };
 
   // ---- init：原子状态机 0->1->2；防递归 ----
@@ -223,9 +226,13 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
   BasicBlock *InitDo = BasicBlock::Create(Ctx, "doinit", Init);
   BasicBlock *InitDone = BasicBlock::Create(Ctx, "done", Init);
   IRBuilder<> IB(InitEntry);
-  Value *Old = IB.CreateAtomicRMW(AtomicRMWInst::Xchg, Inited, IB.getInt32(1),
-                                  MaybeAlign(4), AtomicOrdering::Monotonic);
-  IB.CreateCondBr(IB.CreateICmpEQ(Old, IB.getInt32(0)), InitDo, InitDone);
+  // Claim initialization only from state 0.  An unconditional Xchg would
+  // overwrite an already-published 2 with 1 and permanently disable GetEnv.
+  Value *Cmp = IB.CreateAtomicCmpXchg(
+      Inited, IB.getInt32(0), IB.getInt32(1), MaybeAlign(4),
+      AtomicOrdering::AcquireRelease, AtomicOrdering::Acquire);
+  Value *Claimed = IB.CreateExtractValue(Cmp, 1);
+  IB.CreateCondBr(Claimed, InitDo, InitDone);
   IB.SetInsertPoint(InitDo);
   Value *Env = nullptr;
   if (BCFForceDecoy)
@@ -241,7 +248,9 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
   IB.CreateStore(IB.CreateXor(Env, BuildKey(IB, A1, KeyConst2)), S2,
                  /*isVolatile=*/true);
   CreateAtomicStoreI32(IB, IB.getInt32(TamperKey), Tampered);
-  CreateAtomicStoreI32(IB, IB.getInt32(2), Inited);
+  // Publish S1/S2 with a release store so an acquire reader that observes
+  // 2 also observes both shares.
+  CreateAtomicStoreI32(IB, IB.getInt32(2), Inited, AtomicOrdering::Release);
   IB.CreateBr(InitDone);
   IB.SetInsertPoint(InitDone);
   IB.CreateRetVoid();
@@ -261,11 +270,11 @@ static Function *getOrCreateDecoyRuntime(Module &M) {
   BasicBlock *GSetTamper = BasicBlock::Create(Ctx, "tamper", GetEnv);
   BasicBlock *GCheck = BasicBlock::Create(Ctx, "check", GetEnv);
   IRBuilder<> GB(GE);
-  Value *St = CreateAtomicLoadI32(GB, Inited, "st");
+  Value *St = CreateAtomicLoadI32(GB, Inited, "st", AtomicOrdering::Acquire);
   GB.CreateCondBr(GB.CreateICmpNE(St, GB.getInt32(2)), GSlow, GFast);
   GB.SetInsertPoint(GSlow);
   GB.CreateCall(Init, {});
-  Value *St2 = CreateAtomicLoadI32(GB, Inited, "st2");
+  Value *St2 = CreateAtomicLoadI32(GB, Inited, "st2", AtomicOrdering::Acquire);
   GB.CreateCondBr(GB.CreateICmpEQ(St2, GB.getInt32(2)), GFast, GDefault);
   GB.SetInsertPoint(GDefault);
   GB.CreateRet(GB.getInt32(1)); // 初始化中/递归：fail-open
@@ -477,16 +486,44 @@ static BasicBlock *buildPollutedClone(BasicBlock *OrigBB, Function &F) {
     if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I) || isa<FenceInst>(I))
       return nullptr;
     if (auto *LI = dyn_cast<LoadInst>(&I))
-      if (LI->isAtomic())
+      if (LI->isAtomic() || LI->isVolatile())
         return nullptr;
     if (auto *SI = dyn_cast<StoreInst>(&I))
-      if (SI->isAtomic())
+      if (SI->isAtomic() || SI->isVolatile())
         return nullptr;
     // lifetime/dbg 内建无实际副作用，克隆后重复执行无害；
     // 其它调用（未知副作用/栈增长）一律拒绝。
     if (auto *CB = dyn_cast<CallBase>(&I))
       if (!isa<LifetimeIntrinsic>(CB) && !isa<DbgInfoIntrinsic>(CB))
         return nullptr;
+  }
+
+  // DecoyBB bypasses OrigBB.  A value defined in OrigBB may only escape
+  // through a direct successor's PHI incoming edge from OrigBB; any other
+  // use would lose its definition on the DecoyBB path.
+  for (Instruction &I : *OrigBB) {
+    if (I.isTerminator())
+      continue;
+    for (User *U : I.users()) {
+      auto *UI = dyn_cast<Instruction>(U);
+      if (UI && UI->getParent() == OrigBB)
+        continue;
+      if (auto *PN = dyn_cast<PHINode>(U)) {
+        BasicBlock *Parent = PN->getParent();
+        bool DirectSucc = false;
+        for (BasicBlock *Succ : successors(OrigBB))
+          if (Succ == Parent) {
+            DirectSucc = true;
+            break;
+          }
+        if (DirectSucc) {
+          int Idx = PN->getBasicBlockIndex(OrigBB);
+          if (Idx >= 0 && PN->getIncomingValue(Idx) == &I)
+            continue;
+        }
+      }
+      return nullptr;
+    }
   }
 
   ValueToValueMapTy VMap;
@@ -505,6 +542,21 @@ static BasicBlock *buildPollutedClone(BasicBlock *OrigBB, Function &F) {
       BO->setHasNoUnsignedWrap(false);
       if (BO->isShift())
         BO->setIsExact(false);
+    }
+  }
+
+  // Wire the successor PHIs before mutation so polluteChainIsSafe can see
+  // the values escaping through them.
+  for (BasicBlock *Succ : successors(DecoyBB)) {
+    for (PHINode &PN : Succ->phis()) {
+      Value *In = PN.getIncomingValueForBlock(OrigBB);
+      if (!In)
+        continue;
+      Value *Mapped = In;
+      auto It = VMap.find(In);
+      if (It != VMap.end())
+        Mapped = It->second;
+      PN.addIncoming(Mapped, DecoyBB);
     }
   }
 
@@ -546,22 +598,13 @@ static BasicBlock *buildPollutedClone(BasicBlock *OrigBB, Function &F) {
   }
 
   if (!Mutated) {
+    // Undo the PHI wiring before destroying the clone.
+    for (BasicBlock *Succ : successors(DecoyBB))
+      for (PHINode &PN : Succ->phis())
+        if (PN.getBasicBlockIndex(DecoyBB) >= 0)
+          PN.removeIncomingValue(DecoyBB, /*DeletePHIIfEmpty=*/false);
     DecoyBB->eraseFromParent();
     return nullptr;
-  }
-
-  // 后继 PHI 增加来自 DecoyBB 的入边（值按 VMap 映射到克隆）。
-  for (BasicBlock *Succ : successors(DecoyBB)) {
-    for (PHINode &PN : Succ->phis()) {
-      Value *In = PN.getIncomingValueForBlock(OrigBB);
-      if (!In)
-        continue;
-      Value *Mapped = In;
-      auto It = VMap.find(In);
-      if (It != VMap.end())
-        Mapped = It->second;
-      PN.addIncoming(Mapped, DecoyBB);
-    }
   }
 
   return DecoyBB;
@@ -723,10 +766,15 @@ struct DecoyPass : public FunctionPass {
     // 若这里直接 return，decoy 资格函数将零保护——所以必须自己补插
     // poison（与拆分前"同循环概率分流"的行为一致）。
     const bool FallbackPoison = (GetEnv == nullptr);
-    std::unique_ptr<DominatorTree> DT;
+    // Snapshot reachability before the CFG is modified; a DominatorTree
+    // queried after each diamond would be stale.
+    SmallPtrSet<BasicBlock *, 32> Reachable;
     AllocaInst *EnvSlot = nullptr;
     if (!FallbackPoison) {
-      DT = std::make_unique<DominatorTree>(F);
+      DominatorTree DT(F);
+      for (BasicBlock &BB : F)
+        if (DT.isReachableFromEntry(&BB))
+          Reachable.insert(&BB);
       IRBuilder<> EB(&F.getEntryBlock(),
                      F.getEntryBlock().getFirstInsertionPt());
       EnvSlot = EB.CreateAlloca(Type::getInt32Ty(Ctx), nullptr,
@@ -767,7 +815,7 @@ struct DecoyPass : public FunctionPass {
       bool UseDecoy =
           !FallbackPoison && (cryptoutils->get_uint32_t() % 100) < DecoyPct;
       // env 在入口块写入 alloca；不可达块拿不到有效值，跳过。
-      if (UseDecoy && !DT->isReachableFromEntry(BB))
+      if (UseDecoy && !Reachable.count(BB))
         continue;
       bool Ok = UseDecoy ? applyDecoyDiamond(BB, F, PolluteLeft, EnvSlot)
                          : bcfApplyTopology(BB, F);

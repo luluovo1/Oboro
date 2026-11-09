@@ -50,6 +50,7 @@ void fixStack(Function *f) {
   std::vector<PHINode *>     tmpPhi;
   std::vector<Instruction *> tmpReg;
 
+  unsigned Round = 0;
   do {
     tmpPhi.clear();
     tmpReg.clear();
@@ -100,7 +101,7 @@ void fixStack(Function *f) {
       DemotePHIToStack(tmpPhi.at(i), AllocaInsertPt);
     }
 
-  } while (tmpReg.size() != 0 || tmpPhi.size() != 0);
+  } while ((tmpReg.size() != 0 || tmpPhi.size() != 0) && ++Round < 8);
 }
 
 CallBase* fixEH(CallBase* CB) {
@@ -164,6 +165,9 @@ void LowerConstantExpr(Function &F) {
     if (PHINode *PHI = dyn_cast<PHINode>(I)) {
       for (unsigned int i = 0; i < PHI->getNumIncomingValues(); ++i) {
         Instruction *TI = PHI->getIncomingBlock(i)->getTerminator();
+        // catchswitch must remain the first non-PHI instruction of its block.
+        if (isa<CatchSwitchInst>(TI))
+          continue;
         if (ConstantExpr *CE = dyn_cast<
           ConstantExpr>(PHI->getIncomingValue(i))) {
           Instruction *NewInst = CE->getAsInstruction();
@@ -198,10 +202,6 @@ bool expandConstantExpr(Function &F) {
       }
       auto CI = dyn_cast<CallInst>(&I);
       auto GEP = dyn_cast<GetElementPtrInst>(&I);
-      auto IsPhi = isa<PHINode>(&I);
-      auto InsertPt = IsPhi
-        ? F.getEntryBlock().getFirstInsertionPt()
-        : I.getIterator();
       for (unsigned i = 0; i < I.getNumOperands(); ++i) {
         if (CI && CI->isBundleOperand(i)) {
           continue;
@@ -211,10 +211,22 @@ bool expandConstantExpr(Function &F) {
         }
         auto Opr = I.getOperand(i);
         if (auto CEP = dyn_cast<ConstantExpr>(Opr)) {
+          // A PHI operand is evaluated on its incoming edge, so the expanded
+          // instruction must go in that predecessor, not in the entry block.
+          Instruction *InsertPt = &I;
+          if (auto *PHI = dyn_cast<PHINode>(&I)) {
+            Instruction *TI = PHI->getIncomingBlock(i)->getTerminator();
+            if (isa<CatchSwitchInst>(TI))
+              continue;
+            InsertPt = TI;
+          }
           IRB.SetInsertPoint(InsertPt);
           auto CEPInst = CEP->getAsInstruction();
           IRB.Insert(CEPInst);
-          I.setOperand(i, CEPInst);
+          if (auto *PHI = dyn_cast<PHINode>(&I))
+            PHI->setIncomingValue(i, CEPInst);
+          else
+            I.setOperand(i, CEPInst);
           Changed = true;
         }
       }

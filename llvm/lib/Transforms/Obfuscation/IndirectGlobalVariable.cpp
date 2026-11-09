@@ -48,6 +48,9 @@ struct IndirectGlobalVariable : public FunctionPass {
       if (F.isIntrinsic()) {
         continue;
       }
+      // Do not rewrite functions this pass will not touch.
+      if (!ArgsOptions->toObfuscate(ArgsOptions->indGvOpt(), &F).isEnabled())
+        continue;
       LowerConstantExpr(F);
       for (inst_iterator I = inst_begin(F), E = inst_end(F); I != E; ++I) {
         Instruction *Inst  = &*I;
@@ -204,7 +207,7 @@ struct IndirectGlobalVariable : public FunctionPass {
 
     std::unordered_map<GlobalVariable *, AllocaInst *> GVDedupCache;
     auto &EntryBB = Fn.getEntryBlock();
-    Instruction *AllocaInsertPt = &*EntryBB.begin();
+    Instruction *AllocaInsertPt = &*EntryBB.getFirstInsertionPt();
     auto *PtrTy = PointerType::getUnqual(Fn.getContext());
     for (auto *GV : GVUseOrder) {
       if (GVUseCount[GV] <= 1)
@@ -264,6 +267,9 @@ struct IndirectGlobalVariable : public FunctionPass {
           }
 
           auto PHI = dyn_cast<PHINode>(Inst);
+          if (PHI && isa<CatchSwitchInst>(
+                         PHI->getIncomingBlock(i)->getTerminator()))
+            continue;
           auto InsertPoint = PHI ? PHI->getIncomingBlock(i)->getTerminator() : Inst;
           IRBuilder<> IRB(InsertPoint);
 

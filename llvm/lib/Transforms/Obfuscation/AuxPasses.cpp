@@ -98,6 +98,9 @@ struct FunctionWrapperPass : public ModulePass {
                                      GlobalValue::InternalLinkage,
                                      obf::freshName(M, "fw"), &M);
       W->copyAttributesFrom(F);
+      // The wrapper must not join the callee's section/comdat group.
+      W->setComdat(nullptr);
+      W->setSection("");
       W->setCallingConv(F->getCallingConv());
       W->setDSOLocal(true);
       W->setVisibility(GlobalValue::DefaultVisibility);
@@ -200,7 +203,7 @@ struct SplitBlocksPass : public FunctionPass {
         continue;
       SmallVector<Instruction *, 16> Cands;
       for (Instruction &I : *BB) {
-        if (isa<PHINode>(I) || I.isTerminator())
+        if (isa<PHINode>(I) || I.isTerminator() || isa<AllocaInst>(I))
           continue;
         if (&I == &BB->front())
           continue;
