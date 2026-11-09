@@ -39,16 +39,12 @@ public:
   }
 
   bool runOnModule(Module &M) override {
-    // Copy: never write the per-run fallback back into the shared options,
-    // or later passes would receive a 19-character non-hex seed.
-    std::string seed(ArgsOptions->randomSeed().begin(),
-                     ArgsOptions->randomSeed().end());
-    // A pass must never abort the compiler because a config file is missing.
-    // Fall back to a per-run random seed: the output is still opaque, and an
-    // explicit "seed" in the config keeps builds reproducible.
-    if (seed.empty())
-      seed = std::to_string(
-          std::chrono::system_clock::now().time_since_epoch().count());
+    // The name hash in randomRttiName() is keyed by ArgsOptions->randomSeed()
+    // plus the type name.  Do NOT install a clock-based fallback here: with no
+    // seed configured the hash degenerates to Blake3(type name), which is
+    // stable across translation units.  A per-run timestamp would give the
+    // same type a different name in every TU and break exception matching at
+    // link time.
     bool         changed = false;
     LLVMContext &ctx = M.getContext();
     for (GlobalVariable &gv : M.globals()) {

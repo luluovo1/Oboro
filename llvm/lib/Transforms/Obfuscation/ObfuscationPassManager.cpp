@@ -372,8 +372,9 @@ struct ObfuscationPassManager : public ModulePass {
       const bool WantShuffle =
           Options->mayBeEnabled(Options->auxOpt(), M) &&
           Options->auxOpt()->shuffle();
-      const bool WantSplit = Options->auxOpt()->isEnabled() &&
-                             Options->auxOpt()->splitCount() > 0;
+      const bool WantSplit =
+          Options->mayBeEnabled(Options->auxOpt(), M) &&
+          Options->auxOpt()->splitCount() > 0;
       // INDBR 的三种模式都必须在这里跑：在 PipelineStart 跑，O1+ 的
       // SimplifyCFG 会把单目标 indirectbr 折回 br、合并块（实测 39 个
       // 分支只剩 13 个），full 模式等于白开。

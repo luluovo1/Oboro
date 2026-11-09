@@ -105,6 +105,32 @@ struct StringEncryption : public ModulePass {
 
 char StringEncryption::ID = 0;
 
+/// Aggregates above this many elements are left out of string encryption
+/// entirely.  Expanding them into scalar stores would blow up compile time,
+/// while storing the aggregate as a whole would write the *plaintext* string
+/// pointers into the decrypted buffer and defeat the pass.
+static constexpr unsigned kMaxLowerElements = 256;
+
+static bool exceedsLowerBudget(const Constant *C) {
+  if (auto *CA = dyn_cast<ConstantArray>(C)) {
+    if (CA->getNumOperands() > kMaxLowerElements)
+      return true;
+    for (const Use &U : CA->operands())
+      if (exceedsLowerBudget(cast<Constant>(U.get())))
+        return true;
+    return false;
+  }
+  if (auto *CS = dyn_cast<ConstantStruct>(C)) {
+    if (CS->getNumOperands() > kMaxLowerElements)
+      return true;
+    for (const Use &U : CS->operands())
+      if (exceedsLowerBudget(cast<Constant>(U.get())))
+        return true;
+    return false;
+  }
+  return false;
+}
+
 /// RTTI 类型名字符串在运行时由 dynamic_cast / 异常匹配直接比较，而数据
 /// 引用没有可以插入解密代码的“使用点”。加密它们会让 Itanium ABI 下的
 /// dynamic_cast 一律返回 null（_ZTS* 是 type_info 的 name 字段），因此
@@ -136,6 +162,20 @@ bool StringEncryption::runOnModule(Module &M) {
     // Custom sections (.modinfo, ObjC metadata, ...) have semantics the
     // replacement .bss buffer cannot preserve.
     if (GV.hasSection())
+      continue;
+    // A string referenced from an oversized aggregate stays plaintext: that
+    // aggregate is excluded from encryption below, so there is no use site
+    // where a decrypted pointer could be substituted for it.
+    bool InHugeAggregate = false;
+    for (User *U : GV.users()) {
+      auto *UGV = dyn_cast<GlobalVariable>(U);
+      if (UGV && UGV->hasInitializer() &&
+          exceedsLowerBudget(UGV->getInitializer())) {
+        InHugeAggregate = true;
+        break;
+      }
+    }
+    if (InHugeAggregate)
       continue;
     Constant *Init = GV.getInitializer();
     if (Init == nullptr)
@@ -723,14 +763,7 @@ void StringEncryption::lowerGlobalConstant(Constant *CV, IRBuilder<> &IRB, Value
   }
 }
 
-static constexpr unsigned kMaxLowerElements = 256;
-
 void StringEncryption::lowerGlobalConstantArray(ConstantArray *CA, IRBuilder<> &IRB, Value *Ptr, Type *Ty) {
-  // Huge aggregates would otherwise expand into thousands of scalar stores.
-  if (CA->getNumOperands() > kMaxLowerElements) {
-    IRB.CreateStore(CA, Ptr);
-    return;
-  }
   for (unsigned i = 0, e = CA->getNumOperands(); i != e; ++i) {
     Constant *CV = CA->getOperand(i);
     Value *GEP = IRB.CreateGEP(Ty,
@@ -740,10 +773,6 @@ void StringEncryption::lowerGlobalConstantArray(ConstantArray *CA, IRBuilder<> &
 }
 
 void StringEncryption::lowerGlobalConstantStruct(ConstantStruct *CS, IRBuilder<> &IRB, Value *Ptr, Type *Ty) {
-  if (CS->getNumOperands() > kMaxLowerElements) {
-    IRB.CreateStore(CS, Ptr);
-    return;
-  }
   for (unsigned i = 0, e = CS->getNumOperands(); i != e; ++i) {
     Constant* CV = CS->getOperand(i);
     Value *GEP = IRB.CreateGEP(Ty,
@@ -879,11 +908,10 @@ void StringEncryption::collectConstantStringUser(GlobalVariable *CString, std::s
 }
 
 bool StringEncryption::isValidToEncrypt(GlobalVariable *GV) {
-  if(GV->isConstant() && GV->hasInitializer()) {
-    return GV->getInitializer() != nullptr;
-  } else {
+  if (!GV->isConstant() || !GV->hasInitializer())
     return false;
-  }
+  Constant *Init = GV->getInitializer();
+  return Init != nullptr && !exceedsLowerBudget(Init);
 }
 
 void StringEncryption::deleteUnusedGlobalVariable() {

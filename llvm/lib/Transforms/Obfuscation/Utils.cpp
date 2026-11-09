@@ -200,10 +200,10 @@ bool expandConstantExpr(Function &F) {
         isa<SwitchInst>(&I) || I.isAtomic()) {
         continue;
       }
-      auto CI = dyn_cast<CallInst>(&I);
+      auto *CB = dyn_cast<CallBase>(&I);
       auto GEP = dyn_cast<GetElementPtrInst>(&I);
       for (unsigned i = 0; i < I.getNumOperands(); ++i) {
-        if (CI && CI->isBundleOperand(i)) {
+        if (CB && CB->isBundleOperand(i)) {
           continue;
         }
         if (GEP && (i < 2 || GEP->getSourceElementType()->isStructTy())) {

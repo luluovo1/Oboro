@@ -81,9 +81,14 @@ namespace {
       ConstantInt* Low;
       ConstantInt* High;
       BasicBlock* BB;
+      /// Number of SwitchInst case entries merged into this range.  The value
+      /// span (High - Low) is not a reliable substitute: it overflows for
+      /// extreme i64 bounds and it over-counts whenever the cluster is
+      /// narrower than its span.
+      unsigned NumCases;
 
       CaseRange(ConstantInt *low, ConstantInt *high, BasicBlock *bb)
-          : Low(low), High(high), BB(bb) {}
+          : Low(low), High(high), BB(bb), NumCases(1) {}
     };
 
     using CaseVector = std::vector<CaseRange>;
@@ -229,10 +234,7 @@ LowerSwitch::switchConvert(CaseItr Begin, CaseItr End, ConstantInt *LowerBound,
     // emitting the code that checks if the value actually falls in the range
     // because the bounds already tell us so.
     if (Begin->Low == LowerBound && Begin->High == UpperBound) {
-      unsigned NumMergedCases = 0;
-      if (LowerBound && UpperBound)
-        NumMergedCases =
-            UpperBound->getSExtValue() - LowerBound->getSExtValue();
+      unsigned NumMergedCases = Begin->NumCases > 0 ? Begin->NumCases - 1 : 0;
       fixPhis(Begin->BB, OrigBlock, Predecessor, NumMergedCases);
       return Begin->BB;
     }
@@ -347,17 +349,19 @@ BasicBlock* LowerSwitch::newLeafBlock(CaseRange& Leaf, Value* Val,
   // from OrigBlock to come from NewLeaf.
   for (BasicBlock::iterator I = Succ->begin(); isa<PHINode>(I); ++I) {
     PHINode* PN = cast<PHINode>(I);
-    // Remove all but one incoming entries from the cluster.  Compute the
-    // difference in unsigned space (int64 subtraction can wrap) and never
-    // remove more entries than the PHI actually has.
-    uint64_t Range = uint64_t(Leaf.High->getSExtValue()) -
-                     uint64_t(Leaf.Low->getSExtValue());
+    // Remove all but one of the incoming edges this cluster contributed.
+    // Counting merged cases is exact; deriving the count from High - Low can
+    // overflow and can exceed the number of edges OrigBlock really has.
+    unsigned RemoveCount = Leaf.NumCases > 0 ? Leaf.NumCases - 1 : 0;
+    unsigned OrigEdges = 0;
+    for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i)
+      if (PN->getIncomingBlock(i) == OrigBlock)
+        ++OrigEdges;
     // Keep at least one incoming entry so the setIncomingBlock below still
     // has a target.
-    unsigned NumIncoming = PN->getNumIncomingValues();
-    if (Range >= NumIncoming)
-      Range = NumIncoming > 0 ? NumIncoming - 1 : 0;
-    for (uint64_t j = 0; j < Range; ++j) {
+    if (RemoveCount >= OrigEdges)
+      RemoveCount = OrigEdges > 0 ? OrigEdges - 1 : 0;
+    for (unsigned j = 0; j < RemoveCount; ++j) {
       PN->removeIncomingValue(OrigBlock);
     }
 
@@ -395,6 +399,7 @@ unsigned LowerSwitch::Clusterify(CaseVector& Cases, SwitchInst *SI) {
       if ((currentValue < std::numeric_limits<int64_t>::max()) &&
           (nextValue == currentValue + 1) && (currentBB == nextBB)) {
         I->High = J->High;
+        I->NumCases += J->NumCases;
         // FIXME: Combine branch weights.
       } else if (++I != J) {
         *I = *J;
@@ -531,11 +536,19 @@ void LowerSwitch::processSwitchInst(SwitchInst *SI,
 
     // If there are no cases left, just branch.
     if (Cases.empty()) {
+      // Every remaining case targeted PopSucc.  Count the real SwitchInst
+      // edges to it: MaxPop is a value-span popularity counter, not an edge
+      // count, and using it here would over-remove (or spin for ~4G rounds).
+      unsigned ActualCases = 0;
+      for (const auto &C : SI->cases())
+        if (C.getCaseSuccessor() == PopSucc)
+          ++ActualCases;
       BranchInst::Create(Default, CurBlock);
       SI->eraseFromParent();
       // As all the cases have been replaced with a single branch, only keep
       // one entry in the PHI nodes.
-      for (unsigned I = 0 ; I < (MaxPop - 1) ; ++I)
+      unsigned RemoveCount = ActualCases > 0 ? ActualCases - 1 : 0;
+      for (unsigned I = 0; I < RemoveCount; ++I)
         PopSucc->removePredecessor(OrigBlock);
       return;
     }
