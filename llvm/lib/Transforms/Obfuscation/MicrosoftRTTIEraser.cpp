@@ -94,6 +94,8 @@ public:
         "abcdefghijklmnopqrstuvwxyz";
 
     SmallString<512> passwd;
+    // Empty when no seed is configured: the hash then depends on the type
+    // name alone, which keeps one type stable across translation units.
     passwd.append(ArgsOptions->randomSeed());
     passwd.append(rtti);
     Blake3.init();
