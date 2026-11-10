@@ -1,6 +1,8 @@
-# Oboro — Android NDK Obfuscator
+# Oboro — 基于 LLVM 的混淆编译器
 
-[![Build NDK OLLVM Toolchain](https://github.com/luluovo1/Oboro/actions/workflows/build-ndk-ollvm.yml/badge.svg)](https://github.com/luluovo1/Oboro/actions/workflows/build-ndk-ollvm.yml)
+*一个基于 LLVM 的混淆编译器工具链 —— Android 优先，但不限于 Android。*
+
+[![Build Oboro Toolchain](https://github.com/luluovo1/Oboro/actions/workflows/build-ndk-ollvm.yml/badge.svg)](https://github.com/luluovo1/Oboro/actions/workflows/build-ndk-ollvm.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE.TXT)
 [![LLVM Version](https://img.shields.io/badge/LLVM-21.0.0-red.svg)](https://llvm.org/)
 [![NDK Version](https://img.shields.io/badge/NDK-r30-green.svg)](https://developer.android.com/ndk)
@@ -25,7 +27,9 @@
 
 ## 简介
 
-本仓库基于 [llvm/llvm-project](https://github.com/llvm/llvm-project)（官方 LLVM 源码），在其基础上集成了 [KomiMoe/Arkari](https://github.com/KomiMoe/Arkari) 混淆引擎，并针对 Android NDK 环境进行了定制适配，深度移植到 **Google 官方 Android NDK** 使用的 LLVM 版本（当前为 LLVM 21）上。
+Oboro 是一个基于 [llvm/llvm-project](https://github.com/llvm/llvm-project)（官方 LLVM 源码）的编译器工具链，以 [KomiMoe/Arkari](https://github.com/KomiMoe/Arkari) 混淆引擎为核心，并叠加了自有 Pass 与策略逻辑。
+
+项目以 **Android 为首要目标**：随包提供兼容 Android NDK 的 sysroot 与 wrapper 脚本，Android 目标开箱即用。编译器本身**与目标平台无关**——只要提供对应的 sysroot 与运行时，LLVM 支持的任何 target 都可以使用。
 
 本项目以 **NDK r30 / LLVM 21** 为稳定基准版本，不追随 LLVM 官方主分支更新，以确保混淆工具链的长期稳定性与可靠性。
 
@@ -72,26 +76,37 @@ clang -O2 -mllvm -irobf-cse -mllvm -irobf-icall foo.c -o foo
 
 > 更多参数组合与效果演示见 [混淆使用手册（USAGE.md）](./USAGE.md)
 
+### 非 Android 目标
+
+Oboro 只随包提供 Android NDK 的 sysroot。其他 target 需要自备 sysroot：
+
+```bash
+clang --target=x86_64-linux-gnu --sysroot=/path/to/sysroot foo.c -o foo
+clang --target=x86_64-w64-mingw32 --sysroot=/path/to/mingw foo.c -o foo
+```
+
+混淆 Pass 与 target 无关，行为一致。
+
 ## 差异对比
 
 本项目以 [Arkari](https://github.com/KomiMoe/Arkari) 作为混淆核心引擎基础：
 
 | 对比维度 | Arkari | 本项目 |
 |:---|:---|:---|
-| 目标平台 | 通用 LLVM / iOS | 专为 NDK 定制，并同时适配 Windows |
+| 目标平台 | 通用 LLVM / iOS | Android-first；外部 sysroot 下支持 Windows / Linux |
 | LLVM 版本 | 官方 LLVM 分支 | Google NDK 官方 LLVM 21 |
 | 控制流平坦化 (FLA) | 标准实现 | 基于 Arkari 适配迁移 |
 | 间接分支 (INDBR) | 标准加密页表 | 基于 Arkari 适配迁移 |
 | 间接调用 (ICALL) | 标准加密页表 | 基于 Arkari 适配迁移 |
-| 虚假控制流 (BCF) | 不含 | **BCF v2**：11 族随机不透明谓词 + 随机毒载荷（AArch64 SP 收敛 / x86_64 JUMPOUT） |
+| 虚假控制流 (BCF) | 不含 | **BCF v2**：12 族随机不透明谓词（生产仅启用 5 族经规则引擎验证的谓词）+ 随机毒载荷（AArch64 SP 收敛 / x86_64 JUMPOUT） |
 | 反模拟诱饵 | 不含 | **可选**：probe 驱动 L1 重汇聚 / L3 值污染 |
 | 安全底线 | 不含 | **红/黄区**：weak 符号、C++ 运行时胶水、构造/析构/运算符永不混淆 |
 | 策略系统 | 仅命令行 | **config 优先**：JSON `deny` + 类/文件 `patterns`，字段级级联 |
-| 兼容性 | 通用 | 通用 |
+| 兼容性 | 通用 | Android ABI、MSVC ABI、Itanium ABI |
 
 细节差异：
 
-- 新增 **BCF（虚假控制流）** Pass。v2 每次编译从 11 个数学上严格恒真的谓词族中随机选择（回绕安全、经 InstSimplify 折叠筛选），并随机化输入变换 / 极性 / 载荷常量；注入毒块或可选的诱饵块
+- 新增 **BCF（虚假控制流）** Pass。v2 每次编译从 12 个数学上严格恒真的谓词族中随机选择（生产权重仅启用 5 族，回绕安全、经 InstSimplify 折叠筛选），并随机化输入变换 / 极性 / 载荷常量；注入毒块或可选的诱饵块
 - **安全底线**统一实现在 `toObfuscate()`：红区（weak 符号含全部 STL 模板实例、`__cxa_`/`__gxx_` 胶水、静态构造/析构列表、`operator new/delete`）永不混淆，注解也无法解锁；黄区（构造/析构/其他运算符）需逐函数注解或精确函数名 config pattern 才能解锁
 - **config 优先策略**：`-oboro-cfg=policy.json` 支持 `deny` 名单与类/命名空间/文件 `patterns`，字段级级联（`注解 > 类 pattern > 文件 pattern > CLI > config > 内置`）
 - **decoy（可选）**：工具链不做任何环境检测。由 App 提供 `__oboro_probe()`；返回 0 时代码静默走诱饵路径——L1 语义完全正确（trace 噪声），L3 污染数值（错误但可执行），并受硬性危险链过滤保护

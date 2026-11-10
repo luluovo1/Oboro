@@ -1,6 +1,8 @@
-# Oboro — Android NDK Obfuscator
+# Oboro — LLVM-based Obfuscating Compiler
 
-[![Build NDK OLLVM Toolchain](https://github.com/luluovo1/Oboro/actions/workflows/build-ndk-ollvm.yml/badge.svg)](https://github.com/luluovo1/Oboro/actions/workflows/build-ndk-ollvm.yml)
+*An LLVM-based obfuscating compiler toolchain — Android-first, target-agnostic.*
+
+[![Build Oboro Toolchain](https://github.com/luluovo1/Oboro/actions/workflows/build-ndk-ollvm.yml/badge.svg)](https://github.com/luluovo1/Oboro/actions/workflows/build-ndk-ollvm.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE.TXT)
 [![LLVM Version](https://img.shields.io/badge/LLVM-21.0.0-red.svg)](https://llvm.org/)
 [![NDK Version](https://img.shields.io/badge/NDK-r30-green.svg)](https://developer.android.com/ndk)
@@ -25,7 +27,9 @@
 
 ## Introduction
 
-This repository is based on [llvm/llvm-project](https://github.com/llvm/llvm-project) (official LLVM sources) with the [KomiMoe/Arkari](https://github.com/KomiMoe/Arkari) obfuscation engine integrated and customized for the Android NDK, ported onto the LLVM version used by **Google's official Android NDK** (currently LLVM 21).
+Oboro is a compiler toolchain built on [llvm/llvm-project](https://github.com/llvm/llvm-project) (official LLVM sources), with the [KomiMoe/Arkari](https://github.com/KomiMoe/Arkari) obfuscation engine as its core, extended with original passes and policy logic.
+
+The project is **Android-first**: it ships with an Android NDK-compatible sysroot and wrapper scripts, so Android targets work out of the box. The compiler itself is **target-agnostic** — any target supported by LLVM can be used, provided the corresponding sysroot and runtime are supplied.
 
 This project uses **NDK r30 / LLVM 21** as a stable baseline and does not track upstream LLVM major releases, prioritizing long-term toolchain stability and reliability.
 
@@ -72,13 +76,24 @@ clang -O2 -mllvm -irobf-cse -mllvm -irobf-icall foo.c -o foo
 
 > See the [Usage Manual (USAGE_en.md)](./USAGE_en.md) for more flag combinations and effect demonstrations
 
+### Non-Android targets
+
+Oboro bundles only the Android NDK sysroot. For other targets, supply your own:
+
+```bash
+clang --target=x86_64-linux-gnu --sysroot=/path/to/sysroot foo.c -o foo
+clang --target=x86_64-w64-mingw32 --sysroot=/path/to/mingw foo.c -o foo
+```
+
+The obfuscation passes are target-independent and apply identically.
+
 ## Differences from Arkari
 
 This project builds on [Arkari](https://github.com/KomiMoe/Arkari) as its core obfuscation engine:
 
 | Aspect | Arkari | This Project |
 |:---|:---|:---|
-| Target platform | Generic LLVM / iOS | NDK-tailored, Windows supported as well |
+| Target platform | Generic LLVM / iOS | Android-first; Windows / Linux with an external sysroot |
 | LLVM version | Upstream LLVM branches | Google NDK official LLVM 21 |
 | Control-flow flattening (FLA) | Standard implementation | Ported and adapted from Arkari |
 | Indirect branches (INDBR) | Standard encrypted page table | Ported and adapted from Arkari |
@@ -87,7 +102,7 @@ This project builds on [Arkari](https://github.com/KomiMoe/Arkari) as its core o
 | Anti-emulation decoy | Not included | **Opt-in**: probe-driven L1 reconverge / L3 value pollution |
 | Safety floor | Not included | **Red/yellow zones**: weak symbols, C++ runtime glue, ctors/dtors/operators are never obfuscated |
 | Policy system | CLI flags only | **Config-first**: JSON `deny` + class/file `patterns` with field-level cascade |
-| Compatibility | Generic | Generic |
+| Compatibility | Generic | Android ABI, MSVC ABI, Itanium ABI |
 
 Key differences in detail:
 
